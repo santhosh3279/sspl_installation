@@ -4,6 +4,7 @@ This system provides safe Docker image updates with automatic backup and rollbac
 
 ## 📁 Files
 
+- `sspl-erp-common.sh` - Shared configuration (site name, paths) and helpers, sourced by the other scripts
 - `sspl-erp-update-with-rollback.sh` - Main update script with automatic backup
 - `sspl-erp-rollback.sh` - Rollback to previous version
 - `sspl-erp-backup-manager.sh` - Manage backup files
@@ -13,10 +14,12 @@ This system provides safe Docker image updates with automatic backup and rollbac
 1. Copy the scripts to your server:
 ```bash
 cd /opt/sspl-erp
-# Upload the three scripts here
+# Upload the four scripts here
 ```
 
-2. Make scripts executable:
+2. Set your site name in `sspl-erp-common.sh` (the `SITE_NAME` variable at the top).
+
+3. Make scripts executable:
 ```bash
 chmod +x sspl-erp-update-with-rollback.sh
 chmod +x sspl-erp-rollback.sh
@@ -33,11 +36,14 @@ cd /opt/sspl-erp
 ```
 
 **What it does:**
-1. Backs up current Docker images to `/opt/sspl-erp/image-backups/backup_TIMESTAMP.tar`
-2. Stops all services
-3. Pulls latest images
-4. Starts services with new images
-5. Runs migrations and clears cache
+1. Runs a full Frappe backup (database + files) via `/opt/scripts/frappe_backup.sh`
+2. Backs up current Docker images to `/opt/sspl-erp/image-backups/backup_TIMESTAMP.tar`
+3. Stops all services
+4. Pulls latest images
+5. Starts services and waits until the database and backend are actually ready
+6. Fixes DB grants, runs migrations, and clears cache
+
+If any step fails, the script stops and prints rollback instructions.
 
 ### Rollback to Previous Version
 
@@ -52,6 +58,11 @@ cd /opt/sspl-erp
 3. Stops all services
 4. Restores the backed-up Docker images
 5. Starts services with restored images
+
+To roll back to a specific (non-latest) backup:
+```bash
+BACKUP_FILE=/opt/sspl-erp/image-backups/backup_20240421_143000.tar ./sspl-erp-rollback.sh
+```
 
 ### Manage Backups
 
@@ -144,7 +155,9 @@ du -sh /opt/sspl-erp/image-backups/*
 # List available backups
 ./sspl-erp-backup-manager.sh list
 
-# Edit rollback script to use specific backup
+# Roll back to a specific backup
+BACKUP_FILE=/opt/sspl-erp/image-backups/backup_20240421_143000.tar ./sspl-erp-rollback.sh
+
 # Or manually load:
 docker load -i /opt/sspl-erp/image-backups/backup_20240421_143000.tar
 docker compose up -d
@@ -180,8 +193,8 @@ docker compose exec backend bench --site 192.168.225.135 doctor
 To automatically clean old backups weekly:
 
 ```bash
-# Add to crontab
-0 2 * * 0 /opt/sspl-erp/sspl-erp-backup-manager.sh clean 5 > /dev/null 2>&1
+# Add to crontab (--yes is required: without a terminal the script cannot ask for confirmation)
+0 2 * * 0 /opt/sspl-erp/sspl-erp-backup-manager.sh clean 5 --yes >> /var/log/sspl-erp-backup-clean.log 2>&1
 ```
 
 This runs every Sunday at 2 AM, keeping the 5 most recent backups.

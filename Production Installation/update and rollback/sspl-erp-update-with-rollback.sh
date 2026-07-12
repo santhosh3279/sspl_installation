@@ -2,10 +2,12 @@
 set -e
 
 cd /opt/sspl-erp
+source "$(dirname "$0")/sspl-erp-common.sh"
 
-BACKUP_DIR="/opt/sspl-erp/image-backups"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 BACKUP_FILE="$BACKUP_DIR/backup_$TIMESTAMP.tar"
+
+trap 'echo ""; echo "❌ Update failed!"; echo "   Services may be in a partial state."; echo "   To roll back images: ./sspl-erp-rollback.sh"; echo "   To restore data:      sudo /opt/scripts/frappe_restore.sh <backup-folder>"' ERR
 
 echo "=============================="
 echo " SSPL ERP Update - $(date)"
@@ -26,18 +28,19 @@ fi
 
 # Create backup directory if it doesn't exist
 mkdir -p "$BACKUP_DIR"
+chmod 700 "$BACKUP_DIR"
 
 echo "→ Backing up current Docker images..."
 # Get list of images used by the compose file
-IMAGES=$(docker compose -f docker-compose.yml config | grep 'image:' | awk '{print $2}' | sort -u)
+IMAGES=$(docker compose -f "$COMPOSE_FILE" config | grep 'image:' | awk '{print $2}' | sort -u)
 
 # Save current images to tar file
 if [ -n "$IMAGES" ]; then
     echo "   Images to backup:"
     echo "$IMAGES" | while read img; do echo "   - $img"; done
-    
+
     docker save -o "$BACKUP_FILE" $IMAGES
-    
+
     if [ -f "$BACKUP_FILE" ]; then
         BACKUP_SIZE=$(du -h "$BACKUP_FILE" | cut -f1)
         echo "   ✓ Backup created: $BACKUP_FILE ($BACKUP_SIZE)"
@@ -50,52 +53,30 @@ else
 fi
 
 echo "→ Stopping all services..."
-docker compose -f docker-compose.yml down
+docker compose -f "$COMPOSE_FILE" down
 
 echo "→ Cleaning up unused Docker resources..."
 docker system prune -f
 
 echo "→ Pulling latest image..."
-docker compose -f docker-compose.yml pull
+docker compose -f "$COMPOSE_FILE" pull
 
 echo "→ Starting all services..."
-docker compose -f docker-compose.yml up -d
+docker compose -f "$COMPOSE_FILE" up -d
 
-echo "→ Waiting for services to be ready..."
-sleep 15
-
-echo "→ Fixing MariaDB user grants (handling IP changes)..."
-MARIADB_ROOT_PASSWORD=$(grep MARIADB_ROOT_PASSWORD .env | cut -d '=' -f2)
-SITE_NAME="192.168.225.135"
-
-# Get DB credentials from site_config.json
-docker compose -f docker-compose.yml exec backend bash -c "cat ~/frappe-bench/sites/${SITE_NAME}/site_config.json" > /tmp/site_config.json
-DB_NAME=$(grep -oP '"db_name":\s*"\K[^"]+' /tmp/site_config.json)
-DB_PASS=$(grep -oP '"db_password":\s*"\K[^"]+' /tmp/site_config.json)
-rm /tmp/site_config.json
-
-if [ -n "$DB_NAME" ] && [ -n "$DB_PASS" ]; then
-    echo "   Granting access for user: $DB_NAME on database: $DB_NAME"
-    docker compose -f docker-compose.yml exec db mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" -e "
-        DROP USER IF EXISTS '${DB_NAME}'@'%';
-        CREATE USER '${DB_NAME}'@'%' IDENTIFIED BY '${DB_PASS}';
-        GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_NAME}'@'%';
-        FLUSH PRIVILEGES;
-    " 2>/dev/null && echo "   ✓ Database grants updated" || echo "   ⚠ Grant update failed (may already be correct)"
-else
-    echo "   ⚠ Could not extract DB credentials, skipping grant fix"
-fi
+wait_for_services
+fix_db_grants
 
 echo "→ Running migrations..."
-docker compose -f docker-compose.yml exec backend \
-  bench --site 192.168.225.135 migrate
+docker compose -f "$COMPOSE_FILE" exec backend \
+  bench --site "$SITE_NAME" migrate
 
 echo "→ Clearing cache..."
-docker compose -f docker-compose.yml exec backend \
-  bench --site 192.168.225.135 clear-cache
+docker compose -f "$COMPOSE_FILE" exec backend \
+  bench --site "$SITE_NAME" clear-cache
 
 echo "✅ Update complete!"
-docker compose -f docker-compose.yml exec backend bench version
+docker compose -f "$COMPOSE_FILE" exec backend bench version
 
 echo ""
 echo "📦 Backup Information:"
@@ -104,21 +85,15 @@ echo "   Backup file: $BACKUP_FILE"
 # Automatically keep only the last 3 backups
 echo ""
 echo "→ Cleaning old backups (keeping last 3)..."
-BACKUPS=$(ls -t "$BACKUP_DIR"/backup_*.tar 2>/dev/null)
-TOTAL=$(echo "$BACKUPS" | grep -c . || echo 0)
-
-if [ "$TOTAL" -gt 3 ]; then
-    TO_DELETE=$(echo "$BACKUPS" | tail -n +4)
-    DELETE_COUNT=$(echo "$TO_DELETE" | grep -c . || echo 0)
-    
-    echo "   Found $TOTAL backups, deleting $DELETE_COUNT old backup(s)..."
-    echo "$TO_DELETE" | while read backup; do
+OLD_BACKUPS=$(ls -t "$BACKUP_DIR"/backup_*.tar 2>/dev/null | tail -n +4)
+if [ -n "$OLD_BACKUPS" ]; then
+    echo "$OLD_BACKUPS" | while read backup; do
         rm -f "$backup"
         echo "   ✓ Deleted: $(basename "$backup")"
     done
     echo "   ✓ Cleanup complete - 3 most recent backups retained"
 else
-    echo "   ✓ Only $TOTAL backup(s) exist - no cleanup needed"
+    echo "   ✓ No old backups to clean"
 fi
 
 echo ""
