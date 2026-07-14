@@ -1,0 +1,15 @@
+[Unit]
+Description=SSPL ERP Admin Panel
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/sspl-admin
+ExecStart=/opt/sspl-admin/venv/bin/python /opt/sspl-admin/app.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
