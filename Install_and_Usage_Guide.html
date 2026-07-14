@@ -104,25 +104,35 @@
 <ul>
   <li><b>Backup system</b> (<code>Backup/frappe_backup_system/</code>) — automated daily backups of the ERPNext
       <b>database, uploaded files (public and private), and configuration</b>, plus a restore script.
-      Installed to <code>/opt/scripts/</code>, backups stored in <code>/opt/backups/frappe/</code>.</li>
+      Installed to <code>/opt/scripts/v2/</code>, backups stored in <code>/opt/backups/frappe/</code>.</li>
   <li><b>Update &amp; rollback system</b> (<code>Production Installation/update and rollback/</code>) — safely pulls
       new Docker images from GHCR, taking a full data backup and a Docker image snapshot first, so a bad
-      update can be rolled back. Installed to <code>/opt/sspl-erp/</code>.</li>
+      update can be rolled back. Installed to <code>/opt/sspl-erp/v2/</code>.</li>
 </ul>
+
+<p>Both parts install into their own <code>v2/</code> folder, <b>side-by-side</b> with any older
+scripts already on the server: nothing in <code>/opt/scripts/</code> or directly in
+<code>/opt/sspl-erp/</code> is replaced, so the old scripts remain available as a fallback.
+Backup <i>data</i> is shared — both generations store data backups in
+<code>/opt/backups/frappe/</code> and image snapshots in <code>/opt/sspl-erp/image-backups/</code>,
+so a backup made by one can be restored with the other.</p>
 
 <pre>Your server
 ├── /opt/sspl-erp/                      ← Docker deployment (docker-compose.yml, .env)
-│   ├── sspl-erp-common.sh              ← shared config: SITE_NAME lives here
-│   ├── sspl-erp-update-with-rollback.sh
-│   ├── sspl-erp-rollback.sh
-│   ├── sspl-erp-backup-manager.sh
-│   └── image-backups/                  ← Docker image snapshots (rollback)
-├── /opt/scripts/                       ← Backup scripts
-│   ├── frappe_backup.sh                ← full backup (DB + files + config)
-│   ├── frappe_db_backup.sh             ← quick database-only backup
-│   ├── frappe_backup_verify.sh         ← checks backups are complete &amp; fresh
-│   └── frappe_restore.sh               ← restore a full backup
-└── /opt/backups/frappe/                ← data backups
+│   ├── sspl-erp-*.sh                   ← old update scripts (kept as fallback)
+│   ├── v2/                             ← new update &amp; rollback scripts
+│   │   ├── sspl-erp-common.sh          ← shared config: SITE_NAME lives here
+│   │   ├── sspl-erp-update-with-rollback.sh
+│   │   ├── sspl-erp-rollback.sh
+│   │   └── sspl-erp-backup-manager.sh
+│   └── image-backups/                  ← Docker image snapshots (shared, rollback)
+├── /opt/scripts/                       ← old backup scripts (kept as fallback)
+│   └── v2/                             ← new backup scripts
+│       ├── frappe_backup.sh            ← full backup (DB + files + config)
+│       ├── frappe_db_backup.sh         ← quick database-only backup
+│       ├── frappe_backup_verify.sh     ← checks backups are complete &amp; fresh
+│       └── frappe_restore.sh           ← restore a full backup
+└── /opt/backups/frappe/                ← data backups (shared)
     ├── 20260712_020000/                ← one folder per full backup
     │   ├── *-database.sql.gz           ← database dump
     │   ├── *-files.tgz                 ← public files
@@ -157,14 +167,20 @@ sudo ./setup_frappe_backups.sh</pre>
 <p>The installer will:</p>
 <ol>
   <li>Create <code>/opt/backups/frappe/</code> (permissions restricted to root — backups contain credentials).</li>
-  <li>Install the four scripts to <code>/opt/scripts/</code> and make them executable.</li>
+  <li>Install the four scripts to <code>/opt/scripts/v2/</code> and make them executable —
+      older scripts directly in <code>/opt/scripts/</code> are not touched.</li>
   <li><b>Ask for your site name</b> and write it into the backup, db-backup, and restore scripts.</li>
-  <li>Offer to install the cron jobs (answer <code>yes</code> — see section 11 for the schedule).</li>
+  <li>Offer to install the cron jobs (see section 11 for the schedule).</li>
   <li>Offer to run a test backup (answer <code>yes</code> the first time).</li>
 </ol>
+<div class="warn"><b>If the old backup scripts are already scheduled in cron:</b> installing the new
+cron jobs too means every backup runs twice. Either answer <code>no</code> to the cron question while
+you test the v2 scripts manually, or say <code>yes</code> and then remove the old
+<code>/opt/scripts/frappe_*.sh</code> lines with <code>sudo crontab -e</code> once you are happy
+with v2.</div>
 
 <h3>Step 3 — Verify the test backup</h3>
-<pre>sudo /opt/scripts/frappe_backup_verify.sh</pre>
+<pre>sudo /opt/scripts/v2/frappe_backup_verify.sh</pre>
 <p>All four lines must say <b>OK</b>: database, public files, private files, and config.
 The script exits with an error if anything is missing.</p>
 
@@ -172,14 +188,14 @@ The script exits with an error if anything is missing.</p>
 <p>Once installed, backups run automatically from cron. Manual commands:</p>
 <table>
 <tr><th>Task</th><th>Command</th></tr>
-<tr><td>Full backup now (DB + files + config)</td><td><code>sudo /opt/scripts/frappe_backup.sh</code></td></tr>
-<tr><td>Quick database-only backup</td><td><code>sudo /opt/scripts/frappe_db_backup.sh</code></td></tr>
-<tr><td>Check backups are complete &amp; recent</td><td><code>sudo /opt/scripts/frappe_backup_verify.sh</code></td></tr>
+<tr><td>Full backup now (DB + files + config)</td><td><code>sudo /opt/scripts/v2/frappe_backup.sh</code></td></tr>
+<tr><td>Quick database-only backup</td><td><code>sudo /opt/scripts/v2/frappe_db_backup.sh</code></td></tr>
+<tr><td>Check backups are complete &amp; recent</td><td><code>sudo /opt/scripts/v2/frappe_backup_verify.sh</code></td></tr>
 <tr><td>See what is stored</td><td><code>ls -lh /opt/backups/frappe/</code></td></tr>
-<tr><td>Watch the backup log</td><td><code>tail -f /var/log/frappe_backup.log</code></td></tr>
+<tr><td>Watch the backup log</td><td><code>tail -f /var/log/frappe_backup_v2.log</code></td></tr>
 </table>
 <p>Retention is automatic: full backups are kept <b>30 days</b>, database-only dumps <b>14 days</b>.
-To change this, edit <code>RETENTION_DAYS</code> at the top of the respective script in <code>/opt/scripts/</code>.</p>
+To change this, edit <code>RETENTION_DAYS</code> at the top of the respective script in <code>/opt/scripts/v2/</code>.</p>
 
 <div class="note"><b>Good habit:</b> run a manual full backup before any risky change
 (new app install, configuration change, server maintenance) — and always before an update,
@@ -199,7 +215,7 @@ with the backup contents. Anything entered after the backup was taken is lost.</
 <pre>grep MARIADB_ROOT_PASSWORD /opt/sspl-erp/.env</pre>
 
 <h3>Step 3 — Run the restore</h3>
-<pre>sudo /opt/scripts/frappe_restore.sh /opt/backups/frappe/20260712_020000</pre>
+<pre>sudo /opt/scripts/v2/frappe_restore.sh /opt/backups/frappe/20260712_020000</pre>
 <p>The script will:</p>
 <ol>
   <li>Ask for the site name (press Enter to accept the configured default).</li>
@@ -219,20 +235,23 @@ to cloud storage. Full provider walkthrough: see <i>Rclone_Configuration_Guide.d
 rclone config          # create a remote, e.g. named "gdrive"</pre>
 
 <h3>Step 2 — Point the backup script at the remote</h3>
-<p>Edit <code>/opt/scripts/frappe_backup.sh</code> and set the variable near the top:</p>
+<p>Edit <code>/opt/scripts/v2/frappe_backup.sh</code> and set the variable near the top:</p>
 <pre>RCLONE_REMOTE="gdrive:frappe-backups"</pre>
 <p>Every full backup is then uploaded automatically after it completes. If the upload fails, the
 backup still exists locally and a warning is written to the log.</p>
 
 <h3>Step 3 — Test it</h3>
-<pre>sudo /opt/scripts/frappe_backup.sh
+<pre>sudo /opt/scripts/v2/frappe_backup.sh
 rclone ls gdrive:frappe-backups | head</pre>
 
 <div class="pagebreak"></div>
 <h2>7. Part 2 — Update &amp; rollback system: installation</h2>
 
 <h3>Step 1 — Copy the four scripts</h3>
-<p>Copy these from <code>Production Installation/update and rollback/</code> into <code>/opt/sspl-erp/</code>:</p>
+<p>Copy these from <code>Production Installation/update and rollback/</code> into
+<code>/opt/sspl-erp/v2/</code> (create it with <code>sudo mkdir -p /opt/sspl-erp/v2</code>).
+Older <code>sspl-erp-*.sh</code> scripts directly in <code>/opt/sspl-erp/</code> stay untouched
+as a fallback; both versions share the same <code>image-backups/</code> snapshots.</p>
 <ul>
   <li><code>sspl-erp-common.sh</code> — shared configuration (sourced by the others, not run directly)</li>
   <li><code>sspl-erp-update-with-rollback.sh</code></li>
@@ -241,20 +260,20 @@ rclone ls gdrive:frappe-backups | head</pre>
 </ul>
 
 <h3>Step 2 — Set the site name</h3>
-<p>Edit <code>/opt/sspl-erp/sspl-erp-common.sh</code> and set the variable at the top
+<p>Edit <code>/opt/sspl-erp/v2/sspl-erp-common.sh</code> and set the variable at the top
 (this is the <b>only</b> place it needs changing):</p>
 <pre>SITE_NAME="192.168.225.135"</pre>
 
 <h3>Step 3 — Make the scripts executable</h3>
-<pre>cd /opt/sspl-erp
+<pre>cd /opt/sspl-erp/v2
 chmod +x sspl-erp-update-with-rollback.sh sspl-erp-rollback.sh sspl-erp-backup-manager.sh</pre>
 
-<div class="note"><b>Note:</b> the update script calls <code>/opt/scripts/frappe_backup.sh</code>,
+<div class="note"><b>Note:</b> the update script calls <code>/opt/scripts/v2/frappe_backup.sh</code>,
 so install Part 1 first.</div>
 
 <h2>8. Part 2 — Updating the system</h2>
 <p>When a new image has been published to GHCR (<code>ghcr.io/santhosh3279/sspl-erpnext</code>):</p>
-<pre>cd /opt/sspl-erp
+<pre>cd /opt/sspl-erp/v2
 ./sspl-erp-update-with-rollback.sh</pre>
 <p>What it does, in order:</p>
 <ol>
@@ -277,7 +296,7 @@ docker compose exec backend bench --site 192.168.225.135 doctor</pre>
 <div class="pagebreak"></div>
 <h2>9. Part 2 — Rolling back an update</h2>
 <p>If the system misbehaves after an update:</p>
-<pre>cd /opt/sspl-erp
+<pre>cd /opt/sspl-erp/v2
 ./sspl-erp-rollback.sh</pre>
 <p>The script shows the most recent image snapshot (size and date), asks for confirmation, stops the
 services, loads the saved images, restarts, repairs DB grants, and clears the cache.</p>
@@ -308,23 +327,23 @@ gives manual control:</p>
 <p>Installed by the Part 1 setup script (view with <code>sudo crontab -l</code>):</p>
 <table>
 <tr><th>Schedule</th><th>Job</th><th>Log file</th></tr>
-<tr><td>Daily, 02:00</td><td>Full backup — <code>frappe_backup.sh</code></td><td><code>/var/log/frappe_backup.log</code></td></tr>
-<tr><td>Every 6 hours</td><td>DB-only backup — <code>frappe_db_backup.sh</code></td><td><code>/var/log/frappe_db_backup.log</code></td></tr>
-<tr><td>Sunday, 03:00</td><td>Backup verification — <code>frappe_backup_verify.sh</code></td><td><code>/var/log/frappe_backup_verify.log</code></td></tr>
+<tr><td>Daily, 02:00</td><td>Full backup — <code>frappe_backup.sh</code></td><td><code>/var/log/frappe_backup_v2.log</code></td></tr>
+<tr><td>Every 6 hours</td><td>DB-only backup — <code>frappe_db_backup.sh</code></td><td><code>/var/log/frappe_db_backup_v2.log</code></td></tr>
+<tr><td>Sunday, 03:00</td><td>Backup verification — <code>frappe_backup_verify.sh</code></td><td><code>/var/log/frappe_backup_verify_v2.log</code></td></tr>
 </table>
 <p>Optional — weekly cleanup of image snapshots (add with <code>sudo crontab -e</code>):</p>
-<pre>0 2 * * 0 /opt/sspl-erp/sspl-erp-backup-manager.sh clean 5 --yes >> /var/log/sspl-erp-backup-clean.log 2>&amp;1</pre>
+<pre>0 2 * * 0 /opt/sspl-erp/v2/sspl-erp-backup-manager.sh clean 5 --yes >> /var/log/sspl-erp-backup-clean.log 2>&amp;1</pre>
 
 <div class="pagebreak"></div>
 <h2>12. Quick command reference</h2>
 <table>
 <tr><th>I want to…</th><th>Run</th></tr>
-<tr><td>Back up everything now</td><td><code>sudo /opt/scripts/frappe_backup.sh</code></td></tr>
-<tr><td>Back up only the database</td><td><code>sudo /opt/scripts/frappe_db_backup.sh</code></td></tr>
-<tr><td>Check my backups are OK</td><td><code>sudo /opt/scripts/frappe_backup_verify.sh</code></td></tr>
-<tr><td>Restore a backup</td><td><code>sudo /opt/scripts/frappe_restore.sh /opt/backups/frappe/&lt;TIMESTAMP&gt;</code></td></tr>
-<tr><td>Update to the latest release</td><td><code>cd /opt/sspl-erp &amp;&amp; ./sspl-erp-update-with-rollback.sh</code></td></tr>
-<tr><td>Undo the last update</td><td><code>cd /opt/sspl-erp &amp;&amp; ./sspl-erp-rollback.sh</code></td></tr>
+<tr><td>Back up everything now</td><td><code>sudo /opt/scripts/v2/frappe_backup.sh</code></td></tr>
+<tr><td>Back up only the database</td><td><code>sudo /opt/scripts/v2/frappe_db_backup.sh</code></td></tr>
+<tr><td>Check my backups are OK</td><td><code>sudo /opt/scripts/v2/frappe_backup_verify.sh</code></td></tr>
+<tr><td>Restore a backup</td><td><code>sudo /opt/scripts/v2/frappe_restore.sh /opt/backups/frappe/&lt;TIMESTAMP&gt;</code></td></tr>
+<tr><td>Update to the latest release</td><td><code>cd /opt/sspl-erp/v2 &amp;&amp; ./sspl-erp-update-with-rollback.sh</code></td></tr>
+<tr><td>Undo the last update</td><td><code>cd /opt/sspl-erp/v2 &amp;&amp; ./sspl-erp-rollback.sh</code></td></tr>
 <tr><td>See image snapshots</td><td><code>./sspl-erp-backup-manager.sh list</code></td></tr>
 <tr><td>Free disk space</td><td><code>./sspl-erp-backup-manager.sh clean 3</code></td></tr>
 <tr><td>Check services</td><td><code>docker compose ps</code></td></tr>
@@ -335,9 +354,9 @@ gives manual control:</p>
 <h2>13. Troubleshooting</h2>
 
 <h3>Backup verification says something is MISSING</h3>
-<pre>sudo tail -50 /var/log/frappe_backup.log      # find the failing step
+<pre>sudo tail -50 /var/log/frappe_backup_v2.log      # find the failing step
 ls -lh /opt/backups/frappe/&lt;latest&gt;/          # see what was actually saved
-sudo /opt/scripts/frappe_backup.sh            # re-run manually and watch the output</pre>
+sudo /opt/scripts/v2/frappe_backup.sh            # re-run manually and watch the output</pre>
 
 <h3>Update failed partway through</h3>
 <p>The script prints instructions when it fails. In short: roll back the images with
@@ -359,12 +378,12 @@ docker compose exec backend bench --site 192.168.225.135 doctor</pre>
 <h3>Disk is filling up</h3>
 <pre>du -sh /opt/sspl-erp/image-backups /opt/backups/frappe
 ./sspl-erp-backup-manager.sh clean 2           # image snapshots
-# Data backup retention: lower RETENTION_DAYS in /opt/scripts/frappe_backup.sh</pre>
+# Data backup retention: lower RETENTION_DAYS in /opt/scripts/v2/frappe_backup.sh</pre>
 
 <h3>Cron jobs not running</h3>
 <pre>sudo crontab -l                                # jobs present?
 grep CRON /var/log/syslog | tail               # did they fire?
-sudo tail /var/log/frappe_backup.log           # what did they say?</pre>
+sudo tail /var/log/frappe_backup_v2.log           # what did they say?</pre>
 
 </body>
 </html>

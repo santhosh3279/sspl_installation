@@ -37,6 +37,13 @@ chmod +x frappe_backup_verify.sh setup_frappe_backups.sh
 sudo ./setup_frappe_backups.sh
 ```
 
+The installer copies the scripts to `/opt/scripts/v2/`. Any older backup
+scripts directly in `/opt/scripts/` are left untouched, so you can keep
+using them as a fallback. Both versions store backups in the same place
+(`/opt/backups/frappe/`). If the old scripts are still scheduled in cron,
+either remove those lines (`sudo crontab -e`) or answer `no` to the
+installer's cron question so backups do not run twice.
+
 ### 2. Find Your Site Name
 ```bash
 docker compose -f /opt/sspl-erp/docker-compose.yml exec backend ls sites/
@@ -51,7 +58,7 @@ Update the following in each script:
 
 ### 4. Test Manual Backup
 ```bash
-sudo /opt/scripts/frappe_backup.sh
+sudo /opt/scripts/v2/frappe_backup.sh
 ```
 
 Check if backup was created:
@@ -79,13 +86,13 @@ sudo crontab -e
 ### Custom Schedule Examples:
 ```cron
 # Hourly DB backups during business hours (9 AM - 6 PM)
-0 9-18 * * * /opt/scripts/frappe_db_backup.sh >> /var/log/frappe_db_backup.log 2>&1
+0 9-18 * * * /opt/scripts/v2/frappe_db_backup.sh >> /var/log/frappe_db_backup.log 2>&1
 
 # Full backup twice daily (2 AM and 2 PM)
-0 2,14 * * * /opt/scripts/frappe_backup.sh >> /var/log/frappe_backup.log 2>&1
+0 2,14 * * * /opt/scripts/v2/frappe_backup.sh >> /var/log/frappe_backup.log 2>&1
 
 # Weekly full backup only (Sunday 3 AM)
-0 3 * * 0 /opt/scripts/frappe_backup.sh >> /var/log/frappe_backup.log 2>&1
+0 3 * * 0 /opt/scripts/v2/frappe_backup.sh >> /var/log/frappe_backup.log 2>&1
 ```
 
 ## Backup Retention
@@ -95,7 +102,7 @@ Default: 30 days for full backups, 14 days for DB-only backups
 ### Adjust Retention:
 Edit `RETENTION_DAYS` in scripts:
 ```bash
-sudo nano /opt/scripts/frappe_backup.sh
+sudo nano /opt/scripts/v2/frappe_backup.sh
 # Change: RETENTION_DAYS=30  to your preferred value
 ```
 
@@ -114,7 +121,7 @@ ls -lh /opt/backups/frappe/
 
 ### 2. Restore from Backup:
 ```bash
-sudo /opt/scripts/frappe_restore.sh /opt/backups/frappe/20250330_020000
+sudo /opt/scripts/v2/frappe_restore.sh /opt/backups/frappe/20250330_020000
 ```
 
 ### 3. Manual Restore (if script fails):
@@ -211,7 +218,7 @@ docker compose -f /opt/sspl-erp/docker-compose.yml ps
 ls -la /opt/backups/frappe/
 
 # Run with verbose logging
-bash -x /opt/scripts/frappe_backup.sh
+bash -x /opt/scripts/v2/frappe_backup.sh
 ```
 
 ### Container Not Found:
@@ -272,16 +279,16 @@ docker compose -f /opt/sspl-erp/docker-compose.yml exec backend \
 
 ```bash
 # Manual full backup
-sudo /opt/scripts/frappe_backup.sh
+sudo /opt/scripts/v2/frappe_backup.sh
 
 # Manual DB backup
-sudo /opt/scripts/frappe_db_backup.sh
+sudo /opt/scripts/v2/frappe_db_backup.sh
 
 # Verify backups
-sudo /opt/scripts/frappe_backup_verify.sh
+sudo /opt/scripts/v2/frappe_backup_verify.sh
 
 # Restore
-sudo /opt/scripts/frappe_restore.sh /path/to/backup
+sudo /opt/scripts/v2/frappe_restore.sh /path/to/backup
 
 # Check cron jobs
 sudo crontab -l

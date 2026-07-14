@@ -1,14 +1,16 @@
-# Frappe Backup Cron Jobs
+# Frappe Backup Cron Jobs (v2 scripts in /opt/scripts/v2/)
 # Add these to root crontab: sudo crontab -e
+# If old backup jobs pointing at /opt/scripts/ are still present,
+# remove or comment them out so backups do not run twice.
 
 # Full backup daily at 2 AM
-0 2 * * * /opt/scripts/frappe_backup.sh >> /var/log/frappe_backup.log 2>&1
+0 2 * * * /opt/scripts/v2/frappe_backup.sh >> /var/log/frappe_backup_v2.log 2>&1
 
 # Database-only backup every 6 hours
-0 */6 * * * /opt/scripts/frappe_db_backup.sh >> /var/log/frappe_db_backup.log 2>&1
+0 */6 * * * /opt/scripts/v2/frappe_db_backup.sh >> /var/log/frappe_db_backup_v2.log 2>&1
 
 # Weekly verification (check if backups exist)
-0 3 * * 0 /opt/scripts/frappe_backup_verify.sh >> /var/log/frappe_backup_verify.log 2>&1
+0 3 * * 0 /opt/scripts/v2/frappe_backup_verify.sh >> /var/log/frappe_backup_verify_v2.log 2>&1
 
 # Log rotation for backup logs
 0 0 1 * * find /var/log/frappe_*.log -mtime +30 -delete

@@ -7,7 +7,7 @@ source "$(dirname "$0")/sspl-erp-common.sh"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 BACKUP_FILE="$BACKUP_DIR/backup_$TIMESTAMP.tar"
 
-trap 'echo ""; echo "❌ Update failed!"; echo "   Services may be in a partial state."; echo "   To roll back images: ./sspl-erp-rollback.sh"; echo "   To restore data:      sudo /opt/scripts/frappe_restore.sh <backup-folder>"' ERR
+trap 'echo ""; echo "❌ Update failed!"; echo "   Services may be in a partial state."; echo "   To roll back images: /opt/sspl-erp/v2/sspl-erp-rollback.sh"; echo "   To restore data:      sudo /opt/scripts/v2/frappe_restore.sh <backup-folder>"' ERR
 
 echo "=============================="
 echo " SSPL ERP Update - $(date)"
@@ -15,7 +15,7 @@ echo "=============================="
 
 # Run Frappe backup first
 echo "→ Running Frappe backup..."
-if sudo /opt/scripts/frappe_backup.sh; then
+if sudo /opt/scripts/v2/frappe_backup.sh; then
     echo "   ✓ Frappe backup completed successfully"
 else
     echo "   ⚠ Frappe backup failed!"
@@ -97,4 +97,4 @@ else
 fi
 
 echo ""
-echo "   To rollback, run: ./sspl-erp-rollback.sh"
+echo "   To rollback, run: /opt/sspl-erp/v2/sspl-erp-rollback.sh"
