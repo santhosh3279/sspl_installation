@@ -5,12 +5,16 @@
 # Automates the whole "SSPL ERP Production Deployment Guide" (the docx in
 # this folder) plus the extra tooling in this repo, in a single run:
 #
-#   1. ERP stack     — frappe_docker + custom image from GHCR, .env,
-#                      pdf-fix override, generated docker-compose.yml,
-#                      site creation with all apps (one-time only)
+#   1. ERP stack     — via install_erp_stack.sh (frappe_docker, .env,
+#                      compose, image pull, start, site creation)
 #   2. Backup system — /opt/scripts/v2/ + cron jobs
-#   3. Update/rollback scripts — /opt/sspl-erp/v2/
-#   4. Web admin panel — /opt/sspl-admin/ (HTTPS, port 8090)
+#      Update/rollback scripts — via update and rollback/install_update_rollback.sh
+#      Web admin panel — /opt/sspl-admin/ (HTTPS, port 8090)
+#   3. Terminal shortcuts (sudoers) for clear-RAM and manual backup
+#
+# The ERP-stack and update/rollback steps are delegated to standalone,
+# env-driven scripts so the web admin panel can run the exact same logic
+# from its "Install" switches. This file is the terminal fresh-server flow.
 #
 # All questions are asked UP FRONT; after that the install runs unattended
 # (image pull + site creation take 10-20 minutes total).
@@ -32,22 +36,12 @@
 set -e
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 ERP_DIR="${SSPL_ERP_DIR:-/opt/sspl-erp}"   # overridable for testing
-FD_DIR=$ERP_DIR/frappe_docker
 COMPOSE_FILE=$ERP_DIR/docker-compose.yml
-IMAGE=ghcr.io/santhosh3279/sspl-erpnext
 
 err()  { echo "❌ $*" >&2; exit 1; }
 step() { echo ""; echo "════════════════════════════════════════"; echo " $*"; echo "════════════════════════════════════════"; }
-
-dc() { sudo docker compose -f "$COMPOSE_FILE" "$@"; }
-
-# Cron lines pointing at /opt/scripts/ but not /opt/scripts/v2/ — an older
-# backup setup (e.g. the "Santhosh additions" in the deployment guide)
-# already running on this server.
-legacy_backup_cron() {
-    sudo crontab -l 2>/dev/null | grep -E '/opt/scripts/' | grep -v '/opt/scripts/v2/' || true
-}
 
 # ──────────────────────────────────────────────────────────── preflight checks
 step "SSPL ERP One-Time Installer — preflight"
@@ -141,203 +135,34 @@ echo "Ready to install:  site $SERVER_IP on port $HTTP_PORT"
 read -p "Proceed? [Y/n]: " GO
 [[ "${GO:-y}" =~ ^[Yy] ]] || err "Aborted by user."
 
-# ───────────────────────────────────────────── 1. working directory + frappe_docker
-step "1/7 Working directory and frappe_docker"
+# ───────────────────────────────────────────────── 1. ERPNext Docker stack
+step "1/3 ERPNext Docker stack and site"
 
-sudo mkdir -p "$ERP_DIR"
-sudo chown "$USER:$USER" "$ERP_DIR"
-
-if [ -d "$FD_DIR/.git" ]; then
-    echo "✓ frappe_docker already cloned — keeping it"
-else
-    git clone https://github.com/frappe/frappe_docker "$FD_DIR"
-fi
-
-# Docker group for day-to-day use (takes effect after next login; the
-# installer itself always uses sudo so this doesn't block anything)
+# Docker group for day-to-day use (terminal convenience; the installer
+# itself always uses sudo so this doesn't block anything). The panel path
+# doesn't need this, so it lives in the orchestrator, not the stack script.
 if ! id -nG "$USER" | grep -qw docker; then
     sudo usermod -aG docker "$USER"
     echo "✓ Added $USER to the docker group (log out/in once to use docker without sudo)"
 fi
 
-# ─────────────────────────────────────────────────────────── 2. .env + override
-step "2/7 Environment file and pdf-fix override"
+# All the heavy lifting (frappe_docker, .env, compose, pull, start, site
+# creation, grants) lives in install_erp_stack.sh, shared with the panel.
+SERVER_IP="$SERVER_IP" HTTP_PORT="$HTTP_PORT" \
+    DB_PASSWORD="$DB_PASSWORD" ADMIN_PASSWORD="$ADMIN_PASSWORD" \
+    SSPL_ERP_DIR="$ERP_DIR" \
+    bash "$HERE/install_erp_stack.sh"
 
-ENV_FILE="$FD_DIR/.env"
-if [ -f "$ENV_FILE" ]; then
-    cp "$ENV_FILE" "$ENV_FILE.bak.$(date +%Y%m%d_%H%M%S)"
-    echo "✓ Existing .env backed up"
-fi
-cat > "$ENV_FILE" <<EOF
-# Image
-CUSTOM_IMAGE=$IMAGE
-CUSTOM_TAG=latest
-PULL_POLICY=always
+# ──────────────────────────────────────────────────────────── 2. extra tooling
+step "2/3 Backup system and update/rollback scripts"
 
-# Site — the server's LAN IP
-SITE_NAME=$SERVER_IP
-FRAPPE_SITE_NAME_HEADER=$SERVER_IP
-
-# Database root password
-DB_PASSWORD=$DB_PASSWORD
-
-# Workers
-WORKER_REPLICAS=2
-
-# External port: browsers use http://$SERVER_IP:$HTTP_PORT and socket.io
-# must be told the same external port (not the internal 9000)
-HTTP_PUBLISH_PORT=$HTTP_PORT
-SOCKETIO_PORT=$HTTP_PORT
-EOF
-chmod 600 "$ENV_FILE"
-echo "✓ Wrote $ENV_FILE"
-
-# The update/rollback scripts read the root password from /opt/sspl-erp/.env
-cat > "$ERP_DIR/.env" <<EOF
-MARIADB_ROOT_PASSWORD=$DB_PASSWORD
-EOF
-chmod 600 "$ERP_DIR/.env"
-echo "✓ Wrote $ERP_DIR/.env (used by the update/rollback scripts)"
-
-# PDF-fix override: lets wkhtmltopdf inside the containers reach the site
-# through host.docker.internal, and pins socketio_port to the external port
-cat > "$FD_DIR/overrides/compose.pdf-fix.yaml" <<'EOF'
-services:
-  backend:
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-  queue-short:
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-  queue-long:
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-  scheduler:
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-  configurator:
-    environment:
-      FRAPPE_HOST_NAME: "http://host.docker.internal:${HTTP_PUBLISH_PORT:-8080}"
-    command:
-      - |
-        ls -1 apps > sites/apps.txt
-        bench set-config -g db_host $$DB_HOST
-        bench set-config -gp db_port $$DB_PORT
-        bench set-config -g redis_cache "redis://$$REDIS_CACHE"
-        bench set-config -g redis_queue "redis://$$REDIS_QUEUE"
-        bench set-config -g redis_socketio "redis://$$REDIS_QUEUE"
-        bench set-config -gp socketio_port $$SOCKETIO_PORT
-        bench set-config -g host_name "$$FRAPPE_HOST_NAME"
-EOF
-echo "✓ Wrote overrides/compose.pdf-fix.yaml"
-
-# ─────────────────────────────────────────────── 3. generate docker-compose.yml
-step "3/7 Generating $COMPOSE_FILE"
-
-(cd "$FD_DIR" && sudo docker compose \
-    -f compose.yaml \
-    -f overrides/compose.mariadb.yaml \
-    -f overrides/compose.redis.yaml \
-    -f overrides/compose.noproxy.yaml \
-    -f overrides/compose.pdf-fix.yaml \
-    --env-file .env config) > "$COMPOSE_FILE"
-echo "✓ Generated merged compose file"
-
-if ! grep -Eq "published:? \"?$HTTP_PORT\"?" "$COMPOSE_FILE"; then
-    echo "⚠ WARNING: port $HTTP_PORT not found in the generated compose file."
-    echo "  Check the 'frontend' service ports in $COMPOSE_FILE before going live."
-fi
-
-# ─────────────────────────────────────────────────────── 4. pull + start stack
-step "4/7 Pulling image and starting containers"
-
-sudo docker pull "$IMAGE:latest"
-dc up -d
-dc ps
-
-echo "→ Waiting for database to be ready..."
-WAITED=0
-until dc exec -T -e MYSQL_PWD="$DB_PASSWORD" db mariadb-admin -uroot ping --silent >/dev/null 2>&1; do
-    WAITED=$((WAITED + 5))
-    if [ "$WAITED" -ge 300 ]; then
-        err "Database not ready after 300s — check: sudo docker compose -f $COMPOSE_FILE logs db"
-    fi
-    sleep 5
-done
-echo "→ Waiting for backend to be ready..."
-until dc exec -T backend true >/dev/null 2>&1; do
-    WAITED=$((WAITED + 5))
-    if [ "$WAITED" -ge 300 ]; then
-        err "Backend not ready after 300s — check: sudo docker compose -f $COMPOSE_FILE logs backend"
-    fi
-    sleep 5
-done
-echo "✓ Services are up"
-
-# ──────────────────────────────────────────────────── 5. create the site (once)
-step "5/7 ERPNext site $SERVER_IP"
-
-if dc exec -T backend test -d "sites/$SERVER_IP" 2>/dev/null; then
-    echo "✓ Site $SERVER_IP already exists — skipping creation (one-time step)"
-else
-    # Install every app shipped in the image (erpnext, india_compliance,
-    # ssplbilling, printer_server_configuration, frappe_whatsapp, ...)
-    APP_ARGS=""
-    for app in $(dc exec -T backend ls apps); do
-        [ "$app" = "frappe" ] && continue
-        APP_ARGS="$APP_ARGS --install-app $app"
-    done
-    echo "→ Creating site with apps:$(echo "$APP_ARGS" | sed 's/--install-app//g')"
-    echo "  (this takes 5-10 minutes — do not interrupt)"
-    dc exec -T backend bench new-site "$SERVER_IP" \
-        --mariadb-root-password "$DB_PASSWORD" \
-        --admin-password "$ADMIN_PASSWORD" \
-        $APP_ARGS
-    echo "✓ Site created"
-fi
-
-dc exec -T backend bench use "$SERVER_IP"
-echo "✓ $SERVER_IP set as default site"
-
-# Re-create the site DB user with host '%' so grants survive container
-# IP changes (same fix the update script applies after every update)
-SITE_CONFIG=$(dc exec -T backend bash -c "cat sites/$SERVER_IP/site_config.json" 2>/dev/null || true)
-DB_NAME=$(echo "$SITE_CONFIG" | grep -oP '"db_name":\s*"\K[^"]+' || true)
-DB_PASS=$(echo "$SITE_CONFIG" | grep -oP '"db_password":\s*"\K[^"]+' || true)
-if [ -n "$DB_NAME" ] && [ -n "$DB_PASS" ]; then
-    dc exec -T -e MYSQL_PWD="$DB_PASSWORD" db mariadb -uroot -e "
-        DROP USER IF EXISTS '${DB_NAME}'@'%';
-        CREATE USER '${DB_NAME}'@'%' IDENTIFIED BY '${DB_PASS}';
-        GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_NAME}'@'%';
-        FLUSH PRIVILEGES;" 2>/dev/null \
-        && echo "✓ Database grants fixed for '%' host" \
-        || echo "⚠ Grant fix failed (may already be correct)"
-fi
-
-sudo systemctl enable docker >/dev/null 2>&1 || true
-echo "✓ Docker auto-start on reboot enabled"
-
-# ──────────────────────────────────────────────────────────── 6. extra tooling
-step "6/7 Backup system, update/rollback scripts, admin panel"
-
-BACKUP_CRON_SKIPPED=""
 if [[ "$WANT_BACKUPS" =~ ^[Yy] ]]; then
     echo "→ Installing backup system (/opt/scripts/v2)..."
-    CRON_FLAG=yes
-    LEGACY_CRON=$(legacy_backup_cron)
-    if [ -n "$LEGACY_CRON" ]; then
-        echo "   ⚠ Found existing cron job(s) not under /opt/scripts/v2/ — this looks like an"
-        echo "     older backup setup already running on this server:"
-        echo "$LEGACY_CRON" | sed 's/^/       /'
-        echo "   → Skipping automatic v2 cron install so backups don't run twice."
-        echo "     Scripts are still installed at /opt/scripts/v2/ — switch over manually"
-        echo "     when ready:  sudo crontab -e  (remove the old lines above, then add the"
-        echo "     v2 lines from Backup/frappe_backup_system/frappe_backup.cron)"
-        CRON_FLAG=no
-        BACKUP_CRON_SKIPPED=1
-    fi
+    # setup_frappe_backups.sh itself skips cron scheduling if it detects an
+    # older backup cron job (so backups can't run twice) — that check is
+    # shared by this path and the web panel's "Install backups" switch.
     (cd "$REPO_DIR/Backup/frappe_backup_system" && \
-        SSPL_SITE_NAME="$SERVER_IP" SSPL_INSTALL_CRON="$CRON_FLAG" SSPL_RUN_TEST=no \
+        SSPL_SITE_NAME="$SERVER_IP" SSPL_INSTALL_CRON=yes SSPL_RUN_TEST=no \
         bash setup_frappe_backups.sh)
 else
     echo "– Backup system skipped"
@@ -345,12 +170,8 @@ fi
 
 if [[ "$WANT_UPDATES" =~ ^[Yy] ]]; then
     echo "→ Installing update/rollback scripts (/opt/sspl-erp/v2)..."
-    sudo mkdir -p "$ERP_DIR/v2" "$ERP_DIR/image-backups"
-    sudo cp "$REPO_DIR/Production Installation/update and rollback/"sspl-erp-*.sh "$ERP_DIR/v2/"
-    sudo sed -i "s/^SITE_NAME=.*/SITE_NAME=\"$SERVER_IP\"/" "$ERP_DIR/v2/sspl-erp-common.sh"
-    sudo chown root:root "$ERP_DIR/v2/"sspl-erp-*.sh
-    sudo chmod 755 "$ERP_DIR/v2/"sspl-erp-*.sh
-    echo "   ✓ Installed (site name set to $SERVER_IP)"
+    SERVER_IP="$SERVER_IP" SSPL_ERP_DIR="$ERP_DIR" \
+        bash "$HERE/update and rollback/install_update_rollback.sh"
 else
     echo "– Update/rollback scripts skipped"
 fi
@@ -365,8 +186,8 @@ else
     echo "– Admin panel skipped"
 fi
 
-# ─────────────────────────────────── 7. terminal convenience (sudoers entries)
-step "7/7 Terminal shortcuts (sudoers)"
+# ─────────────────────────────────── 3. terminal convenience (sudoers entries)
+step "3/3 Terminal shortcuts (sudoers)"
 
 # Lets this user clear RAM caches and trigger a manual backup from the
 # terminal without a password (the "Santhosh additions" in the guide)
@@ -396,12 +217,8 @@ if [[ "$WANT_PANEL" =~ ^[Yy] ]]; then
     echo "                certificate, so the browser warns once: Advanced → Proceed)"
 fi
 if [[ "$WANT_BACKUPS" =~ ^[Yy] ]]; then
-    if [ -n "$BACKUP_CRON_SKIPPED" ]; then
-        echo "Backups:        scripts installed, cron NOT scheduled (old cron jobs found —"
-        echo "                see the warning above) — /opt/backups/frappe/"
-    else
-        echo "Backups:        daily 02:00 full + 6-hourly DB — /opt/backups/frappe/"
-    fi
+    echo "Backups:        installed — /opt/backups/frappe/ (see the backup step above"
+    echo "                for whether cron was scheduled or skipped)"
 fi
 if [[ "$WANT_UPDATES" =~ ^[Yy] ]]; then
     echo "Updates:        sudo /opt/sspl-erp/v2/sspl-erp-update-with-rollback.sh"

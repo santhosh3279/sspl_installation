@@ -67,6 +67,23 @@ if [ -z "$INSTALL_CRON" ]; then
     read -p "Install cron jobs: " INSTALL_CRON
 fi
 
+# Don't double-schedule: if the crontab already has backup lines pointing at
+# /opt/scripts/ outside /opt/scripts/v2/ (e.g. an older hand-wired backup),
+# skip installing the v2 cron jobs so backups don't run twice. This runs on
+# both the terminal and the web-panel install paths.
+if [ "$INSTALL_CRON" = "yes" ]; then
+    LEGACY_CRON=$(sudo crontab -l 2>/dev/null | grep -E '/opt/scripts/' | grep -v '/opt/scripts/v2/' || true)
+    if [ -n "$LEGACY_CRON" ]; then
+        echo ""
+        echo "⚠ Existing backup cron job(s) found outside /opt/scripts/v2/:"
+        echo "$LEGACY_CRON" | sed 's/^/    /'
+        echo "  → NOT scheduling the v2 cron jobs, to avoid running backups twice."
+        echo "    The v2 scripts are installed; when ready, switch over with 'sudo crontab -e'"
+        echo "    (remove the old lines above, then add the v2 lines from frappe_backup.cron)."
+        INSTALL_CRON=no
+    fi
+fi
+
 if [ "$INSTALL_CRON" = "yes" ]; then
     # Add to root crontab
     (sudo crontab -l 2>/dev/null || true; echo "") | sudo tee /tmp/crontab.tmp > /dev/null

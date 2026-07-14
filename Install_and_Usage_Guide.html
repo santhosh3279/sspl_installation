@@ -111,8 +111,9 @@
   <li><b>Update &amp; rollback system</b> (<code>Production Installation/update and rollback/</code>) — safely pulls
       new Docker images from GHCR, taking a full data backup and a Docker image snapshot first, so a bad
       update can be rolled back. Installed to <code>/opt/sspl-erp/v2/</code>.</li>
-  <li><b>Web admin panel</b> (<code>Admin Panel/</code>) — a browser interface (HTTPS, admin login) that runs
-      the backup / update / rollback scripts, shows server health and backup files, clears RAM caches, and
+  <li><b>Web admin panel</b> (<code>Admin Panel/</code>) — a browser interface (HTTPS, admin login) that can
+      <b>install ERPNext and the other two parts from the browser</b> (Setup switches), then runs the
+      backup / update / rollback scripts, shows server health and backup files, clears RAM caches, and
       accepts backup file uploads. Installed to <code>/opt/sspl-admin/</code>, served on port <b>8090</b>.
       See section 13.</li>
 </ul>
@@ -392,24 +393,42 @@ gives manual control:</p>
 
 <div class="pagebreak"></div>
 <h2>13. Part 3 — Web admin panel</h2>
-<p>A browser interface for everything above: run backups, updates, and rollbacks with one click,
-watch the script output live, browse and download backup files, monitor CPU / memory / disk /
-container health, clear RAM caches, and upload backup files to the server.</p>
+<p>A browser interface for everything above: <b>install the whole system from the browser</b>, then
+run backups, updates, and rollbacks with one click, watch the script output live, browse and download
+backup files, monitor CPU / memory / disk / container health, clear RAM caches, and upload backup
+files to the server.</p>
 
 <h3>Installation</h3>
-<pre>cd "Admin Panel"
+<pre>git clone https://github.com/santhosh3279/sspl_installation.git
+cd sspl_installation/"Admin Panel"
 chmod +x setup_admin_panel.sh
 ./setup_admin_panel.sh</pre>
 <p>The installer asks for an admin username, password, port (default <b>8090</b>), and the server IP
-for the HTTPS certificate. It installs a Python environment to <code>/opt/sspl-admin/</code> and starts
-a systemd service (<code>sspl-admin</code>) that survives reboots. Parts 1 and 2 must be installed
-first — the panel's buttons run those v2 scripts.</p>
+for the HTTPS certificate. It installs a Python environment to <code>/opt/sspl-admin/</code>, records
+the repo location (<code>repo_dir</code> in its config), and starts a systemd service
+(<code>sspl-admin</code>) that survives reboots.</p>
+<div class="note"><b>The panel can install everything else</b> — Parts 1 and 2 do <i>not</i> need to be
+in place first. Keep the git checkout on the server (the Setup switches run the installers from it;
+<code>git pull</code> there keeps them current).</div>
 
-<h3>Using the panel</h3>
+<h3>Panel-first setup</h3>
 <p>Open <code>https://&lt;server-ip&gt;:8090</code> and log in. The certificate is self-signed (a LAN IP
 cannot get a public certificate), so the browser warns the <b>first</b> time — click
 <i>Advanced → Proceed</i>; the connection is fully encrypted either way. To remove the warning on a
 particular PC, import <code>/opt/sspl-admin/certs/sspl-admin.crt</code> into its trusted store.</p>
+<p>The <b>Setup — install components</b> card at the top shows what is installed and lets you install
+the rest, in order:</p>
+<ol>
+  <li><b>ERPNext stack</b> — enter the server IP, HTTP port, MariaDB root password, and Administrator
+      password, then click <i>Install ERPNext</i>. This pulls the image, starts the containers, and
+      creates the site (10–20 minutes); progress streams into the job console. The passwords are sent
+      over HTTPS as environment variables and are never written to the log.</li>
+  <li><b>Backup system</b> and <b>Update &amp; rollback scripts</b> — enabled once ERPNext is
+      installed, and reuse the deployed site name automatically. One click each.</li>
+</ol>
+<p>Each switch becomes an <i>installed ✓</i> status when done.</p>
+
+<h3>Day-to-day use</h3>
 <ul>
   <li><b>Actions</b> — full backup, DB-only backup, verify, system update, rollback (with a snapshot
       picker), and a Clear-RAM-caches button. Only one job runs at a time; its output streams into

@@ -8,6 +8,12 @@ set -e
 
 INSTALL_DIR=/opt/sspl-admin
 
+# The repo checkout root (this script lives in "<repo>/Admin Panel/"). The
+# panel's Install switches run the installers from here, so this path must
+# keep existing on the server after setup.
+REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+SERVER_IP="$(hostname -I | awk '{print $1}')"
+
 echo "=== SSPL ERP Admin Panel Setup ==="
 
 if [ ! -f app.py ] || [ ! -f sspl-admin.service ]; then
@@ -75,6 +81,7 @@ else
 fi
 
 ADMIN_USER="$ADMIN_USER" ADMIN_PW="$PW1" PORT="$PORT" CERT="$CERT" KEY="$KEY" \
+    REPO_DIR="$REPO_DIR" SERVER_IP="$SERVER_IP" \
     "$INSTALL_DIR/venv/bin/python" - <<'EOF' | sudo tee "$INSTALL_DIR/config.json" > /dev/null
 import json, os, secrets
 from werkzeug.security import generate_password_hash
@@ -85,6 +92,8 @@ print(json.dumps({
     "port": int(os.environ["PORT"]),
     "tls_cert": os.environ["CERT"],
     "tls_key": os.environ["KEY"],
+    "repo_dir": os.environ["REPO_DIR"],
+    "server_ip": os.environ["SERVER_IP"],
 }, indent=2))
 EOF
 sudo chown root:root "$INSTALL_DIR/config.json"

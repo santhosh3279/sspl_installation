@@ -36,9 +36,20 @@ DB_ONLY_DIR = BACKUP_DIR / "db-only"
 UPLOAD_DIR = BACKUP_DIR / "uploads"
 IMAGE_BACKUP_DIR = Path(CONFIG.get("image_backup_dir", "/opt/sspl-erp/image-backups"))
 COMPOSE_FILE = CONFIG.get("compose_file", "/opt/sspl-erp/docker-compose.yml")
+ERP_DIR = CONFIG.get("erp_dir", "/opt/sspl-erp")
 SCRIPTS_DIR = CONFIG.get("scripts_dir", "/opt/scripts/v2")
 UPDATE_DIR = CONFIG.get("update_dir", "/opt/sspl-erp/v2")
 JOB_DIR = Path(CONFIG.get("job_dir", "/opt/sspl-admin/jobs"))
+
+# Where this repo is checked out on the server, recorded by
+# setup_admin_panel.sh. The "Install" switches run the installers from here,
+# so `git pull` then a panel restart picks up newer installers.
+REPO_DIR = CONFIG.get("repo_dir")
+
+
+def _repo(rel):
+    return os.path.join(REPO_DIR, rel) if REPO_DIR else None
+
 
 ACTIONS = {
     "backup":    {"label": "Full backup",   "cmd": [f"{SCRIPTS_DIR}/frappe_backup.sh"]},
@@ -47,6 +58,23 @@ ACTIONS = {
     "update":    {"label": "System update",  "cmd": [f"{UPDATE_DIR}/sspl-erp-update-with-rollback.sh"]},
     "rollback":  {"label": "Rollback",       "cmd": [f"{UPDATE_DIR}/sspl-erp-rollback.sh"], "stdin": "yes\n"},
 }
+
+# Component installers, driven from the panel's Setup switches. Only wired
+# up when repo_dir is configured and the scripts are present on disk.
+ERP_STACK_SCRIPT = _repo("Production Installation/install_erp_stack.sh")
+BACKUP_SETUP_SCRIPT = _repo("Backup/frappe_backup_system/setup_frappe_backups.sh")
+UPDATE_SETUP_SCRIPT = _repo("Production Installation/update and rollback/install_update_rollback.sh")
+
+INSTALL_ACTIONS = {
+    "install_erp":     {"label": "Install ERPNext stack",   "cmd": ["bash", ERP_STACK_SCRIPT or ""]},
+    "install_backups": {"label": "Install backup system",   "cmd": ["bash", BACKUP_SETUP_SCRIPT or ""],
+                        "cwd": _repo("Backup/frappe_backup_system")},
+    "install_update":  {"label": "Install update/rollback", "cmd": ["bash", UPDATE_SETUP_SCRIPT or ""]},
+}
+if REPO_DIR:
+    ACTIONS.update(INSTALL_ACTIONS)
+
+IP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.\-]{0,60}$")
 
 UPLOAD_EXTENSIONS = (".sql.gz", ".gz", ".tar", ".tgz", ".json", ".yml", ".yaml")
 FULL_BACKUP_RE = re.compile(r"^20\d{6}_\d{6}$")
@@ -96,7 +124,7 @@ def start_job(name, extra_env=None):
             proc = subprocess.Popen(
                 action["cmd"], stdout=out, stderr=subprocess.STDOUT,
                 stdin=subprocess.PIPE if stdin_text else subprocess.DEVNULL,
-                env=env)
+                env=env, cwd=action.get("cwd"))
         except OSError as e:
             out.write(f"Failed to start {action['cmd'][0]}: {e}\n")
             out.close()
@@ -201,6 +229,52 @@ def container_status():
         result["error"] = str(e)[:300]
     _containers_cache.update(ts=now, data=result)
     return result
+
+
+# ---------------------------------------------------------------- setup / bootstrap
+
+def deployed_site_name():
+    """Read SITE_NAME from the deployed frappe_docker/.env, if present."""
+    envp = os.path.join(ERP_DIR, "frappe_docker", ".env")
+    try:
+        with open(envp) as f:
+            for line in f:
+                if line.startswith("SITE_NAME="):
+                    return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
+def first_ip():
+    try:
+        out = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=5)
+        parts = out.stdout.split()
+        return parts[0] if parts else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def setup_status():
+    """What is installed on this server, to drive the Setup switches."""
+    cs = container_status()
+    running = any(str(s.get("state", "")).lower().startswith(("running", "up"))
+                  for s in cs["services"])
+    scripts_ok = bool(REPO_DIR) and bool(ERP_STACK_SCRIPT) and os.path.isfile(ERP_STACK_SCRIPT)
+    return {
+        "repo_dir": REPO_DIR,
+        "repo_ok": scripts_ok,
+        "server_ip": CONFIG.get("server_ip") or first_ip(),
+        "components": {
+            "erp": {
+                "installed": os.path.isfile(COMPOSE_FILE),
+                "running": running,
+                "site": deployed_site_name(),
+            },
+            "backups": {"installed": os.path.isfile(os.path.join(SCRIPTS_DIR, "frappe_backup.sh"))},
+            "update":  {"installed": os.path.isfile(os.path.join(UPDATE_DIR, "sspl-erp-common.sh"))},
+        },
+    }
 
 
 def system_stats():
@@ -365,22 +439,69 @@ def api_job():
     return jsonify(job_status())
 
 
+@app.route("/api/setup-status")
+@login_required
+def api_setup_status():
+    return jsonify(setup_status())
+
+
 @app.route("/api/run/<name>", methods=["POST"])
 @login_required
 def api_run(name):
     if name not in ACTIONS:
         abort(404)
+    data = request.get_json(silent=True) or {}
     extra_env = None
+
     if name == "rollback":
-        snap = (request.get_json(silent=True) or {}).get("snapshot", "")
+        snap = data.get("snapshot", "")
         if snap:
             if not SNAPSHOT_RE.match(snap):
                 return jsonify({"error": "invalid snapshot name"}), 400
             extra_env = {"BACKUP_FILE": str(IMAGE_BACKUP_DIR / snap)}
+
+    elif name in INSTALL_ACTIONS:
+        if not REPO_DIR:
+            return jsonify({"error": "repo_dir is not configured on this server"}), 400
+        env, err = _install_env(name, data)
+        if err:
+            return jsonify({"error": err}), 400
+        extra_env = env
+
     job, err = start_job(name, extra_env)
     if err:
         return jsonify({"error": err}), 409
     return jsonify({"ok": True, "label": job["label"]})
+
+
+def _install_env(name, data):
+    """Build (and validate) the environment for an install action.
+    Returns (env_dict, None) or (None, error_message). Secrets stay in the
+    returned dict and are passed to the child as env vars — never logged."""
+    if name == "install_erp":
+        ip = str(data.get("server_ip", "")).strip()
+        port = str(data.get("http_port", "80")).strip() or "80"
+        db_pw = str(data.get("db_password", ""))
+        admin_pw = str(data.get("admin_password", ""))
+        if not IP_RE.match(ip):
+            return None, "enter a valid server IP / hostname"
+        if not (port.isdigit() and 1 <= int(port) <= 65535):
+            return None, "HTTP port must be a number between 1 and 65535"
+        if not db_pw or not admin_pw:
+            return None, "database root password and admin password are both required"
+        return {"SERVER_IP": ip, "HTTP_PORT": port,
+                "DB_PASSWORD": db_pw, "ADMIN_PASSWORD": admin_pw,
+                "SSPL_ERP_DIR": ERP_DIR}, None
+
+    # backups / update: derive the site name from the deployed ERP stack
+    site = deployed_site_name()
+    if not site:
+        return None, "install the ERPNext stack first (no deployed site found)"
+    if name == "install_backups":
+        schedule = data.get("schedule_cron", True)
+        return {"SSPL_SITE_NAME": site, "SSPL_RUN_TEST": "no",
+                "SSPL_INSTALL_CRON": "yes" if schedule else "no"}, None
+    return {"SERVER_IP": site, "SSPL_ERP_DIR": ERP_DIR}, None  # install_update
 
 
 @app.route("/api/clear-ram", methods=["POST"])
@@ -524,6 +645,12 @@ details{margin:2px 0} details summary{cursor:pointer}
 .tabs button.active{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
 .tabpane{display:none} .tabpane.active{display:block}
 .right{text-align:right}
+.setup-row{padding:10px 0;border-bottom:1px solid var(--hairline)}
+.setup-row:last-child{border-bottom:none}
+.setup-h{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.setup-form{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px}
+.setup-form input[type=text],.setup-form input[type=password],.setup-form input:not([type]){
+  padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--ink)}
 </style></head><body>
 <div class="top">
   <h1>SSPL ERP Admin</h1><span id="clock" class="badge"></span><span class="spacer"></span>
@@ -531,6 +658,10 @@ details{margin:2px 0} details summary{cursor:pointer}
   <form method="post" action="/logout" style="margin:0"><button>Log out</button></form>
 </div>
 <main>
+
+<div class="card" id="setup-card"><h2>Setup — install components</h2>
+  <div id="setup-body"><p style="color:var(--muted)">Loading…</p></div>
+</div>
 
 <div class="tiles">
   <div class="tile"><div class="k">CPU usage</div><div class="v num" id="t-cpu">–</div>
@@ -640,6 +771,84 @@ async function refreshStats(){
   }catch(e){}
 }
 
+function pill(ok){ return ok ? '<span class="badge ok">installed ✓</span>'
+                             : '<span class="badge miss">not installed</span>'; }
+
+async function refreshSetup(){
+  try{
+    const r = await fetch('/api/setup-status'); if(r.status===401){location='/login';return;}
+    const s = await r.json();
+    if(!s.repo_ok){
+      $('#setup-body').innerHTML = `<p style="color:var(--warn);margin:0">Installer scripts not found
+        (${s.repo_dir?('repo_dir = <code>'+esc(s.repo_dir)+'</code>'):'repo_dir is not set in config.json'}).
+        Component installs are unavailable. Clone the repo on this server, set <code>repo_dir</code> in
+        <code>/opt/sspl-admin/config.json</code>, then restart the panel.</p>`;
+      return;
+    }
+    const c = s.components, erpDone = c.erp.installed;
+    let rows = '';
+    // ERPNext stack
+    rows += `<div class="setup-row"><div class="setup-h"><b>ERPNext stack</b> ${pill(c.erp.installed)}`
+      + (c.erp.installed && c.erp.running ? ' <span class="badge ok">running</span>' : '')
+      + (c.erp.site ? ` <span class="badge">site ${esc(c.erp.site)}</span>` : '') + `</div>`;
+    if(!c.erp.installed){
+      rows += `<div class="setup-form">
+        <input type="text" id="erp-ip" placeholder="Server IP / hostname" value="${esc(s.server_ip||'')}" size="18">
+        <input type="text" id="erp-port" placeholder="HTTP port" value="80" size="6">
+        <input type="password" id="erp-db" placeholder="MariaDB root password" size="20">
+        <input type="password" id="erp-admin" placeholder="Administrator password" size="20">
+        <button class="primary setup-install" data-inst="install_erp"
+          data-confirm="Install the ERPNext stack now? This pulls the image, starts the containers and creates the site — 10-20 minutes. Do not close the page.">Install ERPNext</button></div>`;
+    }
+    rows += `</div>`;
+    // Backup system
+    rows += `<div class="setup-row"><div class="setup-h"><b>Backup system</b> ${pill(c.backups.installed)}</div>`;
+    if(!c.backups.installed){
+      rows += `<div class="setup-form">
+        <label style="font-size:13px"><input type="checkbox" id="bk-cron" checked> also schedule daily cron backups</label>
+        <button class="primary setup-install" data-inst="install_backups" ${erpDone?'':'disabled'}
+          data-confirm="Install the backup system now?">Install backups</button>`
+        + (erpDone?'':'<span style="color:var(--muted);font-size:12px">install ERPNext first</span>') + `</div>`;
+    }
+    rows += `</div>`;
+    // Update / rollback
+    rows += `<div class="setup-row"><div class="setup-h"><b>Update &amp; rollback scripts</b> ${pill(c.update.installed)}</div>`;
+    if(!c.update.installed){
+      rows += `<div class="setup-form">
+        <button class="primary setup-install" data-inst="install_update" ${erpDone?'':'disabled'}
+          data-confirm="Install the update/rollback scripts now?">Install update/rollback</button>`
+        + (erpDone?'':'<span style="color:var(--muted);font-size:12px">install ERPNext first</span>') + `</div>`;
+    }
+    rows += `</div>`;
+    const allDone = erpDone && c.backups.installed && c.update.installed;
+    $('#setup-body').innerHTML =
+      (allDone ? '<p style="color:var(--ok);margin:0 0 6px">✓ All components are installed.</p>' : '') + rows;
+    document.querySelectorAll('.setup-install').forEach(btn => btn.onclick = () => installComponent(btn));
+  }catch(e){}
+}
+
+async function installComponent(btn){
+  if(btn.disabled) return;
+  if(btn.dataset.confirm && !confirm(btn.dataset.confirm)) return;
+  const inst = btn.dataset.inst, body = {};
+  if(inst==='install_erp'){
+    body.server_ip = $('#erp-ip').value.trim();
+    body.http_port = $('#erp-port').value.trim();
+    body.db_password = $('#erp-db').value;
+    body.admin_password = $('#erp-admin').value;
+  } else if(inst==='install_backups' && $('#bk-cron')){
+    body.schedule_cron = $('#bk-cron').checked;
+  }
+  btn.disabled = true;
+  try{
+    const r = await fetch('/api/run/'+inst, {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    const j = await r.json();
+    if(j.error){ alert(j.error); btn.disabled = false; }
+    else { jobWasActive = true; refreshJob(); $('#console').scrollIntoView({behavior:'smooth'}); }
+  }catch(e){ alert('request failed'); btn.disabled = false; }
+}
+
 function fileBadge(ok, label){ return `<span class="badge ${ok?'ok':'miss'}">${label}${ok?' ✓':' missing'}</span>`; }
 function dl(kind, name){ return `<a href="/download/${kind}/${encodeURIComponent(name).replace(/%2F/g,'/')}">download</a>`; }
 
@@ -686,7 +895,7 @@ async function refreshJob(){
     const c = $('#console'), atEnd = c.scrollTop + c.clientHeight >= c.scrollHeight - 30;
     c.textContent = j.log || '(no output yet)';
     if (atEnd) c.scrollTop = c.scrollHeight;
-    if (jobWasActive && !j.active) refreshBackups();
+    if (jobWasActive && !j.active) { refreshBackups(); refreshSetup(); refreshStats(); }
     jobWasActive = j.active;
   }catch(e){}
 }
@@ -740,10 +949,11 @@ document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => {
 });
 
 setInterval(() => $('#clock').textContent = new Date().toLocaleString(), 1000);
-refreshStats(); refreshBackups(); refreshJob();
+refreshSetup(); refreshStats(); refreshBackups(); refreshJob();
 setInterval(refreshStats, 5000);
 setInterval(refreshJob, 2500);
 setInterval(refreshBackups, 60000);
+setInterval(refreshSetup, 30000);
 </script></body></html>"""
 
 
