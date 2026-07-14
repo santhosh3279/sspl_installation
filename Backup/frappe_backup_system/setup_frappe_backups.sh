@@ -31,10 +31,15 @@ sudo cp frappe_backup_verify.sh "$INSTALL_DIR/"
 sudo chmod +x "$INSTALL_DIR"/frappe_*.sh
 
 # 4. Configure site name
-echo ""
-echo "Please enter your Frappe site name:"
-echo "To find it, run: docker compose -f /opt/sspl-erp/docker-compose.yml exec backend ls sites/"
-read -p "Site name: " SITE_NAME
+# (SSPL_SITE_NAME, SSPL_INSTALL_CRON and SSPL_RUN_TEST can be set by a
+# parent installer to answer the prompts non-interactively)
+SITE_NAME="${SSPL_SITE_NAME:-}"
+if [ -z "$SITE_NAME" ]; then
+    echo ""
+    echo "Please enter your Frappe site name:"
+    echo "To find it, run: docker compose -f /opt/sspl-erp/docker-compose.yml exec backend ls sites/"
+    read -p "Site name: " SITE_NAME
+fi
 
 if [ ! -z "$SITE_NAME" ]; then
     sudo sed -i "s/your-site-name/$SITE_NAME/g" "$INSTALL_DIR/frappe_backup.sh"
@@ -56,8 +61,11 @@ echo "installing these jobs too will run BOTH backups. Recommended: answer 'no',
 echo "test the v2 scripts manually first, then switch the paths in 'sudo crontab -e'"
 echo "from /opt/scripts/ to /opt/scripts/v2/ when you are happy with them."
 echo ""
-echo "Do you want to install automated backups via cron? (yes/no)"
-read -p "Install cron jobs: " INSTALL_CRON
+INSTALL_CRON="${SSPL_INSTALL_CRON:-}"
+if [ -z "$INSTALL_CRON" ]; then
+    echo "Do you want to install automated backups via cron? (yes/no)"
+    read -p "Install cron jobs: " INSTALL_CRON
+fi
 
 if [ "$INSTALL_CRON" = "yes" ]; then
     # Add to root crontab
@@ -80,9 +88,12 @@ if [ "$INSTALL_CRON" = "yes" ]; then
 fi
 
 # 7. Test backup
-echo ""
-echo "Do you want to run a test backup now? (yes/no)"
-read -p "Run test backup: " RUN_TEST
+RUN_TEST="${SSPL_RUN_TEST:-}"
+if [ -z "$RUN_TEST" ]; then
+    echo ""
+    echo "Do you want to run a test backup now? (yes/no)"
+    read -p "Run test backup: " RUN_TEST
+fi
 
 if [ "$RUN_TEST" = "yes" ]; then
     echo "Running test backup..."

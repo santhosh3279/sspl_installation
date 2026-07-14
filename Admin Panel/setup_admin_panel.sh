@@ -30,26 +30,39 @@ sudo "$INSTALL_DIR/venv/bin/pip" install --quiet --upgrade pip flask
 sudo cp app.py "$INSTALL_DIR/"
 
 # 4. Credentials and config
+# (SSPL_ADMIN_USER, SSPL_ADMIN_PW, SSPL_PANEL_PORT and SSPL_CERT_IP can be
+# set by a parent installer to answer the prompts non-interactively)
 echo ""
-read -p "Admin username [admin]: " ADMIN_USER
-ADMIN_USER=${ADMIN_USER:-admin}
-while true; do
+ADMIN_USER="${SSPL_ADMIN_USER:-}"
+if [ -z "$ADMIN_USER" ]; then
+    read -p "Admin username [admin]: " ADMIN_USER
+    ADMIN_USER=${ADMIN_USER:-admin}
+fi
+PW1="${SSPL_ADMIN_PW:-}"
+while [ -z "$PW1" ]; do
     read -sp "Admin password: " PW1; echo ""
     read -sp "Confirm password: " PW2; echo ""
     if [ -n "$PW1" ] && [ "$PW1" = "$PW2" ]; then break; fi
     echo "Passwords are empty or do not match — try again."
+    PW1=""
 done
-read -p "Port for the panel [8090]: " PORT
-PORT=${PORT:-8090}
+PORT="${SSPL_PANEL_PORT:-}"
+if [ -z "$PORT" ]; then
+    read -p "Port for the panel [8090]: " PORT
+    PORT=${PORT:-8090}
+fi
 
 # 5. HTTPS certificate (self-signed, valid 10 years; kept on re-install)
 CERT_DIR="$INSTALL_DIR/certs"
 CERT="$CERT_DIR/sspl-admin.crt"
 KEY="$CERT_DIR/sspl-admin.key"
 if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
-    DETECTED_IP=$(hostname -I | awk '{print $1}')
-    read -p "Server IP for the certificate [$DETECTED_IP]: " CERT_IP
-    CERT_IP=${CERT_IP:-$DETECTED_IP}
+    CERT_IP="${SSPL_CERT_IP:-}"
+    if [ -z "$CERT_IP" ]; then
+        DETECTED_IP=$(hostname -I | awk '{print $1}')
+        read -p "Server IP for the certificate [$DETECTED_IP]: " CERT_IP
+        CERT_IP=${CERT_IP:-$DETECTED_IP}
+    fi
     echo "Generating self-signed HTTPS certificate for $CERT_IP..."
     sudo mkdir -p "$CERT_DIR"
     sudo openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \

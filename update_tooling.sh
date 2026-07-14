@@ -126,8 +126,8 @@ fi
 echo ""
 echo "==============================="
 echo "✅ Update complete"
-[ -n "$UPDATED" ] && echo "   Updated:$UPDATED"
-[ -n "$SKIPPED" ] && echo "   Skipped:$SKIPPED"
+if [ -n "$UPDATED" ]; then echo "   Updated:$UPDATED"; fi
+if [ -n "$SKIPPED" ]; then echo "   Skipped:$SKIPPED"; fi
 echo ""
 echo "Configuration was preserved (site name, rclone remote, retention,"
 echo "panel credentials/certificates). Cron jobs were not changed."
