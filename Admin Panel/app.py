@@ -748,4 +748,11 @@ setInterval(refreshBackups, 60000);
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(CONFIG.get("port", 8090)), threaded=True)
+    cert = CONFIG.get("tls_cert")
+    key = CONFIG.get("tls_key")
+    ssl_ctx = None
+    if cert and key and os.path.isfile(cert) and os.path.isfile(key):
+        ssl_ctx = (cert, key)
+        app.config["SESSION_COOKIE_SECURE"] = True
+    app.run(host="0.0.0.0", port=int(CONFIG.get("port", 8090)),
+            threaded=True, ssl_context=ssl_ctx)

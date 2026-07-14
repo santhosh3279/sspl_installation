@@ -42,7 +42,26 @@ done
 read -p "Port for the panel [8090]: " PORT
 PORT=${PORT:-8090}
 
-ADMIN_USER="$ADMIN_USER" ADMIN_PW="$PW1" PORT="$PORT" \
+# 5. HTTPS certificate (self-signed, valid 10 years; kept on re-install)
+CERT_DIR="$INSTALL_DIR/certs"
+CERT="$CERT_DIR/sspl-admin.crt"
+KEY="$CERT_DIR/sspl-admin.key"
+if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
+    DETECTED_IP=$(hostname -I | awk '{print $1}')
+    read -p "Server IP for the certificate [$DETECTED_IP]: " CERT_IP
+    CERT_IP=${CERT_IP:-$DETECTED_IP}
+    echo "Generating self-signed HTTPS certificate for $CERT_IP..."
+    sudo mkdir -p "$CERT_DIR"
+    sudo openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+        -keyout "$KEY" -out "$CERT" \
+        -subj "/CN=sspl-admin" \
+        -addext "subjectAltName=IP:$CERT_IP,IP:127.0.0.1,DNS:$(hostname)"
+    sudo chmod 600 "$KEY"
+else
+    echo "Existing HTTPS certificate found — keeping it."
+fi
+
+ADMIN_USER="$ADMIN_USER" ADMIN_PW="$PW1" PORT="$PORT" CERT="$CERT" KEY="$KEY" \
     "$INSTALL_DIR/venv/bin/python" - <<'EOF' | sudo tee "$INSTALL_DIR/config.json" > /dev/null
 import json, os, secrets
 from werkzeug.security import generate_password_hash
@@ -51,12 +70,14 @@ print(json.dumps({
     "password_hash": generate_password_hash(os.environ["ADMIN_PW"]),
     "secret_key": secrets.token_hex(32),
     "port": int(os.environ["PORT"]),
+    "tls_cert": os.environ["CERT"],
+    "tls_key": os.environ["KEY"],
 }, indent=2))
 EOF
 sudo chown root:root "$INSTALL_DIR/config.json"
 sudo chmod 600 "$INSTALL_DIR/config.json"
 
-# 5. Systemd service
+# 6. Systemd service
 sudo cp sspl-admin.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now sspl-admin
@@ -67,8 +88,12 @@ IP=$(hostname -I | awk '{print $1}')
 echo ""
 echo "=== Installation Complete ==="
 echo ""
-echo "Admin panel:   http://$IP:$PORT"
+echo "Admin panel:   https://$IP:$PORT"
 echo "Username:      $ADMIN_USER"
+echo ""
+echo "NOTE: the certificate is self-signed, so the browser shows a security"
+echo "warning the first time — click Advanced -> Proceed. The connection is"
+echo "still fully encrypted."
 echo "Service:       sudo systemctl status sspl-admin"
 echo "Logs:          sudo journalctl -u sspl-admin -f"
 echo ""

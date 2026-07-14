@@ -16,6 +16,8 @@ A small web interface for managing the SSPL ERP server from a browser on the LAN
 - **Upload backup files** to the server (stored under
   `/opt/backups/frappe/uploads/`, optionally in a named subfolder)
 - **Admin login** — single admin user, hashed password, session cookie
+- **HTTPS** — self-signed certificate generated at install; all traffic
+  (passwords, backups) is encrypted on the LAN
 
 ## Requirements
 
@@ -32,9 +34,20 @@ chmod +x setup_admin_panel.sh
 ```
 
 The installer asks for an admin username, password, and port (default **8090**),
+generates a self-signed HTTPS certificate for the server IP (valid 10 years),
 then installs everything to `/opt/sspl-admin/` and starts a systemd service.
 
-Open `http://<server-ip>:8090` and log in.
+Open `https://<server-ip>:8090` and log in.
+
+### About the HTTPS warning
+
+The certificate is self-signed (a LAN IP cannot get a public certificate), so
+each browser shows a security warning the **first** time: click
+*Advanced → Proceed*. The connection is fully encrypted either way. To make the
+warning disappear on a particular PC, import
+`/opt/sspl-admin/certs/sspl-admin.crt` into that machine's trusted certificate
+store. To regenerate the certificate (e.g. after changing the server IP),
+delete `/opt/sspl-admin/certs/` and re-run the installer.
 
 ## Managing the service
 
