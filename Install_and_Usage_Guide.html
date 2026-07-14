@@ -87,16 +87,16 @@
 <tr><td>1.</td><td>Overview &amp; server layout</td></tr>
 <tr><td>2.</td><td>Prerequisites</td></tr>
 <tr><td>3.</td><td>Fresh server — one-command installation</td></tr>
-<tr><td>4.</td><td>Part 1 — Backup system: installation</td></tr>
-<tr><td>5.</td><td>Part 1 — Backup system: daily use</td></tr>
-<tr><td>6.</td><td>Part 1 — Restoring from a backup</td></tr>
-<tr><td>7.</td><td>Part 1 — Optional cloud upload (rclone)</td></tr>
-<tr><td>8.</td><td>Part 2 — Update &amp; rollback system: installation</td></tr>
-<tr><td>9.</td><td>Part 2 — Updating the system</td></tr>
-<tr><td>10.</td><td>Part 2 — Rolling back an update</td></tr>
-<tr><td>11.</td><td>Part 2 — Managing image backups</td></tr>
-<tr><td>12.</td><td>Scheduled jobs summary</td></tr>
-<tr><td>13.</td><td>Part 3 — Web admin panel</td></tr>
+<tr><td>4.</td><td>Part 1 — Web admin panel</td></tr>
+<tr><td>5.</td><td>Part 2 — Backup system: installation</td></tr>
+<tr><td>6.</td><td>Part 2 — Backup system: daily use</td></tr>
+<tr><td>7.</td><td>Part 2 — Restoring from a backup</td></tr>
+<tr><td>8.</td><td>Part 2 — Optional cloud upload (rclone)</td></tr>
+<tr><td>9.</td><td>Part 3 — Update &amp; rollback system: installation</td></tr>
+<tr><td>10.</td><td>Part 3 — Updating the system</td></tr>
+<tr><td>11.</td><td>Part 3 — Rolling back an update</td></tr>
+<tr><td>12.</td><td>Part 3 — Managing image backups</td></tr>
+<tr><td>13.</td><td>Scheduled jobs summary</td></tr>
 <tr><td>14.</td><td>Keeping this toolkit up to date</td></tr>
 <tr><td>15.</td><td>Quick command reference</td></tr>
 <tr><td>16.</td><td>Troubleshooting</td></tr>
@@ -115,7 +115,7 @@
       <b>install ERPNext and the other two parts from the browser</b> (Setup switches), then runs the
       backup / update / rollback scripts, shows server health and backup files, clears RAM caches, and
       accepts backup file uploads. Installed to <code>/opt/sspl-admin/</code>, served on port <b>8090</b>.
-      See section 13.</li>
+      See section 4.</li>
 </ul>
 <p>Setting up a <b>brand-new server</b>? The one-time installer <code>Production
 Installation/install_sspl_erp.sh</code> deploys the whole ERP stack <i>and</i> all three parts in a
@@ -186,16 +186,16 @@ login. After the final <i>Proceed?</i> it runs unattended for 10–20 minutes:</
       installs <b>every app shipped in the image</b> automatically (erpnext, india_compliance,
       ssplbilling, printer_server_configuration, frappe_whatsapp, …), sets it as the default
       site, and repairs the MariaDB grants.</li>
-  <li><b>Part 1</b> — backup system with cron jobs (<code>/opt/scripts/v2/</code>).</li>
-  <li><b>Part 2</b> — update &amp; rollback scripts with the site name pre-filled
+  <li><b>Part 1</b> — web admin panel with HTTPS on port 8090 (<code>/opt/sspl-admin/</code>).</li>
+  <li><b>Part 2</b> — backup system with cron jobs (<code>/opt/scripts/v2/</code>).</li>
+  <li><b>Part 3</b> — update &amp; rollback scripts with the site name pre-filled
       (<code>/opt/sspl-erp/v2/</code>).</li>
-  <li><b>Part 3</b> — web admin panel with HTTPS on port 8090 (<code>/opt/sspl-admin/</code>).</li>
   <li><b>Extras</b> — Docker auto-start on reboot, docker group membership, and passwordless
       sudo shortcuts for clear-RAM and manual backup.</li>
 </ul>
 <div class="note"><b>Already installed? It refuses to run.</b> If ERPNext is already deployed and
 running on the server, the installer prints <i>“already installed”</i> and exits without changing
-anything — use the update tools instead (sections 9 and 14). To deliberately re-run, e.g. to
+anything — use the update tools instead (sections 10 and 14). To deliberately re-run, e.g. to
 finish a half-completed install, use <code>SSPL_FORCE=1 ./install_sspl_erp.sh</code>; a forced
 re-run is safe — the existing site is never re-created, and existing <code>.env</code> files are
 backed up before being rewritten.</div>
@@ -205,194 +205,13 @@ outside <code>/opt/scripts/v2/</code> — e.g. an older backup script wired up b
 &ldquo;Santhosh additions&rdquo; in this guide's history). If one is found, the v2 scripts are
 still installed but their cron jobs are <b>not</b> scheduled automatically, and the conflicting
 line is printed so you can switch over manually with <code>sudo crontab -e</code> (see
-section 12 for the v2 schedule).</div>
+section 13 for the v2 schedule).</div>
 <p>Requirements: Ubuntu Server with Docker installed and a static LAN IP. If you install
-components with this script, you can skip the manual installation steps in sections 4, 8
-and 13.</p>
+components with this script, you can skip the manual installation steps in sections 4, 5
+and 9.</p>
 
 <div class="pagebreak"></div>
-<h2>4. Part 1 — Backup system: installation</h2>
-
-<h3>Step 1 — Copy the files to the server</h3>
-<pre># From the repo, copy either the folder or the tarball to the server, then:
-tar -xzf frappe_backup_system.tar.gz
-cd frappe_backup_system            # or: cd Backup/frappe_backup_system</pre>
-
-<h3>Step 2 — Run the installer</h3>
-<pre>chmod +x setup_frappe_backups.sh
-sudo ./setup_frappe_backups.sh</pre>
-<p>The installer will:</p>
-<ol>
-  <li>Create <code>/opt/backups/frappe/</code> (permissions restricted to root — backups contain credentials).</li>
-  <li>Install the four scripts to <code>/opt/scripts/v2/</code> and make them executable —
-      older scripts directly in <code>/opt/scripts/</code> are not touched.</li>
-  <li><b>Ask for your site name</b> and write it into the backup, db-backup, and restore scripts.</li>
-  <li>Offer to install the cron jobs (see section 12 for the schedule).</li>
-  <li>Offer to run a test backup (answer <code>yes</code> the first time).</li>
-</ol>
-<div class="warn"><b>If the old backup scripts are already scheduled in cron:</b> installing the new
-cron jobs too means every backup runs twice. Either answer <code>no</code> to the cron question while
-you test the v2 scripts manually, or say <code>yes</code> and then remove the old
-<code>/opt/scripts/frappe_*.sh</code> lines with <code>sudo crontab -e</code> once you are happy
-with v2.</div>
-
-<h3>Step 3 — Verify the test backup</h3>
-<pre>sudo /opt/scripts/v2/frappe_backup_verify.sh</pre>
-<p>All four lines must say <b>OK</b>: database, public files, private files, and config.
-The script exits with an error if anything is missing.</p>
-
-<h2>5. Part 1 — Backup system: daily use</h2>
-<p>Once installed, backups run automatically from cron. Manual commands:</p>
-<table>
-<tr><th>Task</th><th>Command</th></tr>
-<tr><td>Full backup now (DB + files + config)</td><td><code>sudo /opt/scripts/v2/frappe_backup.sh</code></td></tr>
-<tr><td>Quick database-only backup</td><td><code>sudo /opt/scripts/v2/frappe_db_backup.sh</code></td></tr>
-<tr><td>Check backups are complete &amp; recent</td><td><code>sudo /opt/scripts/v2/frappe_backup_verify.sh</code></td></tr>
-<tr><td>See what is stored</td><td><code>ls -lh /opt/backups/frappe/</code></td></tr>
-<tr><td>Watch the backup log</td><td><code>tail -f /var/log/frappe_backup_v2.log</code></td></tr>
-</table>
-<p>Retention is automatic: full backups are kept <b>30 days</b>, database-only dumps <b>14 days</b>.
-To change this, edit <code>RETENTION_DAYS</code> at the top of the respective script in <code>/opt/scripts/v2/</code>.</p>
-
-<div class="note"><b>Good habit:</b> run a manual full backup before any risky change
-(new app install, configuration change, server maintenance) — and always before an update,
-although the update script also does this automatically.</div>
-
-<div class="pagebreak"></div>
-<h2>6. Part 1 — Restoring from a backup</h2>
-
-<div class="warn"><b>Warning:</b> a restore <b>overwrites</b> the site's current database and files
-with the backup contents. Anything entered after the backup was taken is lost.</div>
-
-<h3>Step 1 — Pick a backup</h3>
-<pre>ls /opt/backups/frappe/
-# e.g. 20260712_020000</pre>
-
-<h3>Step 2 — Get the MariaDB root password</h3>
-<pre>grep MARIADB_ROOT_PASSWORD /opt/sspl-erp/.env</pre>
-
-<h3>Step 3 — Run the restore</h3>
-<pre>sudo /opt/scripts/v2/frappe_restore.sh /opt/backups/frappe/20260712_020000</pre>
-<p>The script will:</p>
-<ol>
-  <li>Ask for the site name (press Enter to accept the configured default).</li>
-  <li>Ask for the MariaDB root password (input is hidden).</li>
-  <li>Ask for a final <code>yes</code> confirmation.</li>
-  <li>Restore the database, public files, and private files in one operation.</li>
-  <li>Run <code>bench migrate</code> (in case app versions differ from the backup) and restart all services.</li>
-</ol>
-<p>Afterwards, log in to ERPNext and verify recent documents, attachments, and print formats.</p>
-
-<h2>7. Part 1 — Optional cloud upload (rclone)</h2>
-<p>By default backups stay on the server's own disk. To survive a disk failure, upload them
-to cloud storage. Full provider walkthrough: see <i>Rclone_Configuration_Guide.docx</i>.</p>
-
-<h3>Step 1 — Install and configure rclone (one time)</h3>
-<pre>sudo apt install rclone
-rclone config          # create a remote, e.g. named "gdrive"</pre>
-
-<h3>Step 2 — Point the backup script at the remote</h3>
-<p>Edit <code>/opt/scripts/v2/frappe_backup.sh</code> and set the variable near the top:</p>
-<pre>RCLONE_REMOTE="gdrive:frappe-backups"</pre>
-<p>Every full backup is then uploaded automatically after it completes. If the upload fails, the
-backup still exists locally and a warning is written to the log.</p>
-
-<h3>Step 3 — Test it</h3>
-<pre>sudo /opt/scripts/v2/frappe_backup.sh
-rclone ls gdrive:frappe-backups | head</pre>
-
-<div class="pagebreak"></div>
-<h2>8. Part 2 — Update &amp; rollback system: installation</h2>
-
-<h3>Step 1 — Copy the four scripts</h3>
-<p>Copy these from <code>Production Installation/update and rollback/</code> into
-<code>/opt/sspl-erp/v2/</code> (create it with <code>sudo mkdir -p /opt/sspl-erp/v2</code>).
-Older <code>sspl-erp-*.sh</code> scripts directly in <code>/opt/sspl-erp/</code> stay untouched
-as a fallback; both versions share the same <code>image-backups/</code> snapshots.</p>
-<ul>
-  <li><code>sspl-erp-common.sh</code> — shared configuration (sourced by the others, not run directly)</li>
-  <li><code>sspl-erp-update-with-rollback.sh</code></li>
-  <li><code>sspl-erp-rollback.sh</code></li>
-  <li><code>sspl-erp-backup-manager.sh</code></li>
-</ul>
-
-<h3>Step 2 — Set the site name</h3>
-<p>Edit <code>/opt/sspl-erp/v2/sspl-erp-common.sh</code> and set the variable at the top
-(this is the <b>only</b> place it needs changing):</p>
-<pre>SITE_NAME="192.168.225.135"</pre>
-
-<h3>Step 3 — Make the scripts executable</h3>
-<pre>cd /opt/sspl-erp/v2
-chmod +x sspl-erp-update-with-rollback.sh sspl-erp-rollback.sh sspl-erp-backup-manager.sh</pre>
-
-<div class="note"><b>Note:</b> the update script calls <code>/opt/scripts/v2/frappe_backup.sh</code>,
-so install Part 1 first.</div>
-
-<h2>9. Part 2 — Updating the system</h2>
-<p>When a new image has been published to GHCR (<code>ghcr.io/santhosh3279/sspl-erpnext</code>):</p>
-<pre>cd /opt/sspl-erp/v2
-./sspl-erp-update-with-rollback.sh</pre>
-<p>What it does, in order:</p>
-<ol>
-  <li>Runs a <b>full Frappe data backup</b> (database + files). If this fails you are asked whether to continue.</li>
-  <li>Snapshots the current Docker images to <code>/opt/sspl-erp/image-backups/backup_TIMESTAMP.tar</code>.</li>
-  <li>Stops all services, prunes unused Docker resources, and pulls the latest images.</li>
-  <li>Starts services and <b>waits until the database and backend are actually ready</b> (up to 3 minutes).</li>
-  <li>Repairs MariaDB user grants, runs <code>bench migrate</code>, clears the cache.</li>
-  <li>Prints the new version and deletes image snapshots older than the 3 most recent.</li>
-</ol>
-<p>If any step fails, the script stops immediately and prints rollback instructions.</p>
-
-<h3>Verify after every update</h3>
-<pre>docker compose ps
-docker compose logs --tail=50
-docker compose exec backend bench version
-docker compose exec backend bench --site 192.168.225.135 doctor</pre>
-<p>Then log in and check the key business flows (e.g. create a draft invoice, open a report, test printing).</p>
-
-<div class="pagebreak"></div>
-<h2>10. Part 2 — Rolling back an update</h2>
-<p>If the system misbehaves after an update:</p>
-<pre>cd /opt/sspl-erp/v2
-./sspl-erp-rollback.sh</pre>
-<p>The script shows the most recent image snapshot (size and date), asks for confirmation, stops the
-services, loads the saved images, restarts, repairs DB grants, and clears the cache.</p>
-
-<h3>Rolling back to a specific older snapshot</h3>
-<pre>./sspl-erp-backup-manager.sh list
-BACKUP_FILE=/opt/sspl-erp/image-backups/backup_20260701_090000.tar ./sspl-erp-rollback.sh</pre>
-
-<div class="warn"><b>Important:</b> rollback restores the Docker <b>images</b> only — not the database.
-If the failed update's migration changed the database structure, also restore the data backup that
-the update script took automatically (section 6). Its timestamp is printed at the start of the update.</div>
-
-<h2>11. Part 2 — Managing image backups</h2>
-<p>Image snapshots are several GB each. The update script already keeps only the last 3; the manager
-gives manual control:</p>
-<table>
-<tr><th>Task</th><th>Command</th></tr>
-<tr><td>List snapshots (marks the latest)</td><td><code>./sspl-erp-backup-manager.sh list</code></td></tr>
-<tr><td>Keep newest 5, delete the rest</td><td><code>./sspl-erp-backup-manager.sh clean 5</code></td></tr>
-<tr><td>Same, without confirmation (for cron)</td><td><code>./sspl-erp-backup-manager.sh clean 5 --yes</code></td></tr>
-<tr><td>Delete all snapshots</td><td><code>./sspl-erp-backup-manager.sh delete-all</code></td></tr>
-<tr><td>Check disk space</td><td><code>df -h /opt/sspl-erp</code></td></tr>
-</table>
-<div class="note"><b>Note:</b> when run from cron there is no terminal to confirm on, so
-<code>--yes</code> is required — without it the command exits with an error instead of deleting.</div>
-
-<h2>12. Scheduled jobs summary</h2>
-<p>Installed by the Part 1 setup script (view with <code>sudo crontab -l</code>):</p>
-<table>
-<tr><th>Schedule</th><th>Job</th><th>Log file</th></tr>
-<tr><td>Daily, 02:00</td><td>Full backup — <code>frappe_backup.sh</code></td><td><code>/var/log/frappe_backup_v2.log</code></td></tr>
-<tr><td>Every 6 hours</td><td>DB-only backup — <code>frappe_db_backup.sh</code></td><td><code>/var/log/frappe_db_backup_v2.log</code></td></tr>
-<tr><td>Sunday, 03:00</td><td>Backup verification — <code>frappe_backup_verify.sh</code></td><td><code>/var/log/frappe_backup_verify_v2.log</code></td></tr>
-</table>
-<p>Optional — weekly cleanup of image snapshots (add with <code>sudo crontab -e</code>):</p>
-<pre>0 2 * * 0 /opt/sspl-erp/v2/sspl-erp-backup-manager.sh clean 5 --yes >> /var/log/sspl-erp-backup-clean.log 2>&amp;1</pre>
-
-<div class="pagebreak"></div>
-<h2>13. Part 3 — Web admin panel</h2>
+<h2>4. Part 1 — Web admin panel</h2>
 <p>A browser interface for everything above: <b>install the whole system from the browser</b>, then
 run backups, updates, and rollbacks with one click, watch the script output live, browse and download
 backup files, monitor CPU / memory / disk / container health, clear RAM caches, and upload backup
@@ -407,7 +226,7 @@ chmod +x setup_admin_panel.sh
 for the HTTPS certificate. It installs a Python environment to <code>/opt/sspl-admin/</code>, records
 the repo location (<code>repo_dir</code> in its config), and starts a systemd service
 (<code>sspl-admin</code>) that survives reboots.</p>
-<div class="note"><b>The panel can install everything else</b> — Parts 1 and 2 do <i>not</i> need to be
+<div class="note"><b>The panel can install everything else</b> — Parts 2 and 3 do <i>not</i> need to be
 in place first. Keep the git checkout on the server (the Setup switches run the installers from it;
 <code>git pull</code> there keeps them current).</div>
 
@@ -439,7 +258,7 @@ the rest, in order:</p>
       <code>/opt/backups/frappe/uploads/</code> and never executed or restored automatically.</li>
 </ul>
 <div class="warn"><b>Restore is deliberately not in the panel:</b> it needs the MariaDB root password
-and overwrites live data, so it stays a console-only operation (section 6).</div>
+and overwrites live data, so it stays a console-only operation (section 7).</div>
 
 <h3>Managing the service</h3>
 <pre>sudo systemctl status sspl-admin       # is it running?
@@ -447,6 +266,187 @@ sudo systemctl restart sspl-admin      # restart
 sudo journalctl -u sspl-admin -f       # follow the logs</pre>
 <p>To change the password or port, re-run <code>./setup_admin_panel.sh</code> — it keeps the
 certificate and Python environment. Keep port 8090 LAN-only; never port-forward it to the internet.</p>
+
+<div class="pagebreak"></div>
+<h2>5. Part 2 — Backup system: installation</h2>
+
+<h3>Step 1 — Copy the files to the server</h3>
+<pre># From the repo, copy either the folder or the tarball to the server, then:
+tar -xzf frappe_backup_system.tar.gz
+cd frappe_backup_system            # or: cd Backup/frappe_backup_system</pre>
+
+<h3>Step 2 — Run the installer</h3>
+<pre>chmod +x setup_frappe_backups.sh
+sudo ./setup_frappe_backups.sh</pre>
+<p>The installer will:</p>
+<ol>
+  <li>Create <code>/opt/backups/frappe/</code> (permissions restricted to root — backups contain credentials).</li>
+  <li>Install the four scripts to <code>/opt/scripts/v2/</code> and make them executable —
+      older scripts directly in <code>/opt/scripts/</code> are not touched.</li>
+  <li><b>Ask for your site name</b> and write it into the backup, db-backup, and restore scripts.</li>
+  <li>Offer to install the cron jobs (see section 13 for the schedule).</li>
+  <li>Offer to run a test backup (answer <code>yes</code> the first time).</li>
+</ol>
+<div class="warn"><b>If the old backup scripts are already scheduled in cron:</b> installing the new
+cron jobs too means every backup runs twice. Either answer <code>no</code> to the cron question while
+you test the v2 scripts manually, or say <code>yes</code> and then remove the old
+<code>/opt/scripts/frappe_*.sh</code> lines with <code>sudo crontab -e</code> once you are happy
+with v2.</div>
+
+<h3>Step 3 — Verify the test backup</h3>
+<pre>sudo /opt/scripts/v2/frappe_backup_verify.sh</pre>
+<p>All four lines must say <b>OK</b>: database, public files, private files, and config.
+The script exits with an error if anything is missing.</p>
+
+<h2>6. Part 2 — Backup system: daily use</h2>
+<p>Once installed, backups run automatically from cron. Manual commands:</p>
+<table>
+<tr><th>Task</th><th>Command</th></tr>
+<tr><td>Full backup now (DB + files + config)</td><td><code>sudo /opt/scripts/v2/frappe_backup.sh</code></td></tr>
+<tr><td>Quick database-only backup</td><td><code>sudo /opt/scripts/v2/frappe_db_backup.sh</code></td></tr>
+<tr><td>Check backups are complete &amp; recent</td><td><code>sudo /opt/scripts/v2/frappe_backup_verify.sh</code></td></tr>
+<tr><td>See what is stored</td><td><code>ls -lh /opt/backups/frappe/</code></td></tr>
+<tr><td>Watch the backup log</td><td><code>tail -f /var/log/frappe_backup_v2.log</code></td></tr>
+</table>
+<p>Retention is automatic: full backups are kept <b>30 days</b>, database-only dumps <b>14 days</b>.
+To change this, edit <code>RETENTION_DAYS</code> at the top of the respective script in <code>/opt/scripts/v2/</code>.</p>
+
+<div class="note"><b>Good habit:</b> run a manual full backup before any risky change
+(new app install, configuration change, server maintenance) — and always before an update,
+although the update script also does this automatically.</div>
+
+<div class="pagebreak"></div>
+<h2>7. Part 2 — Restoring from a backup</h2>
+
+<div class="warn"><b>Warning:</b> a restore <b>overwrites</b> the site's current database and files
+with the backup contents. Anything entered after the backup was taken is lost.</div>
+
+<h3>Step 1 — Pick a backup</h3>
+<pre>ls /opt/backups/frappe/
+# e.g. 20260712_020000</pre>
+
+<h3>Step 2 — Get the MariaDB root password</h3>
+<pre>grep MARIADB_ROOT_PASSWORD /opt/sspl-erp/.env</pre>
+
+<h3>Step 3 — Run the restore</h3>
+<pre>sudo /opt/scripts/v2/frappe_restore.sh /opt/backups/frappe/20260712_020000</pre>
+<p>The script will:</p>
+<ol>
+  <li>Ask for the site name (press Enter to accept the configured default).</li>
+  <li>Ask for the MariaDB root password (input is hidden).</li>
+  <li>Ask for a final <code>yes</code> confirmation.</li>
+  <li>Restore the database, public files, and private files in one operation.</li>
+  <li>Run <code>bench migrate</code> (in case app versions differ from the backup) and restart all services.</li>
+</ol>
+<p>Afterwards, log in to ERPNext and verify recent documents, attachments, and print formats.</p>
+
+<h2>8. Part 2 — Optional cloud upload (rclone)</h2>
+<p>By default backups stay on the server's own disk. To survive a disk failure, upload them
+to cloud storage. Full provider walkthrough: see <i>Rclone_Configuration_Guide.docx</i>.</p>
+
+<h3>Step 1 — Install and configure rclone (one time)</h3>
+<pre>sudo apt install rclone
+rclone config          # create a remote, e.g. named "gdrive"</pre>
+
+<h3>Step 2 — Point the backup script at the remote</h3>
+<p>Edit <code>/opt/scripts/v2/frappe_backup.sh</code> and set the variable near the top:</p>
+<pre>RCLONE_REMOTE="gdrive:frappe-backups"</pre>
+<p>Every full backup is then uploaded automatically after it completes. If the upload fails, the
+backup still exists locally and a warning is written to the log.</p>
+
+<h3>Step 3 — Test it</h3>
+<pre>sudo /opt/scripts/v2/frappe_backup.sh
+rclone ls gdrive:frappe-backups | head</pre>
+
+<div class="pagebreak"></div>
+<h2>9. Part 3 — Update &amp; rollback system: installation</h2>
+
+<h3>Step 1 — Copy the four scripts</h3>
+<p>Copy these from <code>Production Installation/update and rollback/</code> into
+<code>/opt/sspl-erp/v2/</code> (create it with <code>sudo mkdir -p /opt/sspl-erp/v2</code>).
+Older <code>sspl-erp-*.sh</code> scripts directly in <code>/opt/sspl-erp/</code> stay untouched
+as a fallback; both versions share the same <code>image-backups/</code> snapshots.</p>
+<ul>
+  <li><code>sspl-erp-common.sh</code> — shared configuration (sourced by the others, not run directly)</li>
+  <li><code>sspl-erp-update-with-rollback.sh</code></li>
+  <li><code>sspl-erp-rollback.sh</code></li>
+  <li><code>sspl-erp-backup-manager.sh</code></li>
+</ul>
+
+<h3>Step 2 — Set the site name</h3>
+<p>Edit <code>/opt/sspl-erp/v2/sspl-erp-common.sh</code> and set the variable at the top
+(this is the <b>only</b> place it needs changing):</p>
+<pre>SITE_NAME="192.168.225.135"</pre>
+
+<h3>Step 3 — Make the scripts executable</h3>
+<pre>cd /opt/sspl-erp/v2
+chmod +x sspl-erp-update-with-rollback.sh sspl-erp-rollback.sh sspl-erp-backup-manager.sh</pre>
+
+<div class="note"><b>Note:</b> the update script calls <code>/opt/scripts/v2/frappe_backup.sh</code>,
+so install Part 2 first.</div>
+
+<h2>10. Part 3 — Updating the system</h2>
+<p>When a new image has been published to GHCR (<code>ghcr.io/santhosh3279/sspl-erpnext</code>):</p>
+<pre>cd /opt/sspl-erp/v2
+./sspl-erp-update-with-rollback.sh</pre>
+<p>What it does, in order:</p>
+<ol>
+  <li>Runs a <b>full Frappe data backup</b> (database + files). If this fails you are asked whether to continue.</li>
+  <li>Snapshots the current Docker images to <code>/opt/sspl-erp/image-backups/backup_TIMESTAMP.tar</code>.</li>
+  <li>Stops all services, prunes unused Docker resources, and pulls the latest images.</li>
+  <li>Starts services and <b>waits until the database and backend are actually ready</b> (up to 3 minutes).</li>
+  <li>Repairs MariaDB user grants, runs <code>bench migrate</code>, clears the cache.</li>
+  <li>Prints the new version and deletes image snapshots older than the 3 most recent.</li>
+</ol>
+<p>If any step fails, the script stops immediately and prints rollback instructions.</p>
+
+<h3>Verify after every update</h3>
+<pre>docker compose ps
+docker compose logs --tail=50
+docker compose exec backend bench version
+docker compose exec backend bench --site 192.168.225.135 doctor</pre>
+<p>Then log in and check the key business flows (e.g. create a draft invoice, open a report, test printing).</p>
+
+<div class="pagebreak"></div>
+<h2>11. Part 3 — Rolling back an update</h2>
+<p>If the system misbehaves after an update:</p>
+<pre>cd /opt/sspl-erp/v2
+./sspl-erp-rollback.sh</pre>
+<p>The script shows the most recent image snapshot (size and date), asks for confirmation, stops the
+services, loads the saved images, restarts, repairs DB grants, and clears the cache.</p>
+
+<h3>Rolling back to a specific older snapshot</h3>
+<pre>./sspl-erp-backup-manager.sh list
+BACKUP_FILE=/opt/sspl-erp/image-backups/backup_20260701_090000.tar ./sspl-erp-rollback.sh</pre>
+
+<div class="warn"><b>Important:</b> rollback restores the Docker <b>images</b> only — not the database.
+If the failed update's migration changed the database structure, also restore the data backup that
+the update script took automatically (section 7). Its timestamp is printed at the start of the update.</div>
+
+<h2>12. Part 3 — Managing image backups</h2>
+<p>Image snapshots are several GB each. The update script already keeps only the last 3; the manager
+gives manual control:</p>
+<table>
+<tr><th>Task</th><th>Command</th></tr>
+<tr><td>List snapshots (marks the latest)</td><td><code>./sspl-erp-backup-manager.sh list</code></td></tr>
+<tr><td>Keep newest 5, delete the rest</td><td><code>./sspl-erp-backup-manager.sh clean 5</code></td></tr>
+<tr><td>Same, without confirmation (for cron)</td><td><code>./sspl-erp-backup-manager.sh clean 5 --yes</code></td></tr>
+<tr><td>Delete all snapshots</td><td><code>./sspl-erp-backup-manager.sh delete-all</code></td></tr>
+<tr><td>Check disk space</td><td><code>df -h /opt/sspl-erp</code></td></tr>
+</table>
+<div class="note"><b>Note:</b> when run from cron there is no terminal to confirm on, so
+<code>--yes</code> is required — without it the command exits with an error instead of deleting.</div>
+
+<h2>13. Scheduled jobs summary</h2>
+<p>Installed by the Part 2 setup script (view with <code>sudo crontab -l</code>):</p>
+<table>
+<tr><th>Schedule</th><th>Job</th><th>Log file</th></tr>
+<tr><td>Daily, 02:00</td><td>Full backup — <code>frappe_backup.sh</code></td><td><code>/var/log/frappe_backup_v2.log</code></td></tr>
+<tr><td>Every 6 hours</td><td>DB-only backup — <code>frappe_db_backup.sh</code></td><td><code>/var/log/frappe_db_backup_v2.log</code></td></tr>
+<tr><td>Sunday, 03:00</td><td>Backup verification — <code>frappe_backup_verify.sh</code></td><td><code>/var/log/frappe_backup_verify_v2.log</code></td></tr>
+</table>
+<p>Optional — weekly cleanup of image snapshots (add with <code>sudo crontab -e</code>):</p>
+<pre>0 2 * * 0 /opt/sspl-erp/v2/sspl-erp-backup-manager.sh clean 5 --yes >> /var/log/sspl-erp-backup-clean.log 2>&amp;1</pre>
 
 <h2>14. Keeping this toolkit up to date</h2>
 <p>When this repository gets improvements, refresh everything installed on the server in one command:</p>
@@ -491,7 +491,7 @@ sudo /opt/scripts/v2/frappe_backup.sh            # re-run manually and watch the
 <h3>Update failed partway through</h3>
 <p>The script prints instructions when it fails. In short: roll back the images with
 <code>./sspl-erp-rollback.sh</code>; if the migration had already modified the database, also restore
-the data backup taken at the start of the update (section 6).</p>
+the data backup taken at the start of the update (section 7).</p>
 
 <h3>Rollback cannot find or load a snapshot</h3>
 <pre>ls -lh /opt/sspl-erp/image-backups/                    # is the .tar there?
