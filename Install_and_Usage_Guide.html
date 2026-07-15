@@ -283,8 +283,24 @@ install the rest, in order:</p>
   <li><b>Upload</b> — send backup files to the server; they are stored under
       <code>/opt/backups/frappe/uploads/</code> and never executed or restored automatically.</li>
 </ul>
-<div class="warn"><b>Restore is deliberately not in the panel:</b> it needs the MariaDB root password
-and overwrites live data, so it stays a console-only operation (section 7).</div>
+<h3>Restoring from the panel</h3>
+<p>Restore is the one action that destroys data, so it is not a plain button. Full backups and
+uploaded backup <i>folders</i> that contain a <code>*-database.sql.gz</code> get a <b>Restore</b>
+button; clicking it opens a warning naming the exact site about to be overwritten, and asks you to
+type the <b>site name</b> in full and re-enter your <b>admin panel password</b>. Both are checked on
+the server. The job then takes a <b>full safety backup first</b> — if that backup fails, the restore
+never starts — and only then begins the restore, which asks for the <b>MariaDB root password</b> in
+the terminal. Type it into the input line under the terminal and press Enter, then answer
+<code>yes</code> to the final confirmation. What you type never reaches the job log, but the input
+line is an ordinary text box, so the password <i>is</i> visible on your own screen as you type it —
+unlike a console, which hides it.</p>
+<div class="note"><b>To abort a restore</b> that is waiting at a prompt, answer <code>no</code> at
+the confirmation. If nobody is there to answer, <code>sudo systemctl restart sspl-admin</code> ends
+it. While it waits, the one-job-at-a-time rule blocks the panel's other buttons; scheduled cron
+backups are unaffected.</div>
+<div class="note">To restore an <b>uploaded</b> backup, upload it into its own named folder (the
+<i>Folder</i> box on the upload form) so its database and files stay together — a whole folder is
+what gets restored. The console route still works and is unchanged (section 7).</div>
 
 <h3>Managing the service</h3>
 <pre>sudo systemctl status sspl-admin       # is it running?
@@ -346,6 +362,10 @@ although the update script also does this automatically.</div>
 
 <div class="warn"><b>Warning:</b> a restore <b>overwrites</b> the site's current database and files
 with the backup contents. Anything entered after the backup was taken is lost.</div>
+
+<p>You can restore either <b>from the admin panel</b> — which takes a safety backup first and is
+described in section 4 — or from the console as below. The console route is what you want when the
+panel itself is unavailable.</p>
 
 <h3>Step 1 — Pick a backup</h3>
 <pre>ls /opt/backups/frappe/

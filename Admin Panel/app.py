@@ -12,9 +12,11 @@ setup_admin_panel.sh.
 
 import json
 import os
+import pty
 import re
 import shutil
 import subprocess
+import termios
 import threading
 import time
 from datetime import datetime
@@ -57,6 +59,12 @@ ACTIONS = {
     "verify":    {"label": "Verify backups", "cmd": [f"{SCRIPTS_DIR}/frappe_backup_verify.sh"]},
     "update":    {"label": "System update",  "cmd": [f"{UPDATE_DIR}/sspl-erp-update-with-rollback.sh"]},
     "rollback":  {"label": "Rollback",       "cmd": [f"{UPDATE_DIR}/sspl-erp-rollback.sh"], "stdin": "yes\n"},
+    # Restore takes a safety backup first (see restore_with_backup.sh) and is
+    # the one interactive action: the MariaDB root password and the final
+    # confirmation are typed into the job's terminal, so they never become
+    # arguments, env vars, or log lines. Guarded by _restore_request().
+    "restore":   {"label": "Restore from backup",
+                  "cmd": [f"{SCRIPTS_DIR}/restore_with_backup.sh"], "interactive": True},
 }
 
 # Component installers, driven from the panel's Setup switches. Only wired
@@ -105,10 +113,30 @@ def login_required(fn):
 # ---------------------------------------------------------------- job runner
 
 _job_lock = threading.Lock()
-_job = None  # {"name","label","logfile","proc","started","rc","finished"}
+_job = None  # {"name","label","logfile","proc","started","rc","finished","pty"}
 
 
-def start_job(name, extra_env=None):
+def _pump_pty(master, out):
+    """Copy an interactive job's terminal output into its log file."""
+    try:
+        while True:
+            try:
+                data = os.read(master, 4096)
+            except OSError:      # the child exited and closed the slave side
+                break
+            if not data:
+                break
+            out.write(data.decode("utf-8", "replace"))
+            out.flush()
+    finally:
+        out.close()
+        try:
+            os.close(master)
+        except OSError:
+            pass
+
+
+def start_job(name, extra_env=None, extra_args=None):
     """Start a script as a background job; refuse if one is running."""
     global _job
     action = ACTIONS[name]
@@ -117,16 +145,42 @@ def start_job(name, extra_env=None):
             return None, f"'{_job['label']}' is still running"
         JOB_DIR.mkdir(parents=True, exist_ok=True)
         logfile = JOB_DIR / f"{datetime.now():%Y%m%d_%H%M%S}_{name}.log"
-        out = open(logfile, "w")
+        # 0600: job output can quote config and backup contents
+        out = os.fdopen(os.open(logfile, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w")
         env = {**os.environ, **(extra_env or {})}
+        cmd = list(action["cmd"]) + [str(a) for a in (extra_args or [])]
         stdin_text = action.get("stdin")
+        master = None
         try:
-            proc = subprocess.Popen(
-                action["cmd"], stdout=out, stderr=subprocess.STDOUT,
-                stdin=subprocess.PIPE if stdin_text else subprocess.DEVNULL,
-                env=env, cwd=action.get("cwd"))
+            if action.get("interactive"):
+                # A real pty, not a pipe: shell scripts only print `read -p`
+                # prompts when stdin is a terminal.
+                master, slave = pty.openpty()
+                # Echo OFF for the whole job, not just during `read -s`.
+                # A pty echoes input back into the output stream — i.e. into
+                # this job's log. Bash only turns that off while `read -s` is
+                # waiting, so a password typed at any other moment (early,
+                # pasted, type-ahead during the safety backup) would be logged
+                # in clear, and the restore would still succeed, hiding it.
+                # The user reads what they type in the browser input box; the
+                # log never needs it.
+                attrs = termios.tcgetattr(slave)
+                attrs[3] &= ~termios.ECHO          # lflags
+                termios.tcsetattr(slave, termios.TCSANOW, attrs)
+                proc = subprocess.Popen(
+                    cmd, stdin=slave, stdout=slave, stderr=slave,
+                    env=env, cwd=action.get("cwd"), start_new_session=True)
+                os.close(slave)
+                threading.Thread(target=_pump_pty, args=(master, out), daemon=True).start()
+            else:
+                proc = subprocess.Popen(
+                    cmd, stdout=out, stderr=subprocess.STDOUT,
+                    stdin=subprocess.PIPE if stdin_text else subprocess.DEVNULL,
+                    env=env, cwd=action.get("cwd"))
         except OSError as e:
-            out.write(f"Failed to start {action['cmd'][0]}: {e}\n")
+            if master is not None:
+                os.close(master)
+            out.write(f"Failed to start {cmd[0]}: {e}\n")
             out.close()
             return None, f"could not start script: {e}"
         if stdin_text:
@@ -136,8 +190,24 @@ def start_job(name, extra_env=None):
             except OSError:
                 pass
         _job = {"name": name, "label": action["label"], "logfile": str(logfile),
-                "proc": proc, "started": time.time(), "rc": None, "finished": None}
+                "proc": proc, "started": time.time(), "rc": None, "finished": None,
+                "pty": master}
         return _job, None
+
+
+def send_job_input(line):
+    """Type one line into the running job's terminal. Can only ever feed a
+    job that is already running — it never starts anything."""
+    with _job_lock:
+        if not _job or _job["proc"].poll() is not None:
+            return "no job is running"
+        if _job.get("pty") is None:
+            return f"'{_job['label']}' does not take keyboard input"
+        try:
+            os.write(_job["pty"], (line + "\n").encode())
+        except OSError:
+            return "the job is no longer accepting input"
+        return None
 
 
 def job_status():
@@ -159,6 +229,7 @@ def job_status():
             pass
         return {
             "active": rc is None,
+            "interactive": rc is None and _job.get("pty") is not None,
             "name": _job["name"],
             "label": _job["label"],
             "rc": _job["rc"],
@@ -359,7 +430,7 @@ def backups_overview():
             it["latest"] = it["name"] == latest
             images.append(it)
         images.sort(key=lambda x: x["name"], reverse=True)
-    uploads = []
+    uploads, upload_folders = [], []
     if UPLOAD_DIR.is_dir():
         for entry in sorted(UPLOAD_DIR.iterdir()):
             if entry.is_file():
@@ -368,9 +439,54 @@ def backups_overview():
                 for it in _dir_listing(entry):
                     it["name"] = f"{entry.name}/{it['name']}"
                     uploads.append(it)
+                # Only a folder holding a database dump can be restored from.
+                # Loose files in uploads/ are not offered: restoring a whole
+                # directory of unrelated uploads would mix backups together.
+                if any(entry.glob("*-database.sql.gz")):
+                    upload_folders.append(entry.name)
     dbonly = _dir_listing(DB_ONLY_DIR)
     dbonly.sort(key=lambda x: x["name"], reverse=True)
-    return {"full": full, "db_only": dbonly, "images": images, "uploads": uploads}
+    return {"full": full, "db_only": dbonly, "images": images,
+            "uploads": uploads, "upload_folders": upload_folders}
+
+
+def _restore_source(kind, name):
+    """Resolve a restore-from folder inside the backup roots.
+    Returns (Path, None) or (None, error). Only whole backup folders are
+    restorable — a full-backup timestamp folder or an upload subfolder."""
+    roots = {"full": BACKUP_DIR, "upload": UPLOAD_DIR}
+    root = roots.get(kind)
+    if root is None:
+        return None, "restore source must be a full backup or an upload folder"
+    if kind == "full" and not FULL_BACKUP_RE.match(name):
+        return None, "invalid backup name"
+    if kind == "upload" and not SAFE_FOLDER_RE.match(name):
+        return None, "invalid upload folder name"
+    target = (root / name).resolve()
+    if not str(target).startswith(str(root.resolve()) + os.sep) or not target.is_dir():
+        return None, "backup folder not found"
+    if not any(target.glob("*-database.sql.gz")):
+        return None, "no *-database.sql.gz in that folder — nothing to restore from"
+    return target, None
+
+
+def _restore_request(data):
+    """Validate a restore request. Returns (extra_env, extra_args, error, status).
+
+    Three gates, all server-side: the panel admin password is re-entered, the
+    live site name is typed out in full, and the source resolves to a real
+    backup folder inside the backup roots."""
+    site = deployed_site_name()
+    if not site:
+        return None, None, "no deployed site found — nothing to restore into", 400
+    if not check_password_hash(CONFIG["password_hash"], str(data.get("admin_password", ""))):
+        return None, None, "admin password is incorrect", 403
+    if str(data.get("confirm_site", "")).strip() != site:
+        return None, None, f"type the site name exactly — {site} — to confirm", 400
+    src, err = _restore_source(str(data.get("kind", "")), str(data.get("name", "")))
+    if err:
+        return None, None, err, 400
+    return {"SSPL_SITE_NAME": site, "SSPL_SCRIPTS_DIR": SCRIPTS_DIR}, [str(src)], None, None
 
 
 def _safe_download_path(kind, name):
@@ -452,8 +568,14 @@ def api_run(name):
         abort(404)
     data = request.get_json(silent=True) or {}
     extra_env = None
+    extra_args = None
 
-    if name == "rollback":
+    if name == "restore":
+        extra_env, extra_args, err, status = _restore_request(data)
+        if err:
+            return jsonify({"error": err}), status
+
+    elif name == "rollback":
         snap = data.get("snapshot", "")
         if snap:
             if not SNAPSHOT_RE.match(snap):
@@ -468,10 +590,24 @@ def api_run(name):
             return jsonify({"error": err}), 400
         extra_env = env
 
-    job, err = start_job(name, extra_env)
+    job, err = start_job(name, extra_env, extra_args)
     if err:
         return jsonify({"error": err}), 409
     return jsonify({"ok": True, "label": job["label"]})
+
+
+@app.route("/api/job/input", methods=["POST"])
+@login_required
+def api_job_input():
+    """Type a line into the running job's terminal."""
+    data = request.get_json(silent=True) or {}
+    line = str(data.get("line", ""))
+    if len(line) > 512 or "\n" in line or "\r" in line:
+        return jsonify({"error": "one line at a time, 512 characters max"}), 400
+    err = send_job_input(line)
+    if err:
+        return jsonify({"error": err}), 409
+    return jsonify({"ok": True})
 
 
 def _install_env(name, data):
@@ -666,6 +802,24 @@ details{margin:2px 0} details summary{cursor:pointer}
 .setup-form{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px}
 .setup-form input[type=text],.setup-form input[type=password],.setup-form input:not([type]){
   padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--ink)}
+/* terminal input line — only shown while an interactive job is waiting */
+.term-in{display:none;margin-top:8px;gap:8px;align-items:center}
+.term-in.on{display:flex}
+.term-in input{flex:1;font:12.5px/1.45 ui-monospace,Menlo,Consolas,monospace;
+  background:#111;color:#ddd;border-color:#333}
+.term-in .ps1{color:var(--muted);font:12.5px ui-monospace,monospace}
+/* restore confirmation modal */
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;
+  align-items:center;justify-content:center;padding:16px;z-index:10}
+.modal.on{display:flex}
+.modal .card{max-width:520px;width:100%;margin:0;max-height:90vh;overflow:auto}
+.modal label{display:block;margin:10px 0 4px;color:var(--ink-2);font-size:13px}
+.modal input{width:100%}
+.danger-box{border:1px solid var(--crit);border-radius:8px;padding:10px 12px;
+  font-size:13px;color:var(--ink-2);margin-bottom:4px}
+.danger-box b{color:var(--crit)}
+.modal .row{display:flex;gap:10px;justify-content:flex-end;margin-top:16px}
+#rs-err{color:var(--crit);font-size:13px;margin-top:10px;min-height:0}
 </style></head><body>
 <div class="top">
   <h1>SSPL ERP Admin</h1><span id="clock" class="badge"></span><span class="spacer"></span>
@@ -747,14 +901,105 @@ details{margin:2px 0} details summary{cursor:pointer}
 <div class="card" id="job-card"><h2>Terminal — live output</h2>
   <div id="jobstate">No job has been run yet.</div>
   <div id="console"></div>
+  <div class="term-in" id="term-in">
+    <span class="ps1">&gt;</span>
+    <input id="term-line" placeholder="type your answer, then Enter" autocomplete="off">
+    <button id="term-send">Send</button>
+  </div>
 </div>
 </aside>
 
 </main>
+
+<div class="modal" id="rs-modal"><div class="card">
+  <h1 style="font-size:17px;margin-bottom:10px">Restore from backup</h1>
+  <div class="danger-box">
+    <b>⚠ This overwrites the live site.</b> Everything currently in
+    <b id="rs-site">the site</b> — every record entered since the backup was taken — is
+    replaced by the contents of <b id="rs-src">the backup</b>.
+    <br><br>A <b>full safety backup is taken first</b>, so you can get back to the
+    current state if this turns out to be the wrong backup. Users will be
+    disconnected while it runs.
+  </div>
+  <label>Type the site name <b id="rs-site2"></b> to confirm</label>
+  <input id="rs-confirm" autocomplete="off" placeholder="site name">
+  <label>Your admin panel password</label>
+  <input id="rs-pw" type="password" autocomplete="current-password">
+  <div id="rs-err"></div>
+  <div class="row">
+    <button id="rs-cancel">Cancel</button>
+    <button class="danger" id="rs-go">Back up, then restore</button>
+  </div>
+</div></div>
 <script>
 const $ = s => document.querySelector(s);
 const esc = t => (t??'').toString().replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 let jobWasActive = false;
+
+// ---- restore: modal gate, then a job you talk to in the terminal ----
+let rsTarget = null;   // {kind, name} of the backup being restored from
+
+function restoreBtn(hasDb, kind, name){
+  if (!hasDb) return '';
+  return `<button class="danger rs-btn" data-kind="${esc(kind)}" data-name="${esc(name)}"
+    title="Overwrites the live site with this backup">Restore</button>`;
+}
+
+function openRestore(kind, name){
+  rsTarget = {kind, name};
+  const site = (window.setupSite || 'the live site');
+  $('#rs-site').textContent = site;
+  $('#rs-site2').textContent = site;
+  $('#rs-src').textContent = name;
+  $('#rs-confirm').value = ''; $('#rs-pw').value = ''; $('#rs-err').textContent = '';
+  $('#rs-modal').classList.add('on');
+  $('#rs-confirm').focus();
+}
+function closeRestore(){ $('#rs-modal').classList.remove('on'); rsTarget = null; }
+
+document.addEventListener('click', e => {
+  const b = e.target.closest('.rs-btn');
+  if (b) openRestore(b.dataset.kind, b.dataset.name);
+});
+$('#rs-cancel').onclick = closeRestore;
+$('#rs-modal').onclick = e => { if (e.target === $('#rs-modal')) closeRestore(); };
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && $('#rs-modal').classList.contains('on')) closeRestore();
+});
+
+$('#rs-go').onclick = async () => {
+  if (!rsTarget) return;
+  const btn = $('#rs-go');
+  btn.disabled = true; $('#rs-err').textContent = '';
+  try{
+    const r = await fetch('/api/run/restore', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({kind: rsTarget.kind, name: rsTarget.name,
+        confirm_site: $('#rs-confirm').value,
+        admin_password: $('#rs-pw').value})});
+    const j = await r.json();
+    if (j.error){ $('#rs-err').textContent = j.error; btn.disabled = false; return; }
+    closeRestore();
+    jobWasActive = true; refreshJob(); revealConsole();
+  }catch(e){ $('#rs-err').textContent = 'request failed'; }
+  btn.disabled = false;
+};
+
+// ---- terminal input: only ever types into the job that is already running ----
+async function sendTermLine(){
+  const box = $('#term-line'), line = box.value;
+  if (!line) return;
+  box.value = '';
+  try{
+    const r = await fetch('/api/job/input', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({line})});
+    const j = await r.json();
+    if (j.error) alert(j.error);
+  }catch(e){ alert('could not send input'); }
+  refreshJob();
+}
+$('#term-send').onclick = sendTermLine;
+$('#term-line').addEventListener('keydown', e => { if (e.key === 'Enter') sendTermLine(); });
 
 // The terminal sits in the sticky right column, so it is already on screen;
 // only scroll to it when the layout has collapsed to a single column.
@@ -805,6 +1050,7 @@ async function refreshSetup(){
   try{
     const r = await fetch('/api/setup-status'); if(r.status===401){location='/login';return;}
     const s = await r.json();
+    window.setupSite = (s.components && s.components.erp.site) || null;
     if(!s.repo_ok){
       $('#setup-body').innerHTML = `<p style="color:var(--warn);margin:0">Installer scripts not found
         (${s.repo_dir?('repo_dir = <code>'+esc(s.repo_dir)+'</code>'):'repo_dir is not set in config.json'}).
@@ -884,12 +1130,13 @@ async function refreshBackups(){
     const r = await fetch('/api/backups'); if(!r.ok) return;
     const b = await r.json();
     $('#tab-full').innerHTML = b.full.length ? `<table><thead><tr><th>Backup</th><th>Size</th>
-      <th>Contents</th><th class="right">Files</th></tr></thead><tbody>` +
+      <th>Contents</th><th class="right">Files</th><th></th></tr></thead><tbody>` +
       b.full.map(d => `<tr><td class="num">${esc(d.name)}</td><td class="num">${esc(d.size)}</td>
         <td>${fileBadge(d.db,'DB')} ${fileBadge(d.public,'Files')} ${fileBadge(d.private,'Private')}</td>
         <td class="right"><details><summary>${d.files.length} files</summary><div class="filelist">` +
         d.files.map(f => `${esc(f.name)} (${esc(f.size)}) — ${dl('full', d.name + '/' + f.name)}`).join('<br>') +
-        `</div></details></td></tr>`).join('') + '</tbody></table>'
+        `</div></details></td><td class="right">${restoreBtn(d.db, 'full', d.name)}</td></tr>`).join('') +
+        '</tbody></table>'
       : '<p style="color:var(--muted)">No full backups found.</p>';
     const simpleTable = (rows, kind) => rows.length ? `<table><thead><tr><th>File</th><th>Size</th>
       <th>Date</th><th></th></tr></thead><tbody>` +
@@ -899,7 +1146,16 @@ async function refreshBackups(){
       : '<p style="color:var(--muted)">Nothing here yet.</p>';
     $('#tab-db').innerHTML = simpleTable(b.db_only, 'db');
     $('#tab-img').innerHTML = simpleTable(b.images, 'image');
-    $('#tab-upl').innerHTML = simpleTable(b.uploads, 'upload');
+    $('#tab-upl').innerHTML =
+      ((b.upload_folders || []).length ? `<table><thead><tr><th>Restorable folder</th><th></th>
+        </tr></thead><tbody>` + b.upload_folders.map(f =>
+        `<tr><td class="num">${esc(f)} <span class="badge ok">DB</span></td>
+         <td class="right">${restoreBtn(true, 'upload', f)}</td></tr>`).join('') +
+        '</tbody></table>'
+        : '<p style="font-size:13px;color:var(--muted);margin-top:0">To restore an uploaded backup, ' +
+          'upload it into its own named folder (the Folder box below) so its database and files stay ' +
+          'together. Folders containing a <code>*-database.sql.gz</code> get a Restore button here.</p>') +
+      simpleTable(b.uploads, 'upload');
     const sel = $('#rb-snap'), cur = sel.value;
     sel.innerHTML = '<option value="">Latest snapshot</option>' +
       b.images.map(i => `<option value="${esc(i.name)}">${esc(i.name)} (${esc(i.size)})</option>`).join('');
@@ -912,6 +1168,13 @@ async function refreshJob(){
     const r = await fetch('/api/job'); if(!r.ok) return;
     const j = await r.json();
     document.querySelectorAll('.act').forEach(btn => btn.disabled = j.active);
+    document.querySelectorAll('.rs-btn').forEach(btn => btn.disabled = j.active);
+    // The input line appears only while an interactive job is actually running.
+    const ti = $('#term-in'), wantInput = !!j.interactive;
+    if (wantInput !== ti.classList.contains('on')){
+      ti.classList.toggle('on', wantInput);
+      if (wantInput) $('#term-line').focus();
+    }
     if (j.label === null) return;
     const st = j.active
       ? `<b>${esc(j.label)}</b> <span class="live">running…</span> (${j.elapsed}s)`
@@ -978,9 +1241,15 @@ document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => {
 setInterval(() => $('#clock').textContent = new Date().toLocaleString(), 1000);
 refreshSetup(); refreshStats(); refreshBackups(); refreshJob();
 setInterval(refreshStats, 5000);
-setInterval(refreshJob, 2500);
 setInterval(refreshBackups, 60000);
 setInterval(refreshSetup, 30000);
+
+// Poll the job faster while one is running, so prompts and output feel
+// prompt to type against; idle back off when nothing is happening.
+(function pollJob(){
+  const next = () => setTimeout(pollJob, jobWasActive ? 1000 : 3000);
+  refreshJob().then(next, next);
+})();
 </script></body></html>"""
 
 

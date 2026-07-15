@@ -21,6 +21,10 @@ keep watching it. Below 1060px wide the columns stack, terminal last.
 - **Clear RAM caches** button (`sync` + drop_caches — safe, caches rebuild automatically)
 - **One-click actions** — full backup, DB-only backup, backup verification,
   system update, image rollback (with snapshot picker)
+- **Guarded restore** — restore a full backup or an uploaded backup folder:
+  re-enter your admin password, type the site name to confirm, and a safety
+  backup is taken first. The MariaDB root password is typed into the live
+  terminal, never stored. See [Restoring](#restoring-from-the-panel).
 - **Live terminal** — watch the script output while it runs, in the sticky
   right-hand column; only one job can run at a time
 - **Backup browser** — full backups (with DB/Files/Private completeness badges),
@@ -80,6 +84,40 @@ The passwords you type into the ERP form are sent to the installer as
 environment variables over HTTPS and are **never written to the job log**.
 The `bench new-site` step still passes them on its in-container command line
 (visible to `ps` inside the container only) — acceptable on the trusted LAN.
+
+## Restoring from the panel
+
+Restore is the one action that destroys data, so it is deliberately not a
+plain button.
+
+1. Find the backup in the **Backups** card — either a full backup, or an
+   uploaded folder under the **Uploads** tab. Only folders containing a
+   `*-database.sql.gz` get a **Restore** button.
+2. A warning names the exact site about to be overwritten. Type the **site
+   name** in full and re-enter your **admin panel password**.
+3. The job takes a **full safety backup first**, then starts the restore.
+   If the backup fails, the restore does not run.
+4. The restore asks for the **MariaDB root password** in the terminal on the
+   right. Type it into the input line and press Enter, then answer `yes` to
+   the final confirmation.
+
+Note the input line is an ordinary text box, so **what you type is visible on
+your screen** as you type it (unlike a console, which hides the password) —
+mind your shoulder. It is not echoed into the job log at any point.
+
+To abort a restore that is waiting at a prompt, answer `no` at the
+confirmation. If nobody is there to answer, `sudo systemctl restart
+sspl-admin` ends it: the script's next read hits end-of-file and it exits.
+Until it ends, the one-job-at-a-time rule blocks the panel's other buttons
+(cron backups are unaffected — they don't go through the panel).
+
+To restore an **uploaded** backup, upload it into its own named folder (the
+*Folder* box on the upload form) so its database and files stay together. A
+folder is what gets restored, not a loose file: pointing the restore at a
+directory of unrelated uploads would mix backups from different dates.
+
+The console path still works and is unchanged:
+`sudo /opt/scripts/v2/frappe_restore.sh /opt/backups/frappe/<TIMESTAMP>`.
 
 ### About the HTTPS warning
 
@@ -142,9 +180,24 @@ buttons still work.
   memory, so a restart loses the handle and the terminal will show "no
   job" even though the underlying script keeps running to completion. Check
   `/opt/sspl-admin/jobs/*.log` if in doubt.
-- **Restore is deliberately not in the web UI**: `frappe_restore.sh` asks for
-  the MariaDB root password and overwrites live data, so it stays a
-  console-only operation.
+- **Restore** overwrites live data, so it is gated three ways, all checked
+  server-side: your panel password is re-entered, the live site name is
+  typed out in full, and the source must resolve to a real backup folder
+  inside the backup roots. A full safety backup runs first, welded into the
+  same script (`restore_with_backup.sh`) so it cannot be skipped — if the
+  backup fails, the restore never starts.
+- The **terminal input channel** (`/api/job/input`) can only type into the
+  job that is already running — it cannot start a process, and only the
+  restore action accepts input. It is not a shell: no arbitrary command can
+  be run from the browser. The MariaDB root password is typed straight into
+  the running script's terminal, so it is never an argument and never stored.
+- Interactive jobs run on a pty with **echo disabled for the whole job**, not
+  just during `read -s`. A pty echoes input into the output stream, i.e. into
+  the job log; bash only suppresses that while a `read -s` is waiting, so a
+  password typed at any other moment (early, pasted, typed ahead during the
+  safety backup) would otherwise be logged in clear — and the restore would
+  still succeed, hiding the leak. Tested at both timings.
+- Job logs in `/opt/sspl-admin/jobs/` are created `0600`.
 - Uploads accept only backup-type files (`.sql.gz`, `.tar`, `.tgz`, `.json`,
   `.yml`) and are stored under `/opt/backups/frappe/uploads/` — they are never
   executed or restored automatically.

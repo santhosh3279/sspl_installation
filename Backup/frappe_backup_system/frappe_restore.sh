@@ -2,6 +2,10 @@
 
 # Frappe Restore Script
 # Usage: ./frappe_restore.sh /path/to/backup/folder
+#
+# SSPL_SITE_NAME can be set by a parent (the admin panel's Restore action)
+# to answer the site prompt. The MariaDB root password and the final
+# confirmation are always asked interactively and are never stored.
 
 set -e
 
@@ -21,8 +25,13 @@ if [ ! -d "$BACKUP_DIR" ]; then
 fi
 
 echo "=== Starting Frappe Restore from $BACKUP_DIR ==="
-read -p "Enter site name [$SITE_NAME]: " INPUT_SITE
-SITE_NAME=${INPUT_SITE:-$SITE_NAME}
+if [ -n "$SSPL_SITE_NAME" ]; then
+    SITE_NAME="$SSPL_SITE_NAME"
+    echo "Site to restore into: $SITE_NAME"
+else
+    read -p "Enter site name [$SITE_NAME]: " INPUT_SITE
+    SITE_NAME=${INPUT_SITE:-$SITE_NAME}
+fi
 read -sp "Enter MariaDB root password: " DB_ROOT_PASSWORD
 echo ""
 

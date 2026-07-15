@@ -26,9 +26,10 @@ sudo cp frappe_backup.sh "$INSTALL_DIR/"
 sudo cp frappe_db_backup.sh "$INSTALL_DIR/"
 sudo cp frappe_restore.sh "$INSTALL_DIR/"
 sudo cp frappe_backup_verify.sh "$INSTALL_DIR/"
+sudo cp restore_with_backup.sh "$INSTALL_DIR/"
 
 # 3. Make scripts executable
-sudo chmod +x "$INSTALL_DIR"/frappe_*.sh
+sudo chmod +x "$INSTALL_DIR"/frappe_*.sh "$INSTALL_DIR/restore_with_backup.sh"
 
 # 4. Configure site name
 # (SSPL_SITE_NAME, SSPL_INSTALL_CRON and SSPL_RUN_TEST can be set by a
