@@ -99,15 +99,20 @@ echo ""
 echo "→ 3/3 Web admin panel ($PANEL_DST)"
 if [ -f "$PANEL_DST/config.json" ]; then
     sudo cp "$PANEL_SRC/app.py" "$PANEL_DST/"
-    echo "   ✓ app.py"
-    if [ -d /etc/systemd/system ] && [ -f /etc/systemd/system/sspl-admin.service ]; then
+    PANEL_VER=$(grep -m1 '^PANEL_VERSION' "$PANEL_SRC/app.py" | cut -d'"' -f2)
+    echo "   ✓ app.py (v$PANEL_VER)"
+    # Copying app.py is NOT enough: the running process holds the old code in
+    # memory, so without a restart the browser keeps showing the old panel.
+    # Never skip this silently — say so loudly if it can't be done.
+    if [ -f /etc/systemd/system/sspl-admin.service ]; then
         sudo cp "$PANEL_SRC/sspl-admin.service" /etc/systemd/system/
         sudo systemctl daemon-reload
         echo "   → Restarting sspl-admin service..."
         if sudo systemctl restart sspl-admin; then
             sleep 2
             if sudo systemctl is-active --quiet sspl-admin; then
-                echo "   ✓ sspl-admin is running"
+                echo "   ✓ sspl-admin is running v$PANEL_VER"
+                echo "     (browser still showing the old page? hard-refresh: Ctrl+Shift+R)"
             else
                 echo "   ❌ sspl-admin failed to start — check: sudo journalctl -u sspl-admin -n 30"
                 exit 1
@@ -116,6 +121,11 @@ if [ -f "$PANEL_DST/config.json" ]; then
             echo "   ❌ could not restart sspl-admin — check: sudo journalctl -u sspl-admin -n 30"
             exit 1
         fi
+    else
+        echo "   ⚠ /etc/systemd/system/sspl-admin.service not found, so the panel was"
+        echo "     NOT restarted — it is still running the OLD code. The new app.py is"
+        echo "     in place; restart the panel yourself, however you started it."
+        SKIPPED="$SKIPPED admin-panel-restart"
     fi
     UPDATED="$UPDATED admin-panel"
 else

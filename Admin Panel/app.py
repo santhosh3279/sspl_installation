@@ -28,6 +28,14 @@ from flask import (Flask, abort, jsonify, redirect, render_template_string,
 from werkzeug.security import check_password_hash
 from werkzeug.utils import secure_filename
 
+# Shown in the panel header and printed to the journal at startup, so you can
+# tell at a glance whether the code running on the server is the code you
+# think it is. Copying app.py is not enough — the service must be restarted
+# for a new version to take effect. Bump this whenever app.py gains something
+# visible; FEATURES lists what that version should show.
+PANEL_VERSION = "2026-07-15.2"
+FEATURES = "two-column terminal, setup switches, guarded restore"
+
 CONFIG_FILE = os.environ.get("SSPL_ADMIN_CONFIG", "/opt/sspl-admin/config.json")
 with open(CONFIG_FILE) as f:
     CONFIG = json.load(f)
@@ -534,7 +542,7 @@ def logout():
 @app.route("/")
 @login_required
 def index():
-    return render_template_string(DASH_HTML, user=session["user"])
+    return render_template_string(DASH_HTML, user=session["user"], version=PANEL_VERSION)
 
 
 @app.route("/api/stats")
@@ -822,7 +830,9 @@ details{margin:2px 0} details summary{cursor:pointer}
 #rs-err{color:var(--crit);font-size:13px;margin-top:10px;min-height:0}
 </style></head><body>
 <div class="top">
-  <h1>SSPL ERP Admin</h1><span id="clock" class="badge"></span><span class="spacer"></span>
+  <h1>SSPL ERP Admin</h1><span id="clock" class="badge"></span>
+  <span class="badge" title="panel code version — restart the service after updating">v{{ version }}</span>
+  <span class="spacer"></span>
   <span style="color:var(--muted);font-size:13px">{{ user }}</span>
   <form method="post" action="/logout" style="margin:0"><button>Log out</button></form>
 </div>
@@ -1254,6 +1264,7 @@ setInterval(refreshSetup, 30000);
 
 
 if __name__ == "__main__":
+    print(f"SSPL ERP Admin Panel v{PANEL_VERSION} — {FEATURES}", flush=True)
     cert = CONFIG.get("tls_cert")
     key = CONFIG.get("tls_key")
     ssl_ctx = None

@@ -129,6 +129,30 @@ warning disappear on a particular PC, import
 store. To regenerate the certificate (e.g. after changing the server IP),
 delete `/opt/sspl-admin/certs/` and re-run the installer.
 
+## Which version am I running?
+
+The panel header shows a version badge, e.g. `v2026-07-15.2`. That is baked
+into the `app.py` that is **actually running**, so it is the honest answer to
+"did my update take effect?".
+
+Updating is two steps, and missing the second is the usual reason a new
+feature doesn't appear:
+
+1. `git pull && ./update_tooling.sh` — copies the new `app.py` **and**
+   restarts the service. It prints the version it installed.
+2. **Hard-refresh the browser** (Ctrl+Shift+R). The page's HTML, CSS and JS
+   are served inline, so a cached page looks identical to old code.
+
+If the badge still shows an old version after both, the service didn't
+restart: `sudo systemctl restart sspl-admin`, then
+`sudo journalctl -u sspl-admin -n 20` — the panel prints its version and
+feature list on startup.
+
+| Version | Should show |
+|---|---|
+| `2026-07-15.2` | Restore buttons on backups/uploads, interactive terminal |
+| `2026-07-15.1` | Two-column layout, no restore |
+
 ## Managing the service
 
 ```bash
