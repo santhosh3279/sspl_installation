@@ -33,8 +33,8 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-07-15.2"
-FEATURES = "two-column terminal, setup switches, guarded restore"
+PANEL_VERSION = "2026-07-15.3"
+FEATURES = "two-column terminal, setup switches, guarded restore, delete uploads"
 
 CONFIG_FILE = os.environ.get("SSPL_ADMIN_CONFIG", "/opt/sspl-admin/config.json")
 with open(CONFIG_FILE) as f:
@@ -497,6 +497,29 @@ def _restore_request(data):
     return {"SSPL_SITE_NAME": site, "SSPL_SCRIPTS_DIR": SCRIPTS_DIR}, [str(src)], None, None
 
 
+def _safe_upload_target(name):
+    """Resolve an upload file or folder for deletion.
+
+    Deletion is confined to the uploads/ tree: real backups, db-only dumps
+    and image snapshots are not reachable through this. Accepts 'file',
+    'folder', or 'folder/file'."""
+    parts = [p for p in name.split("/") if p]
+    if not 1 <= len(parts) <= 2:
+        return None, "invalid name"
+    if len(parts) == 2:
+        if not SAFE_FOLDER_RE.match(parts[0]) or not SAFE_NAME_RE.match(parts[1]):
+            return None, "invalid name"
+    elif not (SAFE_FOLDER_RE.match(parts[0]) or SAFE_NAME_RE.match(parts[0])):
+        return None, "invalid name"
+    root = UPLOAD_DIR.resolve()
+    target = (UPLOAD_DIR / "/".join(parts)).resolve()
+    if not str(target).startswith(str(root) + os.sep):
+        return None, "outside the uploads folder"
+    if not target.exists():
+        return None, "not found — already deleted?"
+    return target, None
+
+
 def _safe_download_path(kind, name):
     roots = {"full": BACKUP_DIR, "db": DB_ONLY_DIR, "image": IMAGE_BACKUP_DIR, "upload": UPLOAD_DIR}
     root = roots.get(kind)
@@ -686,6 +709,28 @@ def upload():
     if not saved:
         return jsonify({"error": "no files received"}), 400
     return jsonify({"ok": True, "saved": saved, "dest": str(dest)})
+
+
+@app.route("/api/uploads/delete", methods=["POST"])
+@login_required
+def api_uploads_delete():
+    """Delete an uploaded file or folder. Uploads only — never a backup."""
+    data = request.get_json(silent=True) or {}
+    target, err = _safe_upload_target(str(data.get("name", "")))
+    if err:
+        return jsonify({"error": err}), 400
+    # Don't delete the folder a restore is reading from underneath it.
+    with _job_lock:
+        if _job and _job["name"] == "restore" and _job["proc"].poll() is None:
+            return jsonify({"error": "a restore is running — wait for it to finish"}), 409
+    try:
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+    except OSError as e:
+        return jsonify({"error": f"could not delete: {e}"}), 500
+    return jsonify({"ok": True})
 
 
 @app.route("/download/<kind>/<path:name>")
@@ -946,6 +991,30 @@ const $ = s => document.querySelector(s);
 const esc = t => (t??'').toString().replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 let jobWasActive = false;
 
+// ---- deleting uploads (uploads only — backups have no delete button) ----
+function delBtn(name, what){
+  return `<button class="danger del-btn" data-name="${esc(name)}" data-what="${esc(what)}"
+    title="Delete this upload from the server">Delete</button>`;
+}
+
+document.addEventListener('click', async e => {
+  const b = e.target.closest('.del-btn');
+  if (!b) return;
+  const name = b.dataset.name;
+  const msg = b.dataset.what === 'folder'
+    ? `Delete the uploaded folder "${name}" and everything in it?\n\nThis cannot be undone.`
+    : `Delete the uploaded file "${name}"?\n\nThis cannot be undone.`;
+  if (!confirm(msg)) return;
+  b.disabled = true;
+  try{
+    const r = await fetch('/api/uploads/delete', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({name})});
+    const j = await r.json();
+    if (j.error) alert(j.error);
+  }catch(err){ alert('request failed'); }
+  refreshBackups();
+});
+
 // ---- restore: modal gate, then a job you talk to in the terminal ----
 let rsTarget = null;   // {kind, name} of the backup being restored from
 
@@ -1148,24 +1217,26 @@ async function refreshBackups(){
         `</div></details></td><td class="right">${restoreBtn(d.db, 'full', d.name)}</td></tr>`).join('') +
         '</tbody></table>'
       : '<p style="color:var(--muted)">No full backups found.</p>';
-    const simpleTable = (rows, kind) => rows.length ? `<table><thead><tr><th>File</th><th>Size</th>
+    const simpleTable = (rows, kind, deletable) => rows.length ? `<table><thead><tr><th>File</th><th>Size</th>
       <th>Date</th><th></th></tr></thead><tbody>` +
       rows.map(f => `<tr><td class="num">${esc(f.name)}${f.latest?' <span class="badge ok">latest</span>':''}</td>
         <td class="num">${esc(f.size)}</td><td class="num">${esc(f.mtime)}</td>
-        <td class="right">${dl(kind, f.name)}</td></tr>`).join('') + '</tbody></table>'
+        <td class="right">${dl(kind, f.name)}${deletable ? ' ' + delBtn(f.name, 'file') : ''}</td></tr>`).join('') +
+        '</tbody></table>'
       : '<p style="color:var(--muted)">Nothing here yet.</p>';
+    // Only uploads are deletable — real backups and snapshots are not.
     $('#tab-db').innerHTML = simpleTable(b.db_only, 'db');
     $('#tab-img').innerHTML = simpleTable(b.images, 'image');
     $('#tab-upl').innerHTML =
       ((b.upload_folders || []).length ? `<table><thead><tr><th>Restorable folder</th><th></th>
         </tr></thead><tbody>` + b.upload_folders.map(f =>
         `<tr><td class="num">${esc(f)} <span class="badge ok">DB</span></td>
-         <td class="right">${restoreBtn(true, 'upload', f)}</td></tr>`).join('') +
+         <td class="right">${restoreBtn(true, 'upload', f)} ${delBtn(f, 'folder')}</td></tr>`).join('') +
         '</tbody></table>'
         : '<p style="font-size:13px;color:var(--muted);margin-top:0">To restore an uploaded backup, ' +
           'upload it into its own named folder (the Folder box below) so its database and files stay ' +
           'together. Folders containing a <code>*-database.sql.gz</code> get a Restore button here.</p>') +
-      simpleTable(b.uploads, 'upload');
+      simpleTable(b.uploads, 'upload', true);
     const sel = $('#rb-snap'), cur = sel.value;
     sel.innerHTML = '<option value="">Latest snapshot</option>' +
       b.images.map(i => `<option value="${esc(i.name)}">${esc(i.name)} (${esc(i.size)})</option>`).join('');

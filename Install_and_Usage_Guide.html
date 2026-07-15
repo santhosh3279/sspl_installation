@@ -281,7 +281,10 @@ install the rest, in order:</p>
   <li><b>Backups</b> — full backups with DB / Files / Private completeness badges, DB-only dumps,
       image snapshots, and uploads; every file can be downloaded.</li>
   <li><b>Upload</b> — send backup files to the server; they are stored under
-      <code>/opt/backups/frappe/uploads/</code> and never executed or restored automatically.</li>
+      <code>/opt/backups/frappe/uploads/</code> and never executed or restored automatically.
+      Each uploaded file and folder has a <b>Delete</b> button to remove it again. Deleting only
+      ever works inside <code>uploads/</code> — real backups and image snapshots have no delete
+      button and cannot be removed from the browser.</li>
 </ul>
 <h3>Restoring from the panel</h3>
 <p>Restore is the one action that destroys data, so it is not a plain button. Full backups and

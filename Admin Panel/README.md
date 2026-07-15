@@ -30,7 +30,10 @@ keep watching it. Below 1060px wide the columns stack, terminal last.
 - **Backup browser** — full backups (with DB/Files/Private completeness badges),
   DB-only dumps, Docker image snapshots, uploads — all downloadable
 - **Upload backup files** to the server (stored under
-  `/opt/backups/frappe/uploads/`, optionally in a named subfolder)
+  `/opt/backups/frappe/uploads/`, optionally in a named subfolder), and
+  **delete** them again — files or whole folders. Deleting is confined to
+  `uploads/`: real backups and image snapshots have no delete button and
+  cannot be reached by the endpoint.
 - **Admin login** — single admin user, hashed password, session cookie
 - **HTTPS** — self-signed certificate generated at install; all traffic
   (passwords, backups) is encrypted on the LAN
@@ -150,6 +153,7 @@ feature list on startup.
 
 | Version | Should show |
 |---|---|
+| `2026-07-15.3` | Delete buttons on uploads |
 | `2026-07-15.2` | Restore buttons on backups/uploads, interactive terminal |
 | `2026-07-15.1` | Two-column layout, no restore |
 
@@ -225,3 +229,9 @@ buttons still work.
 - Uploads accept only backup-type files (`.sql.gz`, `.tar`, `.tgz`, `.json`,
   `.yml`) and are stored under `/opt/backups/frappe/uploads/` — they are never
   executed or restored automatically.
+- **Deleting is confined to `uploads/`.** The delete endpoint resolves the
+  target and refuses anything that lands outside that tree — traversal
+  (`../`), absolute paths, and symlinks pointing out of it are all rejected,
+  so real backups, DB dumps and image snapshots cannot be deleted from the
+  web. It also refuses while a restore is running, so a folder can't vanish
+  from under the job reading it.
