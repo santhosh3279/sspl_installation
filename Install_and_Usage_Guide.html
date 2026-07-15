@@ -194,7 +194,7 @@ page drives the whole rest of the installation, in order:</p>
       creates the site named after the server IP with <b>every app shipped in the image</b>
       installed automatically (erpnext, india_compliance, ssplbilling,
       printer_server_configuration, frappe_whatsapp, …), sets it as the default site and repairs the
-      MariaDB grants. This takes 10–20 minutes and streams live into the terminal on the right of
+      MariaDB grants. This takes 10–20 minutes and streams live into the terminal at the foot of
       the page.</li>
   <li><b>Install backup system</b> — one click: Part 2 in <code>/opt/scripts/v2/</code> with its cron
       jobs.</li>
@@ -257,16 +257,15 @@ in place first. Keep the git checkout on the server (the Setup switches run the 
 cannot get a public certificate), so the browser warns the <b>first</b> time — click
 <i>Advanced → Proceed</i>; the connection is fully encrypted either way. To remove the warning on a
 particular PC, import <code>/opt/sspl-admin/certs/sspl-admin.crt</code> into its trusted store.</p>
-<p>The page has two columns: the <b>control panel</b> on the left (setup, server health, actions,
-backups) and a <b>terminal</b> on the right that shows the live output of whatever is running. The
-terminal stays in place as you scroll the left column, so you can start a job and keep watching it.
-On a narrow screen or phone the two columns stack, terminal underneath.</p>
-<p>The <b>Setup — install components</b> card at the top left shows what is installed and lets you
+<p>The page is one column: the <b>control panel</b> (setup, server health, actions, backups) with a
+full-width <b>terminal</b> at the foot of the page showing the live output of whatever is running.
+Starting a job scrolls the terminal into view; drag its bottom edge to make it taller.</p>
+<p>The <b>Setup — install components</b> card at the top shows what is installed and lets you
 install the rest, in order:</p>
 <ol>
   <li><b>ERPNext stack</b> — enter the server IP, HTTP port, MariaDB root password, and Administrator
       password, then click <i>Install ERPNext</i>. This pulls the image, starts the containers, and
-      creates the site (10–20 minutes); progress streams into the terminal on the right. The passwords
+      creates the site (10–20 minutes); progress streams into the terminal below. The passwords
       are sent over HTTPS as environment variables and are never written to the log.</li>
   <li><b>Backup system</b> and <b>Update &amp; rollback scripts</b> — enabled once ERPNext is
       installed, and reuse the deployed site name automatically. One click each.</li>
@@ -277,7 +276,7 @@ install the rest, in order:</p>
 <ul>
   <li><b>Actions</b> — full backup, DB-only backup, verify, system update, rollback (with a snapshot
       picker), and a Clear-RAM-caches button. Only one job runs at a time; its output streams into
-      the terminal on the right.</li>
+      the terminal at the foot of the page.</li>
   <li><b>Backups</b> — full backups with DB / Files / Private completeness badges, DB-only dumps,
       image snapshots, and uploads; every file can be downloaded.</li>
   <li><b>Upload</b> — send backup files to the server; they are stored under

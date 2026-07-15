@@ -33,8 +33,9 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-07-15.3"
-FEATURES = "two-column terminal, setup switches, guarded restore, delete uploads"
+PANEL_VERSION = "2026-07-15.4"
+FEATURES = ("console-style terminal, setup switches, guarded restore, "
+            "delete uploads")
 
 CONFIG_FILE = os.environ.get("SSPL_ADMIN_CONFIG", "/opt/sspl-admin/config.json")
 with open(CONFIG_FILE) as f:
@@ -795,26 +796,22 @@ button{width:100%;margin-top:16px}
 <button class="primary" type="submit">Sign in</button>
 </form></div></body></html>"""
 
+# The CSS/JS half of this template is a RAW string (r"""). The JS needs to
+# reach the browser with its own backslash escapes intact: in a normal string
+# Python eats them, turning \x1b into a real ESC byte and split('\r') into a
+# literal carriage return — which is a syntax error inside a JS string literal
+# and kills the whole <script>. Keep the r prefix when editing.
 DASH_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SSPL ERP Admin</title><style>""" + BASE_CSS + """
+<title>SSPL ERP Admin</title><style>""" + BASE_CSS + r"""
 .top{display:flex;align-items:center;gap:14px;max-width:1500px;margin:0 auto;padding:18px 16px 6px}
 .top .spacer{flex:1}
-/* Two columns: control panel on the left, live terminal on the right.
-   The terminal sticks to the viewport so it stays visible while you
-   scroll the controls. Collapses to one column on narrow screens. */
-main{max-width:1500px;margin:0 auto;padding:0 16px 40px;
-  display:grid;grid-template-columns:minmax(0,1fr) minmax(360px,480px);
-  gap:16px;align-items:start}
+/* One column: the control panel, then the terminal full-width at the foot of
+   the page. Starting a job scrolls the terminal into view. */
+main{max-width:1500px;margin:0 auto;padding:0 16px 40px}
 .col-left{min-width:0}
-.col-right{min-width:0;position:sticky;top:16px}
-#job-card{margin-bottom:0;display:flex;flex-direction:column;
-  max-height:calc(100vh - 32px)}
-@media (max-width:1060px){
-  main{grid-template-columns:1fr}
-  .col-right{position:static}
-  #job-card{max-height:none}
-}
+.col-right{min-width:0}
+#job-card{margin-bottom:0}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px}
 .tile{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:12px 14px}
 .tile .k{font-size:12px;color:var(--muted)} .tile .v{font-size:22px;margin-top:2px}
@@ -833,8 +830,16 @@ main{max-width:1500px;margin:0 auto;padding:0 16px 40px;
 .dot.up{background:var(--ok)} .dot.down{background:var(--crit)}
 .actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
 .actions .sep{flex-basis:100%;height:0}
-#console{background:#111;color:#ddd;border-radius:8px;padding:12px;font:12.5px/1.45 ui-monospace,Menlo,Consolas,monospace;
-  white-space:pre-wrap;overflow:auto;flex:1;min-height:320px}
+/* The terminal is one black pane. The log and the input line stay separate
+   DOM nodes — the poll rewrites the log wholesale, which would eat the caret
+   and any half-typed text — but they are styled as a single surface. */
+.term{background:#111;border-radius:8px;padding:12px;display:flex;flex-direction:column;
+  min-width:0;cursor:text;
+  /* a definite height so the log scrolls inside it rather than growing the
+     page forever; drag the bottom edge to resize, as you would a terminal */
+  height:min(60vh,520px);min-height:220px;resize:vertical;overflow:hidden}
+#console{color:#ddd;font:12.5px/1.45 ui-monospace,Menlo,Consolas,monospace;
+  white-space:pre-wrap;overflow-wrap:anywhere;overflow:auto;flex:1;min-height:0}
 #jobstate{font-size:13px;color:var(--ink-2);margin-bottom:8px}
 #jobstate .live{color:var(--accent);font-weight:600}
 #jobstate .okrc{color:var(--ok);font-weight:600} #jobstate .badrc{color:var(--crit);font-weight:600}
@@ -855,12 +860,15 @@ details{margin:2px 0} details summary{cursor:pointer}
 .setup-form{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px}
 .setup-form input[type=text],.setup-form input[type=password],.setup-form input:not([type]){
   padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--ink)}
-/* terminal input line — only shown while an interactive job is waiting */
-.term-in{display:none;margin-top:8px;gap:8px;align-items:center}
+/* terminal input line — only shown while an interactive job is waiting.
+   Borderless and transparent so typing happens *in* the terminal, not in a
+   box below it; Enter submits, the way a console does. */
+.term-in{display:none;gap:8px;align-items:baseline;flex:none}
 .term-in.on{display:flex}
-.term-in input{flex:1;font:12.5px/1.45 ui-monospace,Menlo,Consolas,monospace;
-  background:#111;color:#ddd;border-color:#333}
-.term-in .ps1{color:var(--muted);font:12.5px ui-monospace,monospace}
+.term-in input{flex:1;min-width:0;font:12.5px/1.45 ui-monospace,Menlo,Consolas,monospace;
+  background:transparent;color:#ddd;border:0;outline:none;padding:0;caret-color:#ddd}
+.term-in input::placeholder{color:#555}
+.term-in .ps1{color:var(--accent);font:12.5px/1.45 ui-monospace,monospace}
 /* restore confirmation modal */
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;
   align-items:center;justify-content:center;padding:16px;z-index:10}
@@ -955,11 +963,13 @@ details{margin:2px 0} details summary{cursor:pointer}
 <aside class="col-right">
 <div class="card" id="job-card"><h2>Terminal — live output</h2>
   <div id="jobstate">No job has been run yet.</div>
-  <div id="console"></div>
-  <div class="term-in" id="term-in">
-    <span class="ps1">&gt;</span>
-    <input id="term-line" placeholder="type your answer, then Enter" autocomplete="off">
-    <button id="term-send">Send</button>
+  <div class="term" id="term">
+    <div id="console"></div>
+    <div class="term-in" id="term-in">
+      <span class="ps1">&gt;</span>
+      <input id="term-line" placeholder="type here, then press Enter" autocomplete="off"
+             autocapitalize="off" autocorrect="off" spellcheck="false">
+    </div>
   </div>
 </div>
 </aside>
@@ -1077,14 +1087,50 @@ async function sendTermLine(){
   }catch(e){ alert('could not send input'); }
   refreshJob();
 }
-$('#term-send').onclick = sendTermLine;
 $('#term-line').addEventListener('keydown', e => { if (e.key === 'Enter') sendTermLine(); });
 
-// The terminal sits in the sticky right column, so it is already on screen;
-// only scroll to it when the layout has collapsed to a single column.
+// Click anywhere in the terminal to type, like a real one — but never steal
+// a text selection the user is making to copy an error out of the log.
+$('#term').addEventListener('click', () => {
+  if ($('#term-in').classList.contains('on') && !String(document.getSelection()))
+    $('#term-line').focus();
+});
+
+// ---- render the log the way a terminal would -------------------------------
+// Interactive jobs run on a pty, so docker/bench decide they are talking to a
+// terminal and emit ANSI escapes and \r progress lines. Those are control
+// codes, not text: printed verbatim they are garbage. Strip the escapes and
+// let \r overwrite its line, as a console does. This is deliberately not a
+// full emulator — cursor-up redraws just leave successive progress lines.
+// OSC (window title) | CSI (colour, cursor) | nF, e.g. the ESC ( B that every
+// `tput sgr0` emits | single-character escapes. CSI must be tried before nF.
+const ANSI = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -\/]*[@-~]|\x1b[ -\/]+[0-~]|\x1b[@-Z\\-_]/g;
+// The last sequence can be cut in half: we show the tail of a log that is
+// still being written, so the fetch can land mid-escape.
+const ANSI_CUT = /\x1b\][^\x07\x1b]*$|\x1b\[[0-?]*[ -\/]*$|\x1b[ -\/]*$/;
+// Erase-in-line. Handled, not stripped: docker redraws progress with \r + \x1b[2K,
+// and \r alone does not clear a row, so dropping the erase leaves the tail of
+// the longer previous line behind ("Pull complete9MB/50MB").
+const ERASE = /\x1b\[[012]?K/;
+
+function applyCR(line){
+  let out = '';
+  for (const chunk of line.split('\r')){   // \r = back to column 0, no erase
+    const parts = chunk.split(ERASE);
+    if (parts.length > 1) out = '';        // the row was cleared before redrawing
+    const text = parts[parts.length - 1].replace(ANSI, '').replace(/\x1b/g, '');
+    out = text.length >= out.length ? text : text + out.slice(text.length);
+  }
+  return out;
+}
+function termText(s){
+  return s.replace(ANSI_CUT, '').split('\n').map(applyCR).join('\n');
+}
+
+// The terminal is at the foot of the page, below the controls, so a job
+// started from a button up top would otherwise run off-screen.
 function revealConsole(){
-  if (window.matchMedia('(max-width:1060px)').matches)
-    $('#console').scrollIntoView({behavior:'smooth', block:'center'});
+  $('#job-card').scrollIntoView({behavior:'smooth', block:'end'});
 }
 
 function meterClass(p){ return p >= 92 ? 'crit' : p >= 80 ? 'warn' : ''; }
@@ -1264,7 +1310,7 @@ async function refreshJob(){
         + ` after ${j.elapsed}s (started ${esc(j.started)})`;
     $('#jobstate').innerHTML = st;
     const c = $('#console'), atEnd = c.scrollTop + c.clientHeight >= c.scrollHeight - 30;
-    c.textContent = j.log || '(no output yet)';
+    c.textContent = termText(j.log || '') || '(no output yet)';
     if (atEnd) c.scrollTop = c.scrollHeight;
     if (jobWasActive && !j.active) { refreshBackups(); refreshSetup(); refreshStats(); }
     jobWasActive = j.active;
@@ -1279,7 +1325,7 @@ document.querySelectorAll('.act').forEach(btn => btn.onclick = async () => {
   const r = await fetch('/api/run/' + act, {method:'POST',
     headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   const j = await r.json();
-  if (j.error) alert(j.error); else { jobWasActive = true; refreshJob(); }
+  if (j.error) alert(j.error); else { jobWasActive = true; refreshJob(); revealConsole(); }
 });
 
 $('#clear-ram').onclick = async () => {

@@ -4,11 +4,16 @@ A small web interface for managing the SSPL ERP server from a browser on the LAN
 
 ## Layout
 
-Two columns: the **control panel** on the left (setup switches, server
-health, actions, backups, upload) and a **terminal** on the right showing
-the live output of whatever is running. The terminal is sticky — it stays
-on screen while you scroll the left column, so you can start a job and
-keep watching it. Below 1060px wide the columns stack, terminal last.
+One column: the **control panel** (setup switches, server health, actions,
+backups, upload), then a full-width **terminal** at the foot of the page
+showing the live output of whatever is running. Starting a job scrolls the
+terminal into view; drag its bottom edge to make it taller.
+
+The terminal behaves like a console: you type into the terminal itself, not
+into a box beside it, and Enter submits. Output is rendered the way a
+terminal renders it — ANSI colour/cursor escapes are obeyed as control codes
+rather than printed, and `\r` overwrites its line, so docker's progress
+redraws read cleanly instead of as escape-code soup.
 
 ## Features
 
@@ -25,8 +30,9 @@ keep watching it. Below 1060px wide the columns stack, terminal last.
   re-enter your admin password, type the site name to confirm, and a safety
   backup is taken first. The MariaDB root password is typed into the live
   terminal, never stored. See [Restoring](#restoring-from-the-panel).
-- **Live terminal** — watch the script output while it runs, in the sticky
-  right-hand column; only one job can run at a time
+- **Live terminal** — watch the script output while it runs, full width at
+  the foot of the page; type into it directly when a job asks a question;
+  only one job can run at a time
 - **Backup browser** — full backups (with DB/Files/Private completeness badges),
   DB-only dumps, Docker image snapshots, uploads — all downloadable
 - **Upload backup files** to the server (stored under
@@ -74,7 +80,7 @@ is installed and lets you install the rest, in order:
 1. **ERPNext stack** — fill in the server IP, HTTP port, MariaDB root
    password, and Administrator password, then click *Install ERPNext*. This
    pulls the image, starts the containers, and creates the site (10–20 min).
-   Watch progress in the terminal on the right.
+   Watch progress in the terminal at the foot of the page.
 2. **Backup system** and **Update & rollback scripts** — enabled once ERPNext
    is installed (they reuse the deployed site name automatically). One click
    each.
@@ -100,11 +106,11 @@ plain button.
    name** in full and re-enter your **admin panel password**.
 3. The job takes a **full safety backup first**, then starts the restore.
    If the backup fails, the restore does not run.
-4. The restore asks for the **MariaDB root password** in the terminal on the
-   right. Type it into the input line and press Enter, then answer `yes` to
-   the final confirmation.
+4. The restore asks for the **MariaDB root password** in the terminal at the
+   foot of the page. A prompt appears inside the terminal — type there and
+   press Enter, then answer `yes` to the final confirmation.
 
-Note the input line is an ordinary text box, so **what you type is visible on
+Note the prompt is an ordinary text input, so **what you type is visible on
 your screen** as you type it (unlike a console, which hides the password) —
 mind your shoulder. It is not echoed into the job log at any point.
 
@@ -134,7 +140,7 @@ delete `/opt/sspl-admin/certs/` and re-run the installer.
 
 ## Which version am I running?
 
-The panel header shows a version badge, e.g. `v2026-07-15.2`. That is baked
+The panel header shows a version badge, e.g. `v2026-07-15.4`. That is baked
 into the `app.py` that is **actually running**, so it is the honest answer to
 "did my update take effect?".
 
@@ -153,6 +159,7 @@ feature list on startup.
 
 | Version | Should show |
 |---|---|
+| `2026-07-15.4` | Terminal full-width at the foot of the page, typed into directly |
 | `2026-07-15.3` | Delete buttons on uploads |
 | `2026-07-15.2` | Restore buttons on backups/uploads, interactive terminal |
 | `2026-07-15.1` | Two-column layout, no restore |
