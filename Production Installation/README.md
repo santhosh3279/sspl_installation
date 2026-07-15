@@ -1,5 +1,12 @@
 # Production Installation
 
+> **Setting up a fresh server?** The recommended path is to install the
+> **web admin panel** first (`Admin Panel/setup_admin_panel.sh` — the only
+> command-line step), then install ERPNext, the backup system and the
+> update/rollback scripts from the panel's Setup card in your browser. See
+> `Admin Panel/README.md`. The script below is the all-in-one terminal
+> alternative — use one or the other, not both.
+
 ## One-time install package — `install_sspl_erp.sh`
 
 Sets up a **fresh server** end-to-end in one run, automating the full

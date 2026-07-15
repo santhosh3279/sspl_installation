@@ -86,7 +86,7 @@
 <table class="toc">
 <tr><td>1.</td><td>Overview &amp; server layout</td></tr>
 <tr><td>2.</td><td>Prerequisites</td></tr>
-<tr><td>3.</td><td>Fresh server — one-command installation</td></tr>
+<tr><td>3.</td><td>Fresh server — start here</td></tr>
 <tr><td>4.</td><td>Part 1 — Web admin panel</td></tr>
 <tr><td>5.</td><td>Part 2 — Backup system: installation</td></tr>
 <tr><td>6.</td><td>Part 2 — Backup system: daily use</td></tr>
@@ -117,9 +117,9 @@
       accepts backup file uploads. Installed to <code>/opt/sspl-admin/</code>, served on port <b>8090</b>.
       See section 4.</li>
 </ul>
-<p>Setting up a <b>brand-new server</b>? The one-time installer <code>Production
-Installation/install_sspl_erp.sh</code> deploys the whole ERP stack <i>and</i> all three parts in a
-single run — see section 3. Everything can be refreshed later in one command with
+<p>Setting up a <b>brand-new server</b>? Install the <b>admin panel</b> first, then install ERPNext
+and the other two parts from the browser — see section 3. (A one-command terminal installer that
+does everything at once is available too.) Everything can be refreshed later in one command with
 <code>./update_tooling.sh</code> — see section 14.</p>
 
 <p>Both parts install into their own <code>v2/</code> folder, <b>side-by-side</b> with any older
@@ -166,49 +166,70 @@ so a backup made by one can be restored with the other.</p>
 <p>The site name is the folder that is not <code>apps.txt</code>, <code>assets</code>, or
 <code>common_site_config.json</code> — for example <code>192.168.225.135</code>.</p>
 
-<h2>3. Fresh server — one-command installation</h2>
-<p>For a <b>new server</b> (nothing deployed yet), one script performs the entire production
-deployment — the whole <i>SSPL ERP Production Deployment Guide</i> — plus Parts 1–3 of this
-toolkit, in a single run:</p>
+<h2>3. Fresh server — start here</h2>
+<p>On a <b>new server</b> (nothing deployed yet) the only thing you install from the command line is
+the <b>web admin panel</b>. Everything else — ERPNext itself, the backup system, the update &amp;
+rollback scripts — is then installed from the panel, in the browser. Requirements: Ubuntu Server
+with Docker installed and a static LAN IP.</p>
+
+<h3>Step 1 — Install the admin panel (terminal, once)</h3>
 <pre>git clone https://github.com/santhosh3279/sspl_installation.git
-cd "sspl_installation/Production Installation"
+cd sspl_installation/"Admin Panel"
+chmod +x setup_admin_panel.sh
+./setup_admin_panel.sh</pre>
+<p>It asks for an admin username, password and port (default <b>8090</b>), generates the HTTPS
+certificate, records where the repo is checked out, and starts the <code>sspl-admin</code> service.
+Takes about a minute. Full details in section 4.</p>
+
+<h3>Step 2 — Install ERPNext from the panel</h3>
+<p>Open <code>https://&lt;server-ip&gt;:8090</code>, click through the self-signed certificate warning
+(<i>Advanced → Proceed</i>) and log in. The <b>Setup — install components</b> card at the top of the
+page drives the whole rest of the installation, in order:</p>
+<ol>
+  <li><b>Install ERPNext</b> — enter the server IP, HTTP port (default <b>80</b>), MariaDB root
+      password and ERPNext Administrator password, then click the button. The panel clones
+      <code>frappe_docker</code>, writes <code>.env</code> and the pdf-fix override, generates
+      <code>/opt/sspl-erp/docker-compose.yml</code>, pulls the <code>sspl-erpnext</code> image from
+      GHCR, starts the containers and waits until the database and backend are really ready, then
+      creates the site named after the server IP with <b>every app shipped in the image</b>
+      installed automatically (erpnext, india_compliance, ssplbilling,
+      printer_server_configuration, frappe_whatsapp, …), sets it as the default site and repairs the
+      MariaDB grants. This takes 10–20 minutes and streams live into the job console below.</li>
+  <li><b>Install backup system</b> — one click: Part 2 in <code>/opt/scripts/v2/</code> with its cron
+      jobs.</li>
+  <li><b>Install update &amp; rollback scripts</b> — one click: Part 3 in <code>/opt/sspl-erp/v2/</code>
+      with the site name pre-filled.</li>
+</ol>
+<p>Steps 2 and 3 unlock once ERPNext is installed and reuse the deployed site name automatically;
+each switch turns into an <i>installed ✓</i> status when it finishes. That is the entire
+installation — the same page is then your day-to-day console (section 4), and the manual
+installation steps in sections 5 and 9 are only for installing Parts 2 and 3 by hand instead.</p>
+<div class="note"><b>Won't double-schedule backups.</b> Before installing the v2 backup cron
+jobs — from the panel or the terminal — the installer checks the crontab for an existing entry
+pointing at <code>/opt/scripts/</code> outside <code>/opt/scripts/v2/</code>, e.g. an older backup
+script wired up by hand (the &ldquo;Santhosh additions&rdquo; in this guide's history). If one is
+found, the v2 scripts are still installed but their cron jobs are <b>not</b> scheduled
+automatically, and the conflicting line is printed so you can switch over manually with
+<code>sudo crontab -e</code> (see section 13 for the v2 schedule).</div>
+
+<h3>Alternative — all-in-one terminal installer</h3>
+<p>If you would rather do the whole thing from the command line instead, one script performs the
+entire production deployment — the whole <i>SSPL ERP Production Deployment Guide</i> — plus Parts
+1–3 of this toolkit, in a single unattended run:</p>
+<pre>cd "sspl_installation/Production Installation"
 chmod +x install_sspl_erp.sh
 ./install_sspl_erp.sh</pre>
-<p>All questions are asked <b>up front</b> — server IP, HTTP port (default <b>80</b>), MariaDB
-root password, ERPNext Administrator password, which components to install, and the admin panel
-login. After the final <i>Proceed?</i> it runs unattended for 10–20 minutes:</p>
-<ul>
-  <li><b>ERP stack</b> — clones <code>frappe_docker</code>, writes <code>.env</code> and the
-      pdf-fix override, generates <code>/opt/sspl-erp/docker-compose.yml</code>, pulls the
-      <code>sspl-erpnext</code> image from GHCR, starts all containers, and waits until the
-      database and backend are actually ready.</li>
-  <li><b>Site creation (one-time)</b> — creates the ERPNext site named after the server IP and
-      installs <b>every app shipped in the image</b> automatically (erpnext, india_compliance,
-      ssplbilling, printer_server_configuration, frappe_whatsapp, …), sets it as the default
-      site, and repairs the MariaDB grants.</li>
-  <li><b>Part 1</b> — web admin panel with HTTPS on port 8090 (<code>/opt/sspl-admin/</code>).</li>
-  <li><b>Part 2</b> — backup system with cron jobs (<code>/opt/scripts/v2/</code>).</li>
-  <li><b>Part 3</b> — update &amp; rollback scripts with the site name pre-filled
-      (<code>/opt/sspl-erp/v2/</code>).</li>
-  <li><b>Extras</b> — Docker auto-start on reboot, docker group membership, and passwordless
-      sudo shortcuts for clear-RAM and manual backup.</li>
-</ul>
+<p>All questions are asked <b>up front</b> — server IP, HTTP port, MariaDB root password,
+Administrator password, which components to install, and the admin panel login. After the final
+<i>Proceed?</i> it runs for 10–20 minutes and installs exactly the same things as the panel-first
+flow above, plus Docker auto-start on reboot, docker group membership, and passwordless sudo
+shortcuts for clear-RAM and manual backup. Use this <b>or</b> the panel-first flow — not both.</p>
 <div class="note"><b>Already installed? It refuses to run.</b> If ERPNext is already deployed and
-running on the server, the installer prints <i>“already installed”</i> and exits without changing
+running on the server, this installer prints <i>“already installed”</i> and exits without changing
 anything — use the update tools instead (sections 10 and 14). To deliberately re-run, e.g. to
 finish a half-completed install, use <code>SSPL_FORCE=1 ./install_sspl_erp.sh</code>; a forced
 re-run is safe — the existing site is never re-created, and existing <code>.env</code> files are
 backed up before being rewritten.</div>
-<div class="note"><b>Won't double-schedule backups.</b> Before installing the v2 backup cron
-jobs, the installer checks the crontab for an existing entry pointing at <code>/opt/scripts/</code>
-outside <code>/opt/scripts/v2/</code> — e.g. an older backup script wired up by hand (the
-&ldquo;Santhosh additions&rdquo; in this guide's history). If one is found, the v2 scripts are
-still installed but their cron jobs are <b>not</b> scheduled automatically, and the conflicting
-line is printed so you can switch over manually with <code>sudo crontab -e</code> (see
-section 13 for the v2 schedule).</div>
-<p>Requirements: Ubuntu Server with Docker installed and a static LAN IP. If you install
-components with this script, you can skip the manual installation steps in sections 4, 5
-and 9.</p>
 
 <div class="pagebreak"></div>
 <h2>4. Part 1 — Web admin panel</h2>
@@ -464,7 +485,8 @@ skipped with a pointer to the right installer.</p>
 <h2>15. Quick command reference</h2>
 <table>
 <tr><th>I want to…</th><th>Run</th></tr>
-<tr><td>Set up a brand-new server</td><td><code>cd "Production Installation" &amp;&amp; ./install_sspl_erp.sh</code></td></tr>
+<tr><td>Set up a brand-new server</td><td><code>cd "Admin Panel" &amp;&amp; ./setup_admin_panel.sh</code> — then install ERPNext from the panel</td></tr>
+<tr><td>Set up a brand-new server, all from the terminal</td><td><code>cd "Production Installation" &amp;&amp; ./install_sspl_erp.sh</code></td></tr>
 <tr><td>Back up everything now</td><td><code>sudo /opt/scripts/v2/frappe_backup.sh</code></td></tr>
 <tr><td>Back up only the database</td><td><code>sudo /opt/scripts/v2/frappe_db_backup.sh</code></td></tr>
 <tr><td>Check my backups are OK</td><td><code>sudo /opt/scripts/v2/frappe_backup_verify.sh</code></td></tr>
