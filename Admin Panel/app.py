@@ -609,9 +609,23 @@ button{width:100%;margin-top:16px}
 DASH_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SSPL ERP Admin</title><style>""" + BASE_CSS + """
-.top{display:flex;align-items:center;gap:14px;max-width:1100px;margin:0 auto;padding:18px 16px 6px}
+.top{display:flex;align-items:center;gap:14px;max-width:1500px;margin:0 auto;padding:18px 16px 6px}
 .top .spacer{flex:1}
-main{max-width:1100px;margin:0 auto;padding:0 16px 40px}
+/* Two columns: control panel on the left, live terminal on the right.
+   The terminal sticks to the viewport so it stays visible while you
+   scroll the controls. Collapses to one column on narrow screens. */
+main{max-width:1500px;margin:0 auto;padding:0 16px 40px;
+  display:grid;grid-template-columns:minmax(0,1fr) minmax(360px,480px);
+  gap:16px;align-items:start}
+.col-left{min-width:0}
+.col-right{min-width:0;position:sticky;top:16px}
+#job-card{margin-bottom:0;display:flex;flex-direction:column;
+  max-height:calc(100vh - 32px)}
+@media (max-width:1060px){
+  main{grid-template-columns:1fr}
+  .col-right{position:static}
+  #job-card{max-height:none}
+}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px}
 .tile{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:12px 14px}
 .tile .k{font-size:12px;color:var(--muted)} .tile .v{font-size:22px;margin-top:2px}
@@ -631,8 +645,9 @@ main{max-width:1100px;margin:0 auto;padding:0 16px 40px}
 .actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
 .actions .sep{flex-basis:100%;height:0}
 #console{background:#111;color:#ddd;border-radius:8px;padding:12px;font:12.5px/1.45 ui-monospace,Menlo,Consolas,monospace;
-  white-space:pre-wrap;max-height:340px;overflow:auto;min-height:60px}
+  white-space:pre-wrap;overflow:auto;flex:1;min-height:320px}
 #jobstate{font-size:13px;color:var(--ink-2);margin-bottom:8px}
+#jobstate .live{color:var(--accent);font-weight:600}
 #jobstate .okrc{color:var(--ok);font-weight:600} #jobstate .badrc{color:var(--crit);font-weight:600}
 details{margin:2px 0} details summary{cursor:pointer}
 .filelist{margin:6px 0 4px 18px;font-size:13px;color:var(--ink-2)}
@@ -658,6 +673,7 @@ details{margin:2px 0} details summary{cursor:pointer}
   <form method="post" action="/logout" style="margin:0"><button>Log out</button></form>
 </div>
 <main>
+<div class="col-left">
 
 <div class="card" id="setup-card"><h2>Setup — install components</h2>
   <div id="setup-body"><p style="color:var(--muted)">Loading…</p></div>
@@ -700,11 +716,6 @@ details{margin:2px 0} details summary{cursor:pointer}
   </div>
 </div>
 
-<div class="card"><h2>Job console</h2>
-  <div id="jobstate">No job has been run yet.</div>
-  <div id="console"></div>
-</div>
-
 <div class="card"><h2>Backups on the server</h2>
   <div class="tabs">
     <button class="active" data-tab="full">Full backups</button>
@@ -730,11 +741,27 @@ details{margin:2px 0} details summary{cursor:pointer}
   </div>
 </div>
 
+</div><!-- /col-left -->
+
+<aside class="col-right">
+<div class="card" id="job-card"><h2>Terminal — live output</h2>
+  <div id="jobstate">No job has been run yet.</div>
+  <div id="console"></div>
+</div>
+</aside>
+
 </main>
 <script>
 const $ = s => document.querySelector(s);
 const esc = t => (t??'').toString().replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 let jobWasActive = false;
+
+// The terminal sits in the sticky right column, so it is already on screen;
+// only scroll to it when the layout has collapsed to a single column.
+function revealConsole(){
+  if (window.matchMedia('(max-width:1060px)').matches)
+    $('#console').scrollIntoView({behavior:'smooth', block:'center'});
+}
 
 function meterClass(p){ return p >= 92 ? 'crit' : p >= 80 ? 'warn' : ''; }
 function meterFlag(p){ return p >= 92 ? '<span class="flag crit">critical</span>'
@@ -845,7 +872,7 @@ async function installComponent(btn){
       headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
     const j = await r.json();
     if(j.error){ alert(j.error); btn.disabled = false; }
-    else { jobWasActive = true; refreshJob(); $('#console').scrollIntoView({behavior:'smooth'}); }
+    else { jobWasActive = true; refreshJob(); revealConsole(); }
   }catch(e){ alert('request failed'); btn.disabled = false; }
 }
 
@@ -887,7 +914,7 @@ async function refreshJob(){
     document.querySelectorAll('.act').forEach(btn => btn.disabled = j.active);
     if (j.label === null) return;
     const st = j.active
-      ? `<b>${esc(j.label)}</b> running… (${j.elapsed}s)`
+      ? `<b>${esc(j.label)}</b> <span class="live">running…</span> (${j.elapsed}s)`
       : `<b>${esc(j.label)}</b> finished — ` + (j.rc === 0
           ? '<span class="okrc">success</span>' : `<span class="badrc">FAILED (exit ${j.rc})</span>`)
         + ` after ${j.elapsed}s (started ${esc(j.started)})`;

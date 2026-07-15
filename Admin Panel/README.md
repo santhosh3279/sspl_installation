@@ -2,6 +2,14 @@
 
 A small web interface for managing the SSPL ERP server from a browser on the LAN.
 
+## Layout
+
+Two columns: the **control panel** on the left (setup switches, server
+health, actions, backups, upload) and a **terminal** on the right showing
+the live output of whatever is running. The terminal is sticky — it stays
+on screen while you scroll the left column, so you can start a job and
+keep watching it. Below 1060px wide the columns stack, terminal last.
+
 ## Features
 
 - **Setup switches** — install the whole system from the browser: ERPNext
@@ -13,8 +21,8 @@ A small web interface for managing the SSPL ERP server from a browser on the LAN
 - **Clear RAM caches** button (`sync` + drop_caches — safe, caches rebuild automatically)
 - **One-click actions** — full backup, DB-only backup, backup verification,
   system update, image rollback (with snapshot picker)
-- **Live job console** — watch the script output while it runs; only one job
-  can run at a time
+- **Live terminal** — watch the script output while it runs, in the sticky
+  right-hand column; only one job can run at a time
 - **Backup browser** — full backups (with DB/Files/Private completeness badges),
   DB-only dumps, Docker image snapshots, uploads — all downloadable
 - **Upload backup files** to the server (stored under
@@ -59,7 +67,7 @@ is installed and lets you install the rest, in order:
 1. **ERPNext stack** — fill in the server IP, HTTP port, MariaDB root
    password, and Administrator password, then click *Install ERPNext*. This
    pulls the image, starts the containers, and creates the site (10–20 min).
-   Watch progress in the Job console below.
+   Watch progress in the terminal on the right.
 2. **Backup system** and **Update & rollback scripts** — enabled once ERPNext
    is installed (they reuse the deployed site name automatically). One click
    each.
@@ -131,7 +139,7 @@ buttons still work.
   never echoed to the job log.
 - Don't restart the `sspl-admin` service (or run `update_tooling.sh`) while
   an install or backup job is running: the panel tracks the running job in
-  memory, so a restart loses the handle and the job console will show "no
+  memory, so a restart loses the handle and the terminal will show "no
   job" even though the underlying script keeps running to completion. Check
   `/opt/sspl-admin/jobs/*.log` if in doubt.
 - **Restore is deliberately not in the web UI**: `frappe_restore.sh` asks for
