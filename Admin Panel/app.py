@@ -33,10 +33,10 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-07-16.8"
+PANEL_VERSION = "2026-07-16.9"
 FEATURES = ("ERP Next Installation suite page with rclone cloud backup setup "
             "covering full and DB-only backups, console-style terminal, "
-            "guarded restore, delete uploads")
+            "guarded restore, delete uploads, cron jobs viewer on the dashboard")
 
 CONFIG_FILE = os.environ.get("SSPL_ADMIN_CONFIG", "/opt/sspl-admin/config.json")
 with open(CONFIG_FILE) as f:
@@ -455,28 +455,44 @@ def rclone_status():
     }
 
 
-def cron_status():
-    """The backup-related entries in root's crontab.
+CRON_ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def crontab_entries():
+    """Every entry in root's crontab, parsed.
 
     The panel runs as root, so 'crontab -l' reads the same crontab that
     setup_frappe_backups.sh writes the schedule into — what you'd see over
-    SSH with 'sudo crontab -l'."""
+    SSH with 'sudo crontab -l'. Environment lines (MAILTO=…) and @-shortcuts
+    (@daily …) are kept: hiding them would misreport what cron will do."""
     try:
         out = subprocess.run(["crontab", "-l"], capture_output=True,
                              text=True, timeout=10)
         lines = out.stdout.splitlines() if out.returncode == 0 else []
     except (OSError, subprocess.SubprocessError):
         lines = []
-    jobs = []
+    entries = []
     for ln in lines:
         ln = ln.strip()
         if not ln or ln.startswith("#"):
             continue
-        if SCRIPTS_DIR in ln or "frappe" in ln.lower():
+        if ln.startswith("@"):
+            parts = ln.split(None, 1)
+            entries.append({"schedule": parts[0],
+                            "command": parts[1] if len(parts) > 1 else ""})
+        elif CRON_ENV_RE.match(ln):
+            entries.append({"schedule": "", "command": ln})
+        else:
             parts = ln.split(None, 5)
             if len(parts) == 6:
-                jobs.append({"schedule": " ".join(parts[:5]), "command": parts[5]})
-    return {"jobs": jobs}
+                entries.append({"schedule": " ".join(parts[:5]), "command": parts[5]})
+    return entries
+
+
+def cron_status():
+    """The backup-related entries in root's crontab, for the setup page."""
+    return {"jobs": [e for e in crontab_entries() if e["schedule"] and
+                     (SCRIPTS_DIR in e["command"] or "frappe" in e["command"].lower())]}
 
 
 def repo_panel_version():
@@ -765,6 +781,15 @@ def api_job():
 @login_required
 def api_setup_status():
     return jsonify(setup_status())
+
+
+@app.route("/api/cron")
+@login_required
+def api_cron():
+    """Root's whole crontab — the dashboard's cron-jobs button reads this.
+    Unlike setup-status it is unfiltered: the point is to see everything
+    cron will run, not just the backup schedule."""
+    return jsonify({"jobs": crontab_entries()})
 
 
 @app.route("/api/run/<name>", methods=["POST"])
@@ -1693,6 +1718,13 @@ details{margin:2px 0} details summary{cursor:pointer}
     <button id="clear-ram"
       data-confirm="Clear RAM caches now? This is safe but may briefly slow the system while caches rebuild.">Clear RAM caches</button>
     <span id="ram-msg" style="font-size:13px;color:var(--ink-2)"></span>
+    <button id="cron-show" title="Root's crontab — what 'sudo crontab -l' shows over SSH">Show cron jobs</button>
+  </div>
+  <div id="cron-box" style="display:none;margin-top:12px">
+    <table><thead><tr><th>Schedule</th><th>Command</th></tr></thead>
+    <tbody id="cron-rows"></tbody></table>
+    <div style="font-size:12.5px;color:var(--muted);margin-top:6px">Root's crontab —
+      the same list <code>sudo crontab -l</code> shows over SSH.</div>
   </div>
 </div>
 
@@ -1947,6 +1979,26 @@ document.querySelectorAll('.act').forEach(btn => btn.onclick = async () => {
   const j = await r.json();
   if (j.error) alert(j.error); else { jobWasActive = true; refreshJob(); revealConsole(); }
 });
+
+// ---- cron jobs: fetched fresh on every open, so an edit over SSH shows up ----
+$('#cron-show').onclick = async () => {
+  const box = $('#cron-box'), btn = $('#cron-show');
+  if (box.style.display !== 'none'){
+    box.style.display = 'none'; btn.textContent = 'Show cron jobs'; return;
+  }
+  btn.disabled = true;
+  try{
+    const r = await fetch('/api/cron');
+    const j = await r.json();
+    $('#cron-rows').innerHTML = (j.jobs || []).length
+      ? j.jobs.map(c => `<tr>
+          <td class="num" style="white-space:nowrap"><code>${esc(c.schedule)}</code></td>
+          <td><code>${esc(c.command)}</code></td></tr>`).join('')
+      : '<tr><td colspan="2" style="color:var(--muted)">The crontab is empty — nothing is scheduled.</td></tr>';
+    box.style.display = ''; btn.textContent = 'Hide cron jobs';
+  }catch(e){ alert('could not read the crontab'); }
+  btn.disabled = false;
+};
 
 $('#clear-ram').onclick = async () => {
   if (!confirm($('#clear-ram').dataset.confirm)) return;
