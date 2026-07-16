@@ -91,10 +91,13 @@ Open `https://<server-ip>:8090` and log in.
 Once logged in, follow **ERP Next Installation suite** in the header. That page
 shows what is installed and lets you install the rest, in order:
 
-1. **ERPNext stack** — fill in the server IP, HTTP port, MariaDB root
-   password, and Administrator password, then click *Install ERPNext*. This
-   pulls the image, starts the containers, and creates the site (10–20 min).
-   Watch progress in the terminal at the foot of the page.
+1. **ERPNext stack** — fill in the server IP, HTTP port, Docker image,
+   MariaDB root password, and Administrator password, then click *Install
+   ERPNext*. This pulls the image, starts the containers, and creates the
+   site (10–20 min). Watch progress in the terminal at the foot of the page.
+   The image field prefills `ghcr.io/santhosh3279/sspl-erpnext`; if you change
+   it, the new value is saved to `config.json` (`erp_image`) and prefilled
+   from then on. Give it without a tag — the installer pins `latest`.
 2. **Backup system** and **Update & rollback scripts** — enabled once ERPNext
    is installed (they reuse the deployed site name automatically). One click
    each.
@@ -254,9 +257,13 @@ override the default paths (useful for testing):
   "compose_file": "/opt/sspl-erp/docker-compose.yml",
   "scripts_dir": "/opt/scripts/v2",
   "update_dir": "/opt/sspl-erp/v2",
-  "job_dir": "/opt/sspl-admin/jobs"
+  "job_dir": "/opt/sspl-admin/jobs",
+  "erp_image": "ghcr.io/santhosh3279/sspl-erpnext"
 }
 ```
+
+`erp_image` is written by the panel itself when you change the Docker image
+in the ERPNext install form — it is how the changed value survives restarts.
 
 If `repo_dir` is missing or the installer scripts aren't found there, the
 installation suite says so and the install buttons are hidden — the dashboard's

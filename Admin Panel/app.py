@@ -33,7 +33,7 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-07-16.6"
+PANEL_VERSION = "2026-07-16.7"
 FEATURES = ("ERP Next Installation suite page with rclone cloud backup setup "
             "covering full and DB-only backups, console-style terminal, "
             "guarded restore, delete uploads")
@@ -111,6 +111,30 @@ RCLONE_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,40}:$")
 RCLONE_PATH_RE = re.compile(r"^[A-Za-z0-9_.\-][A-Za-z0-9_.\-/]{0,120}$")
 
 IP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.\-]{0,60}$")
+
+# The ERPNext Docker image. The install form prefills the stored value (or
+# this default); a changed value is written back to config.json so it sticks
+# for every later reinstall. Tagless on purpose — the installer pins
+# CUSTOM_TAG=latest in the .env it writes.
+DEFAULT_ERP_IMAGE = "ghcr.io/santhosh3279/sspl-erpnext"
+ERP_IMAGE_RE = re.compile(r"^[a-z0-9][a-z0-9._\-]*(?::[0-9]{1,5})?(?:/[a-z0-9][a-z0-9._\-]*)+$")
+
+
+def erp_image():
+    return str(CONFIG.get("erp_image") or DEFAULT_ERP_IMAGE)
+
+
+def save_config_key(key, value):
+    """Persist one key into config.json, atomically and preserving its mode
+    (the file holds the panel's password hash and secret key — never loosen
+    it). Also updates the in-memory CONFIG so the change is live at once."""
+    CONFIG[key] = value
+    mode = os.stat(CONFIG_FILE).st_mode & 0o7777
+    tmp = CONFIG_FILE + ".panel-tmp"
+    with open(tmp, "w") as f:
+        json.dump(CONFIG, f, indent=2)
+    os.chmod(tmp, mode)
+    os.replace(tmp, CONFIG_FILE)
 
 UPLOAD_EXTENSIONS = (".sql.gz", ".gz", ".tar", ".tgz", ".json", ".yml", ".yaml")
 FULL_BACKUP_RE = re.compile(r"^20\d{6}_\d{6}$")
@@ -438,6 +462,7 @@ def setup_status():
         "repo_dir": REPO_DIR,
         "repo_ok": scripts_ok,
         "server_ip": CONFIG.get("server_ip") or first_ip(),
+        "erp_image": erp_image(),
         "components": {
             "erp": {
                 "installed": os.path.isfile(COMPOSE_FILE),
@@ -750,15 +775,26 @@ def _install_env(name, data):
     if name == "install_erp":
         ip = str(data.get("server_ip", "")).strip()
         port = str(data.get("http_port", "80")).strip() or "80"
+        image = str(data.get("image", "")).strip() or erp_image()
         db_pw = str(data.get("db_password", ""))
         admin_pw = str(data.get("admin_password", ""))
         if not IP_RE.match(ip):
             return None, "enter a valid server IP / hostname"
         if not (port.isdigit() and 1 <= int(port) <= 65535):
             return None, "HTTP port must be a number between 1 and 65535"
+        if len(image) > 200 or not ERP_IMAGE_RE.match(image):
+            return None, ("Docker image must look like registry/owner/name "
+                          "(lowercase, no tag — e.g. ghcr.io/santhosh3279/sspl-erpnext)")
         if not db_pw or not admin_pw:
             return None, "database root password and admin password are both required"
-        return {"SERVER_IP": ip, "HTTP_PORT": port,
+        # Remember a changed image for good: the next install (and the next
+        # panel restart) prefills it instead of the built-in default.
+        if image != erp_image():
+            try:
+                save_config_key("erp_image", image)
+            except OSError as e:
+                return None, f"could not save the image to config.json: {e}"
+        return {"SERVER_IP": ip, "HTTP_PORT": port, "SSPL_IMAGE": image,
                 "DB_PASSWORD": db_pw, "ADMIN_PASSWORD": admin_pw,
                 "SSPL_ERP_DIR": ERP_DIR}, None
 
@@ -1397,6 +1433,8 @@ async function refreshSetup(){
       rows += `<div class="setup-form">
         <input type="text" id="erp-ip" placeholder="Server IP / hostname" value="${esc(s.server_ip||'')}" size="18">
         <input type="text" id="erp-port" placeholder="HTTP port" value="80" size="6">
+        <input type="text" id="erp-image" placeholder="Docker image" value="${esc(s.erp_image||'')}" size="34"
+          title="ERPNext Docker image (registry/owner/name, no tag). A changed value is remembered for future installs.">
         <input type="password" id="erp-db" placeholder="MariaDB root password" size="20">
         <input type="password" id="erp-admin" placeholder="Administrator password" size="20">
         <button class="primary setup-install" data-inst="install_erp"
@@ -1442,6 +1480,7 @@ async function installComponent(btn){
   if(inst==='install_erp'){
     body.server_ip = $('#erp-ip').value.trim();
     body.http_port = $('#erp-port').value.trim();
+    body.image = $('#erp-image').value.trim();
     body.db_password = $('#erp-db').value;
     body.admin_password = $('#erp-admin').value;
   } else if(inst==='install_backups' && $('#bk-cron')){
