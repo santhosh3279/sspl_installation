@@ -11,6 +11,7 @@ SITE_NAME="your-site-name"  # Change this to your site name
 COMPOSE_FILE="/opt/sspl-erp/docker-compose.yml"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 RETENTION_DAYS=14
+RCLONE_REMOTE=""  # Optional: e.g. "gdrive:frappe-backups" — leave empty to skip cloud upload
 
 mkdir -p "$BACKUP_DIR"
 chmod 700 "$BACKUP_DIR"
@@ -45,5 +46,17 @@ fi
 
 # Clean old backups
 find "$BACKUP_DIR" -name "*.sql.gz" -mtime +$RETENTION_DAYS -delete
+
+# Optional: upload to cloud storage via rclone, into a db-only/ folder so the
+# dumps don't mix with the full backups' timestamped directories. Same
+# semantics as the full backup: a failed upload is a warning, not a failure.
+if [ -n "$RCLONE_REMOTE" ]; then
+    echo "Uploading backup to $RCLONE_REMOTE/db-only..."
+    if rclone copy "$BACKUP_FILE" "$RCLONE_REMOTE/db-only"; then
+        echo "Cloud upload completed"
+    else
+        echo "WARNING: Cloud upload failed — backup exists locally only"
+    fi
+fi
 
 echo "=== Database backup completed: $BACKUP_FILE ($(du -h "$BACKUP_FILE" | cut -f1)) ==="

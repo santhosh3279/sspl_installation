@@ -70,7 +70,7 @@ echo ""
 echo "→ 1/3 Backup scripts ($BACKUP_DST)"
 if [ -f "$BACKUP_DST/frappe_backup.sh" ]; then
     update_script "$BACKUP_SRC" "$BACKUP_DST" frappe_backup.sh        SITE_NAME BACKUP_DIR RETENTION_DAYS RCLONE_REMOTE
-    update_script "$BACKUP_SRC" "$BACKUP_DST" frappe_db_backup.sh     SITE_NAME BACKUP_DIR RETENTION_DAYS
+    update_script "$BACKUP_SRC" "$BACKUP_DST" frappe_db_backup.sh     SITE_NAME BACKUP_DIR RETENTION_DAYS RCLONE_REMOTE
     update_script "$BACKUP_SRC" "$BACKUP_DST" frappe_restore.sh       SITE_NAME
     update_script "$BACKUP_SRC" "$BACKUP_DST" frappe_backup_verify.sh BACKUP_DIR ALERT_EMAIL MAX_AGE_HOURS
     update_script "$BACKUP_SRC" "$BACKUP_DST" restore_with_backup.sh

@@ -33,9 +33,10 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-07-16.2"
-FEATURES = ("ERP Next Installation suite page with rclone cloud backup setup, "
-            "console-style terminal, guarded restore, delete uploads")
+PANEL_VERSION = "2026-07-16.3"
+FEATURES = ("ERP Next Installation suite page with rclone cloud backup setup "
+            "covering full and DB-only backups, console-style terminal, "
+            "guarded restore, delete uploads")
 
 CONFIG_FILE = os.environ.get("SSPL_ADMIN_CONFIG", "/opt/sspl-admin/config.json")
 with open(CONFIG_FILE) as f:
@@ -94,11 +95,14 @@ INSTALL_ACTIONS = {
 if REPO_DIR:
     ACTIONS.update(INSTALL_ACTIONS)
 
-# The backup script the panel wires a cloud remote into. Its RCLONE_REMOTE line
-# is the switch that decides whether "Run full backup" uploads anywhere: empty
-# means local-only, and the script treats a failed upload as a warning, so a
-# misconfigured remote still reports a successful backup.
+# The backup scripts the panel wires a cloud remote into. Their RCLONE_REMOTE
+# line is the switch that decides whether a backup uploads anywhere: empty
+# means local-only, and both scripts treat a failed upload as a warning, so a
+# misconfigured remote still reports a successful backup. The full-backup
+# script is the source of truth for status; the DB-only script is wired to the
+# same remote, but an older deployed copy may predate cloud upload entirely.
 DEPLOYED_BACKUP_SCRIPT = os.path.join(SCRIPTS_DIR, "frappe_backup.sh")
+DEPLOYED_DB_BACKUP_SCRIPT = os.path.join(SCRIPTS_DIR, "frappe_db_backup.sh")
 RCLONE_LINE_RE = re.compile(r"^RCLONE_REMOTE=.*$", re.M)
 # Reads the current value out of that line: RCLONE_REMOTE="gdrive:backups" # note
 RCLONE_VALUE_RE = re.compile(r"""^RCLONE_REMOTE=(?:"([^"]*)"|'([^']*)'|([^\s#]*))""", re.M)
@@ -374,10 +378,13 @@ def rclone_version():
         return None
 
 
-def wired_remote():
-    """The remote the deployed backup script uploads to, '' if local-only."""
+def wired_remote(script=DEPLOYED_BACKUP_SCRIPT):
+    """The remote a deployed backup script uploads to, '' if local-only.
+
+    None means the script can't upload at all: it is missing, or it is an
+    older deployed copy with no RCLONE_REMOTE line."""
     try:
-        with open(DEPLOYED_BACKUP_SCRIPT) as f:
+        with open(script) as f:
             m = RCLONE_VALUE_RE.search(f.read())
     except OSError:
         return None                      # backup system isn't installed
@@ -410,6 +417,10 @@ def rclone_status():
         "backups_installed": wired is not None,
         "wired": wired or "",
         "wired_ok": wired_ok,
+        # The DB-only script uploads separately; None = its deployed copy has
+        # no RCLONE_REMOTE line (predates cloud upload), so wiring can't help
+        # until update_tooling.sh replaces it.
+        "db_wired": wired_remote(DEPLOYED_DB_BACKUP_SCRIPT),
         "ready": bool(installed and wired_ok),
     }
 
@@ -764,10 +775,43 @@ def _install_env(name, data):
     return {"SERVER_IP": site, "SSPL_ERP_DIR": ERP_DIR}, None  # install_update
 
 
+def _wire_remote_into(script, target):
+    """Rewrite one deployed script's RCLONE_REMOTE line to point at target.
+
+    Returns None on success, else a short reason the file was left alone."""
+    try:
+        with open(script) as f:
+            text = f.read()
+        mode = os.stat(script).st_mode & 0o7777
+    except OSError:
+        return "is not installed"
+    # Replace the whole line, not the empty-string literal: re-pointing an
+    # already-wired script has to work too.
+    new_text, n = RCLONE_LINE_RE.subn(
+        f'RCLONE_REMOTE="{target}"  # set from the admin panel', text, count=1)
+    if n != 1:
+        return "has no RCLONE_REMOTE line"
+    # Write via a temp file in the same directory, so a failure here can never
+    # leave a half-written backup script behind.
+    tmp = script + ".panel-tmp"
+    try:
+        with open(tmp, "w") as f:
+            f.write(new_text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, script)
+    except OSError as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return f"could not be written: {e}"
+    return None
+
+
 @app.route("/api/rclone/wire", methods=["POST"])
 @login_required
 def api_rclone_wire():
-    """Point the deployed backup script at a cloud remote.
+    """Point both deployed backup scripts at a cloud remote.
 
     The remote name must be one rclone actually reports: a typo here would not
     fail the backup — the upload failure is only a warning — so it would show
@@ -783,33 +827,15 @@ def api_rclone_wire():
     if path and (not RCLONE_PATH_RE.match(path) or ".." in path):
         return jsonify({"error": "folder may only use letters, digits, . - _ and /"}), 400
     target = remote + path
-    try:
-        with open(DEPLOYED_BACKUP_SCRIPT) as f:
-            text = f.read()
-        mode = os.stat(DEPLOYED_BACKUP_SCRIPT).st_mode & 0o7777
-    except OSError:
+    err = _wire_remote_into(DEPLOYED_BACKUP_SCRIPT, target)
+    if err == "is not installed":
         return jsonify({"error": "the backup system is not installed on this server yet"}), 400
-    # Replace the whole line, not the empty-string literal: re-pointing an
-    # already-wired script has to work too.
-    new_text, n = RCLONE_LINE_RE.subn(
-        f'RCLONE_REMOTE="{target}"  # set from the admin panel', text, count=1)
-    if n != 1:
-        return jsonify({"error": "could not find the RCLONE_REMOTE line in "
-                                 f"{DEPLOYED_BACKUP_SCRIPT}"}), 500
-    # Write via a temp file in the same directory, so a failure here can never
-    # leave a half-written backup script behind.
-    tmp = DEPLOYED_BACKUP_SCRIPT + ".panel-tmp"
-    try:
-        with open(tmp, "w") as f:
-            f.write(new_text)
-        os.chmod(tmp, mode)
-        os.replace(tmp, DEPLOYED_BACKUP_SCRIPT)
-    except OSError as e:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        return jsonify({"error": f"could not write the backup script: {e}"}), 500
+    if err:
+        return jsonify({"error": f"{DEPLOYED_BACKUP_SCRIPT} {err}"}), 500
+    # The DB-only script uploads to the same remote (under db-only/). Failing
+    # to wire it is not a failure of the request — an older deployed copy has
+    # no RCLONE_REMOTE line at all — the status row reports the mismatch.
+    _wire_remote_into(DEPLOYED_DB_BACKUP_SCRIPT, target)
     return jsonify({"ok": True, "wired": target})
 
 
@@ -1218,6 +1244,17 @@ function rcloneRow(s){
     h += `<div class="note" style="color:var(--crit)">Backups point at
       <code>${esc(r.wired)}</code>, but rclone has no such remote${r.installed ? '' : ' (rclone is not installed)'} —
       uploads are failing silently. Pick a remote below.</div>`;
+  }
+  // The DB-only backup uploads on its own RCLONE_REMOTE line, so it can lag
+  // behind: wired before this existed, or a deployed copy too old to upload.
+  if(r.wired_ok && r.db_wired !== r.wired){
+    h += r.db_wired === null
+      ? `<div class="note" style="color:var(--crit)">Full backups upload, but the deployed DB-only
+         backup script is an older version with no cloud upload — run <code>update_tooling.sh</code>
+         on the server, then set the destination again.</div>`
+      : `<div class="note" style="color:var(--crit)">Full backups upload, but DB-only backups
+         ${r.db_wired ? 'point at <code>' + esc(r.db_wired) + '</code>' : 'stay local only'} —
+         click Update destination to fix both.</div>`;
   }
   if(!r.backups_installed){
     h += `<div class="note">Install the backup system first.</div>`;
