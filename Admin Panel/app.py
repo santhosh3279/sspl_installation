@@ -33,7 +33,7 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-07-16.5"
+PANEL_VERSION = "2026-07-16.6"
 FEATURES = ("ERP Next Installation suite page with rclone cloud backup setup "
             "covering full and DB-only backups, console-style terminal, "
             "guarded restore, delete uploads")
@@ -99,10 +99,11 @@ if REPO_DIR:
 # line is the switch that decides whether a backup uploads anywhere: empty
 # means local-only, and both scripts treat a failed upload as a warning, so a
 # misconfigured remote still reports a successful backup. The full-backup
-# script is the source of truth for status; the DB-only script is wired to the
-# same remote, but an older deployed copy may predate cloud upload entirely.
+# script is the source of truth for status; the DB-only and update scripts are
+# wired to the same remote, but older deployed copies may predate cloud upload.
 DEPLOYED_BACKUP_SCRIPT = os.path.join(SCRIPTS_DIR, "frappe_backup.sh")
 DEPLOYED_DB_BACKUP_SCRIPT = os.path.join(SCRIPTS_DIR, "frappe_db_backup.sh")
+DEPLOYED_UPDATE_SCRIPT = os.path.join(UPDATE_DIR, "sspl-erp-update-with-rollback.sh")
 RCLONE_LINE_RE = re.compile(r"^RCLONE_REMOTE=.*$", re.M)
 # Reads the current value out of that line: RCLONE_REMOTE="gdrive:backups" # note
 RCLONE_VALUE_RE = re.compile(r"""^RCLONE_REMOTE=(?:"([^"]*)"|'([^']*)'|([^\s#]*))""", re.M)
@@ -417,10 +418,12 @@ def rclone_status():
         "backups_installed": wired is not None,
         "wired": wired or "",
         "wired_ok": wired_ok,
-        # The DB-only script uploads separately; None = its deployed copy has
-        # no RCLONE_REMOTE line (predates cloud upload), so wiring can't help
-        # until update_tooling.sh replaces it.
+        # The DB-only and update scripts upload separately; None = the
+        # deployed copy has no RCLONE_REMOTE line (predates cloud upload), so
+        # wiring can't help until update_tooling.sh replaces it.
         "db_wired": wired_remote(DEPLOYED_DB_BACKUP_SCRIPT),
+        "update_wired": wired_remote(DEPLOYED_UPDATE_SCRIPT),
+        "update_installed": os.path.isfile(DEPLOYED_UPDATE_SCRIPT),
         "ready": bool(installed and wired_ok),
     }
 
@@ -832,10 +835,13 @@ def api_rclone_wire():
         return jsonify({"error": "the backup system is not installed on this server yet"}), 400
     if err:
         return jsonify({"error": f"{DEPLOYED_BACKUP_SCRIPT} {err}"}), 500
-    # The DB-only script uploads to the same remote (under db-only/). Failing
-    # to wire it is not a failure of the request — an older deployed copy has
-    # no RCLONE_REMOTE line at all — the status row reports the mismatch.
+    # The DB-only script (db-only/) and the update script's image snapshot
+    # (image-snapshots/) upload to the same remote. Failing to wire them is
+    # not a failure of the request — an older deployed copy has no
+    # RCLONE_REMOTE line, and the update system may not be installed at all —
+    # the status row reports any mismatch.
     _wire_remote_into(DEPLOYED_DB_BACKUP_SCRIPT, target)
+    _wire_remote_into(DEPLOYED_UPDATE_SCRIPT, target)
     return jsonify({"ok": True, "wired": target})
 
 
@@ -1296,16 +1302,22 @@ function rcloneRow(s){
       <code>${esc(r.wired)}</code>, but rclone has no such remote${r.installed ? '' : ' (rclone is not installed)'} —
       uploads are failing silently. Pick a remote below.</div>`;
   }
-  // The DB-only backup uploads on its own RCLONE_REMOTE line, so it can lag
-  // behind: wired before this existed, or a deployed copy too old to upload.
-  if(r.wired_ok && r.db_wired !== r.wired){
-    h += r.db_wired === null
-      ? `<div class="note" style="color:var(--crit)">Full backups upload, but the deployed DB-only
-         backup script is an older version with no cloud upload — run <code>update_tooling.sh</code>
-         on the server, then set the destination again.</div>`
-      : `<div class="note" style="color:var(--crit)">Full backups upload, but DB-only backups
-         ${r.db_wired ? 'point at <code>' + esc(r.db_wired) + '</code>' : 'stay local only'} —
-         click Update destination to fix both.</div>`;
+  // The DB-only backup and the update's image snapshot upload on their own
+  // RCLONE_REMOTE lines, so they can lag behind: wired before they existed,
+  // or deployed copies too old to upload. Flag whichever is out of step.
+  if(r.wired_ok){
+    const lag = [];
+    if(r.db_wired !== r.wired) lag.push(['DB-only backups', r.db_wired]);
+    if(r.update_installed && r.update_wired !== r.wired) lag.push(['update image snapshots', r.update_wired]);
+    for(const [what, val] of lag){
+      h += val === null
+        ? `<div class="note" style="color:var(--crit)">Full backups upload, but the deployed script
+           for ${what} is an older version with no cloud upload — run <code>update_tooling.sh</code>
+           on the server, then set the destination again.</div>`
+        : `<div class="note" style="color:var(--crit)">Full backups upload, but ${what}
+           ${val ? 'point at <code>' + esc(val) + '</code>' : 'stay local only'} —
+           click Update destination to fix.</div>`;
+    }
   }
   if(!r.backups_installed){
     h += `<div class="note">Install the backup system first.</div>`;

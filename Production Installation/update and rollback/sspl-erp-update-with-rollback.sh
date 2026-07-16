@@ -6,6 +6,7 @@ source "$(dirname "$0")/sspl-erp-common.sh"
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 BACKUP_FILE="$BACKUP_DIR/backup_$TIMESTAMP.tar"
+RCLONE_REMOTE=""  # Optional: e.g. "gdrive:frappe-backups" — leave empty to skip cloud upload
 
 trap 'echo ""; echo "❌ Update failed!"; echo "   Services may be in a partial state."; echo "   To roll back images: /opt/sspl-erp/v2/sspl-erp-rollback.sh"; echo "   To restore data:      sudo /opt/scripts/v2/frappe_restore.sh <backup-folder>"' ERR
 
@@ -82,13 +83,32 @@ echo ""
 echo "📦 Backup Information:"
 echo "   Backup file: $BACKUP_FILE"
 
-# Automatically keep only the last 3 backups
+# Optional: copy the image snapshot to cloud storage via rclone. Done after
+# the update, not before it, so a multi-gigabyte upload never extends the
+# downtime window. Same semantics as the backup scripts: a failed upload is
+# a warning, not a failure.
+if [ -n "$RCLONE_REMOTE" ] && [ -f "$BACKUP_FILE" ]; then
+    echo ""
+    echo "→ Uploading image snapshot to $RCLONE_REMOTE/image-snapshots..."
+    if rclone copy "$BACKUP_FILE" "$RCLONE_REMOTE/image-snapshots"; then
+        echo "   ✓ Cloud upload completed"
+    else
+        echo "   ⚠ Cloud upload failed — snapshot exists locally only"
+    fi
+fi
+
+# Automatically keep only the last 3 backups, on the remote too — snapshots
+# are multi-gigabyte, so the cloud copy follows the same retention instead
+# of growing without bound.
 echo ""
 echo "→ Cleaning old backups (keeping last 3)..."
 OLD_BACKUPS=$(ls -t "$BACKUP_DIR"/backup_*.tar 2>/dev/null | tail -n +4)
 if [ -n "$OLD_BACKUPS" ]; then
     echo "$OLD_BACKUPS" | while read backup; do
         rm -f "$backup"
+        if [ -n "$RCLONE_REMOTE" ]; then
+            rclone deletefile "$RCLONE_REMOTE/image-snapshots/$(basename "$backup")" 2>/dev/null || true
+        fi
         echo "   ✓ Deleted: $(basename "$backup")"
     done
     echo "   ✓ Cleanup complete - 3 most recent backups retained"

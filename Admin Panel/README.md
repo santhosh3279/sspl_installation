@@ -106,11 +106,12 @@ server health.
 
 ## Cloud backup
 
-By default a backup stays on the server: `frappe_backup.sh` and
-`frappe_db_backup.sh` only upload when their `RCLONE_REMOTE` is set, and it
-ships empty in both. The **Cloud backup (rclone)** row in the installation
-suite sets that up, and reports the three stages separately — all three must
-be green before a backup leaves the machine:
+By default a backup stays on the server: `frappe_backup.sh`,
+`frappe_db_backup.sh` and the update's image snapshot only upload when their
+`RCLONE_REMOTE` is set, and it ships empty in all three. The **Cloud backup
+(rclone)** row in the installation suite sets that up, and reports the three
+stages separately — all three must be green before a backup leaves the
+machine:
 
 1. **rclone installed** — the *Install rclone* button. Uses the official
    installer rather than apt, because a distro rclone can be old enough to
@@ -119,11 +120,13 @@ be green before a backup leaves the machine:
 2. **Cloud account connected** — done over SSH with `sudo rclone config`, not
    from the panel (see below). The panel lists whatever remotes it finds.
 3. **Backups upload to it** — pick the remote and folder, and the panel writes
-   `RCLONE_REMOTE` into both deployed scripts. Full backups land in a
-   timestamped folder per run; DB-only dumps go under `db-only/` in the same
-   destination. If the deployed `frappe_db_backup.sh` is an older copy with no
-   `RCLONE_REMOTE` line, the row says so — run `update_tooling.sh`, then set
-   the destination again.
+   `RCLONE_REMOTE` into all three deployed scripts. Full backups land in a
+   timestamped folder per run; DB-only dumps go under `db-only/`; the system
+   update uploads its Docker image snapshot under `image-snapshots/` *after*
+   the update finishes (so the multi-GB upload never extends downtime) and
+   mirrors its keep-last-3 retention on the remote. If a deployed script is an
+   older copy with no `RCLONE_REMOTE` line, the row says so — run
+   `update_tooling.sh`, then set the destination again.
 
 Step 2 is deliberately not a button. It is an OAuth flow needing a browser on
 another machine, and `rclone config` prints the account's long-lived refresh
