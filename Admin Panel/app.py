@@ -33,7 +33,7 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-07-16.4"
+PANEL_VERSION = "2026-07-16.5"
 FEATURES = ("ERP Next Installation suite page with rclone cloud backup setup "
             "covering full and DB-only backups, console-style terminal, "
             "guarded restore, delete uploads")
@@ -864,6 +864,7 @@ def api_clear_ram():
 
 
 CLEAR_OLD_DAYS = 30
+CLEAR_KEEP_MIN = 20
 
 
 @app.route("/api/backups/clear-old", methods=["POST"])
@@ -871,17 +872,18 @@ CLEAR_OLD_DAYS = 30
 def api_clear_old_backups():
     """Delete full and DB-only backups older than CLEAR_OLD_DAYS.
 
-    The newest full backup and the newest DB-only dump survive regardless of
-    age: a cleanup must never leave the server with no backup at all. Uploads
-    and image snapshots are untouched — uploads have their own delete buttons,
-    and snapshots are what a rollback runs from. Age is mtime, the same clock
-    the cron retention (find -mtime) uses."""
+    The newest CLEAR_KEEP_MIN of each survive regardless of age: a cleanup
+    must never strip the backup folder down to nothing just because the cron
+    stopped producing fresh backups for a while. Uploads and image snapshots
+    are untouched — uploads have their own delete buttons, and snapshots are
+    what a rollback runs from. Age is mtime, the same clock the cron
+    retention (find -mtime) uses."""
     cutoff = time.time() - CLEAR_OLD_DAYS * 86400
     deleted, freed, errors = 0, 0, []
     full = sorted((d for d in BACKUP_DIR.iterdir()
                    if d.is_dir() and FULL_BACKUP_RE.match(d.name)),
                   key=lambda d: d.name, reverse=True) if BACKUP_DIR.is_dir() else []
-    for d in full[1:]:                       # [0] is the newest — always kept
+    for d in full[CLEAR_KEEP_MIN:]:          # newest 20 are always kept
         try:
             if d.stat().st_mtime >= cutoff:
                 continue
@@ -895,7 +897,7 @@ def api_clear_old_backups():
     dumps = sorted((p for p in DB_ONLY_DIR.iterdir() if p.is_file()),
                    key=lambda p: p.stat().st_mtime,
                    reverse=True) if DB_ONLY_DIR.is_dir() else []
-    for p in dumps[1:]:
+    for p in dumps[CLEAR_KEEP_MIN:]:
         try:
             if p.stat().st_mtime >= cutoff:
                 continue
@@ -1566,7 +1568,7 @@ details{margin:2px 0} details summary{cursor:pointer}
   <div class="tabpane" id="tab-upl"></div>
   <div style="display:flex;gap:10px;align-items:center;margin-top:12px">
     <button id="clear-old" class="danger"
-      data-confirm="Delete full and DB-only backups older than 30 days? The newest of each is always kept, however old. Uploads and image snapshots are not touched.">Clear backups older than 30 days</button>
+      data-confirm="Delete full and DB-only backups older than 30 days? The newest 20 of each are always kept, however old. Uploads and image snapshots are not touched.">Clear backups older than 30 days</button>
     <span id="clear-old-msg" style="font-size:13px;color:var(--ink-2)"></span>
   </div>
 </div>
