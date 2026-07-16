@@ -33,9 +33,9 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-07-15.4"
-FEATURES = ("console-style terminal, setup switches, guarded restore, "
-            "delete uploads")
+PANEL_VERSION = "2026-07-16.1"
+FEATURES = ("ERP Next Installation suite page, console-style terminal, "
+            "guarded restore, delete uploads")
 
 CONFIG_FILE = os.environ.get("SSPL_ADMIN_CONFIG", "/opt/sspl-admin/config.json")
 with open(CONFIG_FILE) as f:
@@ -569,6 +569,12 @@ def index():
     return render_template_string(DASH_HTML, user=session["user"], version=PANEL_VERSION)
 
 
+@app.route("/install")
+@login_required
+def install_suite():
+    return render_template_string(INSTALL_HTML, user=session["user"], version=PANEL_VERSION)
+
+
 @app.route("/api/stats")
 @login_required
 def api_stats():
@@ -777,6 +783,177 @@ th{color:var(--muted);font-weight:600;text-align:left;padding:6px 10px;
 td{padding:6px 10px;border-bottom:1px solid var(--hairline)}
 tr:last-child td{border-bottom:none}
 .num{font-variant-numeric:tabular-nums}
+.badge{font-size:11.5px;border:1px solid var(--hairline);border-radius:6px;padding:1px 6px;color:var(--muted)}
+.badge.ok{color:var(--ok);border-color:var(--ok)}
+.badge.miss{color:var(--crit);border-color:var(--crit)}
+"""
+
+# Page chrome shared by the dashboard and the installation suite.
+LAYOUT_CSS = """
+.top{display:flex;align-items:center;gap:14px;max-width:1500px;margin:0 auto;padding:18px 16px 6px}
+.top .spacer{flex:1}
+.top a.nav{font-size:13px;text-decoration:none;border:1px solid var(--border);
+  border-radius:8px;padding:7px 12px;color:var(--ink)}
+.top a.nav:hover{border-color:var(--accent);color:var(--accent)}
+/* One column: the page's controls, then the terminal full-width at the foot.
+   Starting a job scrolls the terminal into view. */
+main{max-width:1500px;margin:0 auto;padding:0 16px 40px}
+.col-left{min-width:0}
+.col-right{min-width:0}
+#job-card{margin-bottom:0}
+"""
+
+# ---- the terminal ----------------------------------------------------------
+# Both pages show the same terminal, watching the same server-side job: the
+# panel runs one job at a time (_job is a module global), so an install started
+# on the suite page is still readable from the dashboard, and vice versa. CSS,
+# markup and JS live here once rather than being copied per page — the ANSI
+# handling below is fiddly enough that two drifting copies would be a bug farm.
+
+TERM_CSS = """
+/* The terminal is one black pane. The log and the input line stay separate
+   DOM nodes — the poll rewrites the log wholesale, which would eat the caret
+   and any half-typed text — but they are styled as a single surface. */
+.term{background:#111;border-radius:8px;padding:12px;display:flex;flex-direction:column;
+  min-width:0;cursor:text;
+  /* a definite height so the log scrolls inside it rather than growing the
+     page forever; drag the bottom edge to resize, as you would a terminal */
+  height:min(60vh,520px);min-height:220px;resize:vertical;overflow:hidden}
+#console{color:#ddd;font:12.5px/1.45 ui-monospace,Menlo,Consolas,monospace;
+  white-space:pre-wrap;overflow-wrap:anywhere;overflow:auto;flex:1;min-height:0}
+#jobstate{font-size:13px;color:var(--ink-2);margin-bottom:8px}
+#jobstate .live{color:var(--accent);font-weight:600}
+#jobstate .okrc{color:var(--ok);font-weight:600} #jobstate .badrc{color:var(--crit);font-weight:600}
+/* terminal input line — only shown while an interactive job is waiting.
+   Borderless and transparent so typing happens *in* the terminal, not in a
+   box below it; Enter submits, the way a console does. */
+.term-in{display:none;gap:8px;align-items:baseline;flex:none}
+.term-in.on{display:flex}
+.term-in input{flex:1;min-width:0;font:12.5px/1.45 ui-monospace,Menlo,Consolas,monospace;
+  background:transparent;color:#ddd;border:0;outline:none;padding:0;caret-color:#ddd}
+.term-in input::placeholder{color:#555}
+.term-in .ps1{color:var(--accent);font:12.5px/1.45 ui-monospace,monospace}
+"""
+
+TERM_HTML = """
+<aside class="col-right">
+<div class="card" id="job-card"><h2>Terminal — live output</h2>
+  <div id="jobstate">No job has been run yet.</div>
+  <div class="term" id="term">
+    <div id="console"></div>
+    <div class="term-in" id="term-in">
+      <span class="ps1">&gt;</span>
+      <input id="term-line" placeholder="type here, then press Enter" autocomplete="off"
+             autocapitalize="off" autocorrect="off" spellcheck="false">
+    </div>
+  </div>
+</div>
+</aside>
+"""
+
+# RAW string (r"""), like the page templates that embed it — see the note on
+# DASH_HTML. The escapes below must reach the browser intact.
+TERM_JS = r"""
+const $ = s => document.querySelector(s);
+const esc = t => (t??'').toString().replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let jobWasActive = false;
+// What to refresh when a job finishes. Each page sets its own: the pages show
+// different things, so they care about different halves of the aftermath.
+let onJobFinished = () => {};
+
+// ---- terminal input: only ever types into the job that is already running ----
+async function sendTermLine(){
+  const box = $('#term-line'), line = box.value;
+  if (!line) return;
+  box.value = '';
+  try{
+    const r = await fetch('/api/job/input', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({line})});
+    const j = await r.json();
+    if (j.error) alert(j.error);
+  }catch(e){ alert('could not send input'); }
+  refreshJob();
+}
+$('#term-line').addEventListener('keydown', e => { if (e.key === 'Enter') sendTermLine(); });
+
+// Click anywhere in the terminal to type, like a real one — but never steal
+// a text selection the user is making to copy an error out of the log.
+$('#term').addEventListener('click', () => {
+  if ($('#term-in').classList.contains('on') && !String(document.getSelection()))
+    $('#term-line').focus();
+});
+
+// ---- render the log the way a terminal would -------------------------------
+// Interactive jobs run on a pty, so docker/bench decide they are talking to a
+// terminal and emit ANSI escapes and \r progress lines. Those are control
+// codes, not text: printed verbatim they are garbage. Strip the escapes and
+// let \r overwrite its line, as a console does. This is deliberately not a
+// full emulator — cursor-up redraws just leave successive progress lines.
+// OSC (window title) | CSI (colour, cursor) | nF, e.g. the ESC ( B that every
+// `tput sgr0` emits | single-character escapes. CSI must be tried before nF.
+const ANSI = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -\/]*[@-~]|\x1b[ -\/]+[0-~]|\x1b[@-Z\\-_]/g;
+// The last sequence can be cut in half: we show the tail of a log that is
+// still being written, so the fetch can land mid-escape.
+const ANSI_CUT = /\x1b\][^\x07\x1b]*$|\x1b\[[0-?]*[ -\/]*$|\x1b[ -\/]*$/;
+// Erase-in-line. Handled, not stripped: docker redraws progress with \r + \x1b[2K,
+// and \r alone does not clear a row, so dropping the erase leaves the tail of
+// the longer previous line behind ("Pull complete9MB/50MB").
+const ERASE = /\x1b\[[012]?K/;
+
+function applyCR(line){
+  let out = '';
+  for (const chunk of line.split('\r')){   // \r = back to column 0, no erase
+    const parts = chunk.split(ERASE);
+    if (parts.length > 1) out = '';        // the row was cleared before redrawing
+    const text = parts[parts.length - 1].replace(ANSI, '').replace(/\x1b/g, '');
+    out = text.length >= out.length ? text : text + out.slice(text.length);
+  }
+  return out;
+}
+function termText(s){
+  return s.replace(ANSI_CUT, '').split('\n').map(applyCR).join('\n');
+}
+
+// The terminal is at the foot of the page, below the controls, so a job
+// started from a button up top would otherwise run off-screen.
+function revealConsole(){
+  $('#job-card').scrollIntoView({behavior:'smooth', block:'end'});
+}
+
+async function refreshJob(){
+  try{
+    const r = await fetch('/api/job'); if(!r.ok) return;
+    const j = await r.json();
+    document.querySelectorAll('.act').forEach(btn => btn.disabled = j.active);
+    document.querySelectorAll('.rs-btn').forEach(btn => btn.disabled = j.active);
+    document.querySelectorAll('.setup-install').forEach(btn => btn.disabled = j.active);
+    // The input line appears only while an interactive job is actually running.
+    const ti = $('#term-in'), wantInput = !!j.interactive;
+    if (wantInput !== ti.classList.contains('on')){
+      ti.classList.toggle('on', wantInput);
+      if (wantInput) $('#term-line').focus();
+    }
+    if (j.label === null) return;
+    const st = j.active
+      ? `<b>${esc(j.label)}</b> <span class="live">running…</span> (${j.elapsed}s)`
+      : `<b>${esc(j.label)}</b> finished — ` + (j.rc === 0
+          ? '<span class="okrc">success</span>' : `<span class="badrc">FAILED (exit ${j.rc})</span>`)
+        + ` after ${j.elapsed}s (started ${esc(j.started)})`;
+    $('#jobstate').innerHTML = st;
+    const c = $('#console'), atEnd = c.scrollTop + c.clientHeight >= c.scrollHeight - 30;
+    c.textContent = termText(j.log || '') || '(no output yet)';
+    if (atEnd) c.scrollTop = c.scrollHeight;
+    if (jobWasActive && !j.active) onJobFinished();
+    jobWasActive = j.active;
+  }catch(e){}
+}
+
+// Poll the job faster while one is running, so prompts and output feel
+// prompt to type against; idle back off when nothing is happening.
+function pollJob(){
+  const next = () => setTimeout(pollJob, jobWasActive ? 1000 : 3000);
+  refreshJob().then(next, next);
+}
 """
 
 LOGIN_HTML = """<!doctype html><html><head><meta charset="utf-8">
@@ -796,6 +973,143 @@ button{width:100%;margin-top:16px}
 <button class="primary" type="submit">Sign in</button>
 </form></div></body></html>"""
 
+# ---- the installation suite ------------------------------------------------
+# The component installers live on their own page: installing is a one-off job
+# done when a server is first built, while the dashboard is the day-to-day
+# view. Both pages carry the terminal, because an install has nowhere else to
+# report to.
+
+SETUP_CSS = """
+.setup-row{padding:10px 0;border-bottom:1px solid var(--hairline)}
+.setup-row:last-child{border-bottom:none}
+.setup-h{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.setup-form{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px}
+.setup-form input[type=text],.setup-form input[type=password],.setup-form input:not([type]){
+  padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--ink)}
+"""
+
+INSTALL_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ERP Next Installation suite</title><style>""" + BASE_CSS + LAYOUT_CSS + \
+    TERM_CSS + SETUP_CSS + r"""
+.lead{font-size:13px;color:var(--ink-2);margin:0 0 12px}
+</style></head><body>
+<div class="top">
+  <h1>ERP Next Installation suite</h1><span id="clock" class="badge"></span>
+  <span class="badge" title="panel code version — restart the service after updating">v{{ version }}</span>
+  <a class="nav" href="/">← Dashboard</a>
+  <span class="spacer"></span>
+  <span style="color:var(--muted);font-size:13px">{{ user }}</span>
+  <form method="post" action="/logout" style="margin:0"><button>Log out</button></form>
+</div>
+<main>
+<div class="col-left">
+
+<div class="card" id="setup-card"><h2>Install components</h2>
+  <p class="lead">Install the ERPNext stack and its tooling on this server. Each
+  install runs as a job and reports into the terminal below — leave the page open
+  until it finishes.</p>
+  <div id="setup-body"><p style="color:var(--muted)">Loading…</p></div>
+</div>
+
+</div><!-- /col-left -->
+""" + TERM_HTML + r"""
+</main>
+<script>
+""" + TERM_JS + r"""
+function pill(ok){ return ok ? '<span class="badge ok">installed ✓</span>'
+                             : '<span class="badge miss">not installed</span>'; }
+
+async function refreshSetup(){
+  try{
+    const r = await fetch('/api/setup-status'); if(r.status===401){location='/login';return;}
+    const s = await r.json();
+    if(!s.repo_ok){
+      $('#setup-body').innerHTML = `<p style="color:var(--warn);margin:0">Installer scripts not found
+        (${s.repo_dir?('repo_dir = <code>'+esc(s.repo_dir)+'</code>'):'repo_dir is not set in config.json'}).
+        Component installs are unavailable. Clone the repo on this server, set <code>repo_dir</code> in
+        <code>/opt/sspl-admin/config.json</code>, then restart the panel.</p>`;
+      return;
+    }
+    const c = s.components, erpDone = c.erp.installed;
+    let rows = '';
+    // ERPNext stack
+    rows += `<div class="setup-row"><div class="setup-h"><b>ERPNext stack</b> ${pill(c.erp.installed)}`
+      + (c.erp.installed && c.erp.running ? ' <span class="badge ok">running</span>' : '')
+      + (c.erp.site ? ` <span class="badge">site ${esc(c.erp.site)}</span>` : '') + `</div>`;
+    if(!c.erp.installed){
+      rows += `<div class="setup-form">
+        <input type="text" id="erp-ip" placeholder="Server IP / hostname" value="${esc(s.server_ip||'')}" size="18">
+        <input type="text" id="erp-port" placeholder="HTTP port" value="80" size="6">
+        <input type="password" id="erp-db" placeholder="MariaDB root password" size="20">
+        <input type="password" id="erp-admin" placeholder="Administrator password" size="20">
+        <button class="primary setup-install" data-inst="install_erp"
+          data-confirm="Install the ERPNext stack now? This pulls the image, starts the containers and creates the site — 10-20 minutes. Do not close the page.">Install ERPNext</button></div>`;
+    }
+    rows += `</div>`;
+    // Backup system
+    rows += `<div class="setup-row"><div class="setup-h"><b>Backup system</b> ${pill(c.backups.installed)}</div>`;
+    if(!c.backups.installed){
+      rows += `<div class="setup-form">
+        <label style="font-size:13px"><input type="checkbox" id="bk-cron" checked> also schedule daily cron backups</label>
+        <button class="primary setup-install" data-inst="install_backups" ${erpDone?'':'disabled'}
+          data-confirm="Install the backup system now?">Install backups</button>`
+        + (erpDone?'':'<span style="color:var(--muted);font-size:12px">install ERPNext first</span>') + `</div>`;
+    }
+    rows += `</div>`;
+    // Update / rollback
+    rows += `<div class="setup-row"><div class="setup-h"><b>Update &amp; rollback scripts</b> ${pill(c.update.installed)}</div>`;
+    if(!c.update.installed){
+      rows += `<div class="setup-form">
+        <button class="primary setup-install" data-inst="install_update" ${erpDone?'':'disabled'}
+          data-confirm="Install the update/rollback scripts now?">Install update/rollback</button>`
+        + (erpDone?'':'<span style="color:var(--muted);font-size:12px">install ERPNext first</span>') + `</div>`;
+    }
+    rows += `</div>`;
+    const allDone = erpDone && c.backups.installed && c.update.installed;
+    $('#setup-body').innerHTML =
+      (allDone ? '<p style="color:var(--ok);margin:0 0 6px">✓ All components are installed. ' +
+                 'Run the server from the <a href="/">dashboard</a>.</p>' : '') + rows;
+    document.querySelectorAll('.setup-install').forEach(btn => btn.onclick = () => installComponent(btn));
+    // A job started from the dashboard (or a second browser tab) still owns the
+    // panel: re-disable the buttons the render above has just recreated.
+    if (jobWasActive) document.querySelectorAll('.setup-install').forEach(b => b.disabled = true);
+  }catch(e){}
+}
+
+async function installComponent(btn){
+  if(btn.disabled) return;
+  if(btn.dataset.confirm && !confirm(btn.dataset.confirm)) return;
+  const inst = btn.dataset.inst, body = {};
+  if(inst==='install_erp'){
+    body.server_ip = $('#erp-ip').value.trim();
+    body.http_port = $('#erp-port').value.trim();
+    body.db_password = $('#erp-db').value;
+    body.admin_password = $('#erp-admin').value;
+  } else if(inst==='install_backups' && $('#bk-cron')){
+    body.schedule_cron = $('#bk-cron').checked;
+  }
+  btn.disabled = true;
+  try{
+    const r = await fetch('/api/run/'+inst, {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    const j = await r.json();
+    if(j.error){ alert(j.error); btn.disabled = false; }
+    else { jobWasActive = true; refreshJob(); revealConsole(); }
+  }catch(e){ alert('request failed'); btn.disabled = false; }
+}
+
+// An install that has finished has flipped a pill from "not installed" to
+// "installed ✓" — this page's whole job is to show that.
+onJobFinished = () => refreshSetup();
+
+setInterval(() => $('#clock').textContent = new Date().toLocaleString(), 1000);
+refreshSetup();
+setInterval(refreshSetup, 30000);
+pollJob();
+</script></body></html>"""
+
+
 # The CSS/JS half of this template is a RAW string (r"""). The JS needs to
 # reach the browser with its own backslash escapes intact: in a normal string
 # Python eats them, turning \x1b into a real ESC byte and split('\r') into a
@@ -803,15 +1117,7 @@ button{width:100%;margin-top:16px}
 # and kills the whole <script>. Keep the r prefix when editing.
 DASH_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SSPL ERP Admin</title><style>""" + BASE_CSS + r"""
-.top{display:flex;align-items:center;gap:14px;max-width:1500px;margin:0 auto;padding:18px 16px 6px}
-.top .spacer{flex:1}
-/* One column: the control panel, then the terminal full-width at the foot of
-   the page. Starting a job scrolls the terminal into view. */
-main{max-width:1500px;margin:0 auto;padding:0 16px 40px}
-.col-left{min-width:0}
-.col-right{min-width:0}
-#job-card{margin-bottom:0}
+<title>SSPL ERP Admin</title><style>""" + BASE_CSS + LAYOUT_CSS + TERM_CSS + r"""
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px}
 .tile{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:12px 14px}
 .tile .k{font-size:12px;color:var(--muted)} .tile .v{font-size:22px;margin-top:2px}
@@ -830,45 +1136,14 @@ main{max-width:1500px;margin:0 auto;padding:0 16px 40px}
 .dot.up{background:var(--ok)} .dot.down{background:var(--crit)}
 .actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
 .actions .sep{flex-basis:100%;height:0}
-/* The terminal is one black pane. The log and the input line stay separate
-   DOM nodes — the poll rewrites the log wholesale, which would eat the caret
-   and any half-typed text — but they are styled as a single surface. */
-.term{background:#111;border-radius:8px;padding:12px;display:flex;flex-direction:column;
-  min-width:0;cursor:text;
-  /* a definite height so the log scrolls inside it rather than growing the
-     page forever; drag the bottom edge to resize, as you would a terminal */
-  height:min(60vh,520px);min-height:220px;resize:vertical;overflow:hidden}
-#console{color:#ddd;font:12.5px/1.45 ui-monospace,Menlo,Consolas,monospace;
-  white-space:pre-wrap;overflow-wrap:anywhere;overflow:auto;flex:1;min-height:0}
-#jobstate{font-size:13px;color:var(--ink-2);margin-bottom:8px}
-#jobstate .live{color:var(--accent);font-weight:600}
-#jobstate .okrc{color:var(--ok);font-weight:600} #jobstate .badrc{color:var(--crit);font-weight:600}
 details{margin:2px 0} details summary{cursor:pointer}
 .filelist{margin:6px 0 4px 18px;font-size:13px;color:var(--ink-2)}
-.badge{font-size:11.5px;border:1px solid var(--hairline);border-radius:6px;padding:1px 6px;color:var(--muted)}
-.badge.ok{color:var(--ok);border-color:var(--ok)}
-.badge.miss{color:var(--crit);border-color:var(--crit)}
 .uprow{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
 #upmsg{font-size:13px;color:var(--ink-2)}
 .tabs{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap}
 .tabs button.active{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
 .tabpane{display:none} .tabpane.active{display:block}
 .right{text-align:right}
-.setup-row{padding:10px 0;border-bottom:1px solid var(--hairline)}
-.setup-row:last-child{border-bottom:none}
-.setup-h{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.setup-form{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px}
-.setup-form input[type=text],.setup-form input[type=password],.setup-form input:not([type]){
-  padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--ink)}
-/* terminal input line — only shown while an interactive job is waiting.
-   Borderless and transparent so typing happens *in* the terminal, not in a
-   box below it; Enter submits, the way a console does. */
-.term-in{display:none;gap:8px;align-items:baseline;flex:none}
-.term-in.on{display:flex}
-.term-in input{flex:1;min-width:0;font:12.5px/1.45 ui-monospace,Menlo,Consolas,monospace;
-  background:transparent;color:#ddd;border:0;outline:none;padding:0;caret-color:#ddd}
-.term-in input::placeholder{color:#555}
-.term-in .ps1{color:var(--accent);font:12.5px/1.45 ui-monospace,monospace}
 /* restore confirmation modal */
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;
   align-items:center;justify-content:center;padding:16px;z-index:10}
@@ -885,16 +1160,13 @@ details{margin:2px 0} details summary{cursor:pointer}
 <div class="top">
   <h1>SSPL ERP Admin</h1><span id="clock" class="badge"></span>
   <span class="badge" title="panel code version — restart the service after updating">v{{ version }}</span>
+  <a class="nav" href="/install">ERP Next Installation suite →</a>
   <span class="spacer"></span>
   <span style="color:var(--muted);font-size:13px">{{ user }}</span>
   <form method="post" action="/logout" style="margin:0"><button>Log out</button></form>
 </div>
 <main>
 <div class="col-left">
-
-<div class="card" id="setup-card"><h2>Setup — install components</h2>
-  <div id="setup-body"><p style="color:var(--muted)">Loading…</p></div>
-</div>
 
 <div class="tiles">
   <div class="tile"><div class="k">CPU usage</div><div class="v num" id="t-cpu">–</div>
@@ -959,21 +1231,7 @@ details{margin:2px 0} details summary{cursor:pointer}
 </div>
 
 </div><!-- /col-left -->
-
-<aside class="col-right">
-<div class="card" id="job-card"><h2>Terminal — live output</h2>
-  <div id="jobstate">No job has been run yet.</div>
-  <div class="term" id="term">
-    <div id="console"></div>
-    <div class="term-in" id="term-in">
-      <span class="ps1">&gt;</span>
-      <input id="term-line" placeholder="type here, then press Enter" autocomplete="off"
-             autocapitalize="off" autocorrect="off" spellcheck="false">
-    </div>
-  </div>
-</div>
-</aside>
-
+""" + TERM_HTML + r"""
 </main>
 
 <div class="modal" id="rs-modal"><div class="card">
@@ -997,10 +1255,7 @@ details{margin:2px 0} details summary{cursor:pointer}
   </div>
 </div></div>
 <script>
-const $ = s => document.querySelector(s);
-const esc = t => (t??'').toString().replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-let jobWasActive = false;
-
+""" + TERM_JS + r"""
 // ---- deleting uploads (uploads only — backups have no delete button) ----
 function delBtn(name, what){
   return `<button class="danger del-btn" data-name="${esc(name)}" data-what="${esc(what)}"
@@ -1074,65 +1329,6 @@ $('#rs-go').onclick = async () => {
   btn.disabled = false;
 };
 
-// ---- terminal input: only ever types into the job that is already running ----
-async function sendTermLine(){
-  const box = $('#term-line'), line = box.value;
-  if (!line) return;
-  box.value = '';
-  try{
-    const r = await fetch('/api/job/input', {method:'POST',
-      headers:{'Content-Type':'application/json'}, body: JSON.stringify({line})});
-    const j = await r.json();
-    if (j.error) alert(j.error);
-  }catch(e){ alert('could not send input'); }
-  refreshJob();
-}
-$('#term-line').addEventListener('keydown', e => { if (e.key === 'Enter') sendTermLine(); });
-
-// Click anywhere in the terminal to type, like a real one — but never steal
-// a text selection the user is making to copy an error out of the log.
-$('#term').addEventListener('click', () => {
-  if ($('#term-in').classList.contains('on') && !String(document.getSelection()))
-    $('#term-line').focus();
-});
-
-// ---- render the log the way a terminal would -------------------------------
-// Interactive jobs run on a pty, so docker/bench decide they are talking to a
-// terminal and emit ANSI escapes and \r progress lines. Those are control
-// codes, not text: printed verbatim they are garbage. Strip the escapes and
-// let \r overwrite its line, as a console does. This is deliberately not a
-// full emulator — cursor-up redraws just leave successive progress lines.
-// OSC (window title) | CSI (colour, cursor) | nF, e.g. the ESC ( B that every
-// `tput sgr0` emits | single-character escapes. CSI must be tried before nF.
-const ANSI = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -\/]*[@-~]|\x1b[ -\/]+[0-~]|\x1b[@-Z\\-_]/g;
-// The last sequence can be cut in half: we show the tail of a log that is
-// still being written, so the fetch can land mid-escape.
-const ANSI_CUT = /\x1b\][^\x07\x1b]*$|\x1b\[[0-?]*[ -\/]*$|\x1b[ -\/]*$/;
-// Erase-in-line. Handled, not stripped: docker redraws progress with \r + \x1b[2K,
-// and \r alone does not clear a row, so dropping the erase leaves the tail of
-// the longer previous line behind ("Pull complete9MB/50MB").
-const ERASE = /\x1b\[[012]?K/;
-
-function applyCR(line){
-  let out = '';
-  for (const chunk of line.split('\r')){   // \r = back to column 0, no erase
-    const parts = chunk.split(ERASE);
-    if (parts.length > 1) out = '';        // the row was cleared before redrawing
-    const text = parts[parts.length - 1].replace(ANSI, '').replace(/\x1b/g, '');
-    out = text.length >= out.length ? text : text + out.slice(text.length);
-  }
-  return out;
-}
-function termText(s){
-  return s.replace(ANSI_CUT, '').split('\n').map(applyCR).join('\n');
-}
-
-// The terminal is at the foot of the page, below the controls, so a job
-// started from a button up top would otherwise run off-screen.
-function revealConsole(){
-  $('#job-card').scrollIntoView({behavior:'smooth', block:'end'});
-}
-
 function meterClass(p){ return p >= 92 ? 'crit' : p >= 80 ? 'warn' : ''; }
 function meterFlag(p){ return p >= 92 ? '<span class="flag crit">critical</span>'
                      : p >= 80 ? '<span class="flag warn">high</span>' : ''; }
@@ -1168,83 +1364,15 @@ async function refreshStats(){
   }catch(e){}
 }
 
-function pill(ok){ return ok ? '<span class="badge ok">installed ✓</span>'
-                             : '<span class="badge miss">not installed</span>'; }
-
-async function refreshSetup(){
+// The components themselves are installed from the installation suite. All the
+// dashboard needs from that endpoint is the live site name, which the restore
+// modal makes the user type out to confirm.
+async function refreshSite(){
   try{
     const r = await fetch('/api/setup-status'); if(r.status===401){location='/login';return;}
     const s = await r.json();
     window.setupSite = (s.components && s.components.erp.site) || null;
-    if(!s.repo_ok){
-      $('#setup-body').innerHTML = `<p style="color:var(--warn);margin:0">Installer scripts not found
-        (${s.repo_dir?('repo_dir = <code>'+esc(s.repo_dir)+'</code>'):'repo_dir is not set in config.json'}).
-        Component installs are unavailable. Clone the repo on this server, set <code>repo_dir</code> in
-        <code>/opt/sspl-admin/config.json</code>, then restart the panel.</p>`;
-      return;
-    }
-    const c = s.components, erpDone = c.erp.installed;
-    let rows = '';
-    // ERPNext stack
-    rows += `<div class="setup-row"><div class="setup-h"><b>ERPNext stack</b> ${pill(c.erp.installed)}`
-      + (c.erp.installed && c.erp.running ? ' <span class="badge ok">running</span>' : '')
-      + (c.erp.site ? ` <span class="badge">site ${esc(c.erp.site)}</span>` : '') + `</div>`;
-    if(!c.erp.installed){
-      rows += `<div class="setup-form">
-        <input type="text" id="erp-ip" placeholder="Server IP / hostname" value="${esc(s.server_ip||'')}" size="18">
-        <input type="text" id="erp-port" placeholder="HTTP port" value="80" size="6">
-        <input type="password" id="erp-db" placeholder="MariaDB root password" size="20">
-        <input type="password" id="erp-admin" placeholder="Administrator password" size="20">
-        <button class="primary setup-install" data-inst="install_erp"
-          data-confirm="Install the ERPNext stack now? This pulls the image, starts the containers and creates the site — 10-20 minutes. Do not close the page.">Install ERPNext</button></div>`;
-    }
-    rows += `</div>`;
-    // Backup system
-    rows += `<div class="setup-row"><div class="setup-h"><b>Backup system</b> ${pill(c.backups.installed)}</div>`;
-    if(!c.backups.installed){
-      rows += `<div class="setup-form">
-        <label style="font-size:13px"><input type="checkbox" id="bk-cron" checked> also schedule daily cron backups</label>
-        <button class="primary setup-install" data-inst="install_backups" ${erpDone?'':'disabled'}
-          data-confirm="Install the backup system now?">Install backups</button>`
-        + (erpDone?'':'<span style="color:var(--muted);font-size:12px">install ERPNext first</span>') + `</div>`;
-    }
-    rows += `</div>`;
-    // Update / rollback
-    rows += `<div class="setup-row"><div class="setup-h"><b>Update &amp; rollback scripts</b> ${pill(c.update.installed)}</div>`;
-    if(!c.update.installed){
-      rows += `<div class="setup-form">
-        <button class="primary setup-install" data-inst="install_update" ${erpDone?'':'disabled'}
-          data-confirm="Install the update/rollback scripts now?">Install update/rollback</button>`
-        + (erpDone?'':'<span style="color:var(--muted);font-size:12px">install ERPNext first</span>') + `</div>`;
-    }
-    rows += `</div>`;
-    const allDone = erpDone && c.backups.installed && c.update.installed;
-    $('#setup-body').innerHTML =
-      (allDone ? '<p style="color:var(--ok);margin:0 0 6px">✓ All components are installed.</p>' : '') + rows;
-    document.querySelectorAll('.setup-install').forEach(btn => btn.onclick = () => installComponent(btn));
   }catch(e){}
-}
-
-async function installComponent(btn){
-  if(btn.disabled) return;
-  if(btn.dataset.confirm && !confirm(btn.dataset.confirm)) return;
-  const inst = btn.dataset.inst, body = {};
-  if(inst==='install_erp'){
-    body.server_ip = $('#erp-ip').value.trim();
-    body.http_port = $('#erp-port').value.trim();
-    body.db_password = $('#erp-db').value;
-    body.admin_password = $('#erp-admin').value;
-  } else if(inst==='install_backups' && $('#bk-cron')){
-    body.schedule_cron = $('#bk-cron').checked;
-  }
-  btn.disabled = true;
-  try{
-    const r = await fetch('/api/run/'+inst, {method:'POST',
-      headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-    const j = await r.json();
-    if(j.error){ alert(j.error); btn.disabled = false; }
-    else { jobWasActive = true; refreshJob(); revealConsole(); }
-  }catch(e){ alert('request failed'); btn.disabled = false; }
 }
 
 function fileBadge(ok, label){ return `<span class="badge ${ok?'ok':'miss'}">${label}${ok?' ✓':' missing'}</span>`; }
@@ -1287,33 +1415,6 @@ async function refreshBackups(){
     sel.innerHTML = '<option value="">Latest snapshot</option>' +
       b.images.map(i => `<option value="${esc(i.name)}">${esc(i.name)} (${esc(i.size)})</option>`).join('');
     if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
-  }catch(e){}
-}
-
-async function refreshJob(){
-  try{
-    const r = await fetch('/api/job'); if(!r.ok) return;
-    const j = await r.json();
-    document.querySelectorAll('.act').forEach(btn => btn.disabled = j.active);
-    document.querySelectorAll('.rs-btn').forEach(btn => btn.disabled = j.active);
-    // The input line appears only while an interactive job is actually running.
-    const ti = $('#term-in'), wantInput = !!j.interactive;
-    if (wantInput !== ti.classList.contains('on')){
-      ti.classList.toggle('on', wantInput);
-      if (wantInput) $('#term-line').focus();
-    }
-    if (j.label === null) return;
-    const st = j.active
-      ? `<b>${esc(j.label)}</b> <span class="live">running…</span> (${j.elapsed}s)`
-      : `<b>${esc(j.label)}</b> finished — ` + (j.rc === 0
-          ? '<span class="okrc">success</span>' : `<span class="badrc">FAILED (exit ${j.rc})</span>`)
-        + ` after ${j.elapsed}s (started ${esc(j.started)})`;
-    $('#jobstate').innerHTML = st;
-    const c = $('#console'), atEnd = c.scrollTop + c.clientHeight >= c.scrollHeight - 30;
-    c.textContent = termText(j.log || '') || '(no output yet)';
-    if (atEnd) c.scrollTop = c.scrollHeight;
-    if (jobWasActive && !j.active) { refreshBackups(); refreshSetup(); refreshStats(); }
-    jobWasActive = j.active;
   }catch(e){}
 }
 
@@ -1365,18 +1466,16 @@ document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => {
     p.classList.toggle('active', p.id === 'tab-' + b.dataset.tab));
 });
 
+// A backup, update or rollback that has just finished changes what is on disk
+// and how the box is doing — the reasons this page exists.
+onJobFinished = () => { refreshBackups(); refreshStats(); refreshSite(); };
+
 setInterval(() => $('#clock').textContent = new Date().toLocaleString(), 1000);
-refreshSetup(); refreshStats(); refreshBackups(); refreshJob();
+refreshSite(); refreshStats(); refreshBackups();
 setInterval(refreshStats, 5000);
 setInterval(refreshBackups, 60000);
-setInterval(refreshSetup, 30000);
-
-// Poll the job faster while one is running, so prompts and output feel
-// prompt to type against; idle back off when nothing is happening.
-(function pollJob(){
-  const next = () => setTimeout(pollJob, jobWasActive ? 1000 : 3000);
-  refreshJob().then(next, next);
-})();
+setInterval(refreshSite, 30000);
+pollJob();
 </script></body></html>"""
 
 

@@ -4,10 +4,17 @@ A small web interface for managing the SSPL ERP server from a browser on the LAN
 
 ## Layout
 
-One column: the **control panel** (setup switches, server health, actions,
-backups, upload), then a full-width **terminal** at the foot of the page
-showing the live output of whatever is running. Starting a job scrolls the
-terminal into view; drag its bottom edge to make it taller.
+Two pages, linked from the header:
+
+- **Dashboard** (`/`) — the day-to-day view: server health, actions, backups,
+  upload.
+- **ERP Next Installation suite** (`/install`) — installing the components onto
+  a new server. A one-off job, so it stays out of the way of the daily view.
+
+Each page is one column of cards, then a full-width **terminal** at the foot
+showing the live output of whatever is running. The panel runs one job at a
+time, so a job started on either page is readable from both. Starting a job
+scrolls the terminal into view; drag its bottom edge to make it taller.
 
 The terminal behaves like a console: you type into the terminal itself, not
 into a box beside it, and Enter submits. Output is rendered the way a
@@ -17,8 +24,8 @@ redraws read cleanly instead of as escape-code soup.
 
 ## Features
 
-- **Setup switches** — install the whole system from the browser: ERPNext
-  stack, backup system, and update/rollback scripts, each with a live
+- **ERP Next Installation suite** — install the whole system from the browser:
+  ERPNext stack, backup system, and update/rollback scripts, each with a live
   install log. The panel is the only thing you install by hand; everything
   else is a click. See [Panel-first setup](#panel-first-setup).
 - **Server health** — CPU usage, load average, memory/swap/disk meters, uptime,
@@ -48,8 +55,8 @@ redraws read cleanly instead of as escape-code soup.
 
 - Docker + Docker Compose on the server (the panel installs ERPNext for you)
 - Python 3 with `venv` (`sudo apt install python3-venv` if missing)
-- **This repository stays checked out on the server.** The Setup switches
-  run the installer scripts from the git checkout; its path is recorded as
+- **This repository stays checked out on the server.** The installation suite
+  runs the installer scripts from the git checkout; its path is recorded as
   `repo_dir` in `config.json`. Don't delete the clone after setup — and
   `git pull` there keeps the installers current.
 
@@ -74,8 +81,8 @@ Open `https://<server-ip>:8090` and log in.
 
 ## Panel-first setup
 
-Once logged in, the **Setup — install components** card at the top shows what
-is installed and lets you install the rest, in order:
+Once logged in, follow **ERP Next Installation suite** in the header. That page
+shows what is installed and lets you install the rest, in order:
 
 1. **ERPNext stack** — fill in the server IP, HTTP port, MariaDB root
    password, and Administrator password, then click *Install ERPNext*. This
@@ -85,9 +92,10 @@ is installed and lets you install the rest, in order:
    is installed (they reuse the deployed site name automatically). One click
    each.
 
-Each switch turns into an "installed ✓" status once done. After that you use
-the same page day-to-day: run backups, run updates, roll back, clear RAM, and
-watch server health.
+Each row turns into an "installed ✓" status once done. After that the
+installation suite has served its purpose, and the dashboard is the page you
+use day-to-day: run backups, run updates, roll back, clear RAM, and watch
+server health.
 
 The passwords you type into the ERP form are sent to the installer as
 environment variables over HTTPS and are **never written to the job log**.
@@ -179,7 +187,7 @@ To change the admin password or port, simply re-run `./setup_admin_panel.sh`.
 ## Configuration
 
 `/opt/sspl-admin/config.json` holds the credentials, port, and `repo_dir`
-(the git checkout the Setup switches install from). These optional keys
+(the git checkout the installation suite installs from). These optional keys
 override the default paths (useful for testing):
 
 ```json
@@ -197,14 +205,14 @@ override the default paths (useful for testing):
 ```
 
 If `repo_dir` is missing or the installer scripts aren't found there, the
-Setup card says so and the install switches are hidden — the operational
-buttons still work.
+installation suite says so and the install buttons are hidden — the dashboard's
+operational buttons still work.
 
 ## Security notes
 
 - Intended for the **trusted LAN only** — do not expose the port to the internet.
 - The service runs as root (required for docker, drop_caches, and reading
-  `/opt/backups`). All actions — including the Setup installs — map to fixed
+  `/opt/backups`). All actions — including the suite's installs — map to fixed
   scripts in the repo and the v2 directories; no arbitrary commands can be
   run from the web.
 - Install actions receive their inputs (site IP, passwords) as validated
