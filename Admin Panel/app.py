@@ -33,7 +33,7 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-07-16.7"
+PANEL_VERSION = "2026-07-16.8"
 FEATURES = ("ERP Next Installation suite page with rclone cloud backup setup "
             "covering full and DB-only backups, console-style terminal, "
             "guarded restore, delete uploads")
@@ -84,6 +84,7 @@ BACKUP_SETUP_SCRIPT = _repo("Backup/frappe_backup_system/setup_frappe_backups.sh
 UPDATE_SETUP_SCRIPT = _repo("Production Installation/update and rollback/install_update_rollback.sh")
 RCLONE_SETUP_SCRIPT = _repo("Backup/frappe_backup_system/install_rclone.sh")
 RCLONE_GUIDE = _repo("Backup/Rclone_Configuration_Guide.docx")
+UPDATE_TOOLING_SCRIPT = _repo("update_tooling.sh")
 
 INSTALL_ACTIONS = {
     "install_erp":     {"label": "Install ERPNext stack",   "cmd": ["bash", ERP_STACK_SCRIPT or ""]},
@@ -91,6 +92,8 @@ INSTALL_ACTIONS = {
                         "cwd": _repo("Backup/frappe_backup_system")},
     "install_update":  {"label": "Install update/rollback", "cmd": ["bash", UPDATE_SETUP_SCRIPT or ""]},
     "install_rclone":  {"label": "Install rclone",          "cmd": ["bash", RCLONE_SETUP_SCRIPT or ""]},
+    "update_tooling":  {"label": "Update v2 scripts & panel",
+                        "cmd": ["bash", UPDATE_TOOLING_SCRIPT or ""]},
 }
 if REPO_DIR:
     ACTIONS.update(INSTALL_ACTIONS)
@@ -452,6 +455,48 @@ def rclone_status():
     }
 
 
+def cron_status():
+    """The backup-related entries in root's crontab.
+
+    The panel runs as root, so 'crontab -l' reads the same crontab that
+    setup_frappe_backups.sh writes the schedule into — what you'd see over
+    SSH with 'sudo crontab -l'."""
+    try:
+        out = subprocess.run(["crontab", "-l"], capture_output=True,
+                             text=True, timeout=10)
+        lines = out.stdout.splitlines() if out.returncode == 0 else []
+    except (OSError, subprocess.SubprocessError):
+        lines = []
+    jobs = []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        if SCRIPTS_DIR in ln or "frappe" in ln.lower():
+            parts = ln.split(None, 5)
+            if len(parts) == 6:
+                jobs.append({"schedule": " ".join(parts[:5]), "command": parts[5]})
+    return {"jobs": jobs}
+
+
+def repo_panel_version():
+    """PANEL_VERSION of the checkout's app.py — differs from the running
+    PANEL_VERSION when a git pull brought a newer panel that hasn't been
+    deployed yet."""
+    path = _repo("Admin Panel/app.py")
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as f:
+            for ln in f:
+                if ln.startswith("PANEL_VERSION"):
+                    m = re.search(r'"([^"]+)"', ln)
+                    return m.group(1) if m else None
+    except OSError:
+        pass
+    return None
+
+
 def setup_status():
     """What is installed on this server, to drive the Setup switches."""
     cs = container_status()
@@ -473,6 +518,9 @@ def setup_status():
             "update":  {"installed": os.path.isfile(os.path.join(UPDATE_DIR, "sspl-erp-common.sh"))},
             "rclone":  rclone_status(),
         },
+        "cron": cron_status(),
+        "panel_version": PANEL_VERSION,
+        "repo_panel_version": repo_panel_version(),
         "guide_ok": bool(RCLONE_GUIDE) and os.path.isfile(RCLONE_GUIDE),
     }
 
@@ -802,6 +850,12 @@ def _install_env(name, data):
     # installed before it (unlike the two below, which read the site name).
     if name == "install_rclone":
         return {}, None
+
+    # The tooling updater restarts the panel service at the end, which would
+    # kill its own job — the flag tells it to defer that restart until after
+    # the job has finished (see update_tooling.sh).
+    if name == "update_tooling":
+        return {"SSPL_FROM_PANEL": "1"}, None
 
     # backups / update: derive the site name from the deployed ERP stack
     site = deployed_site_name()
@@ -1290,6 +1344,14 @@ INSTALL_HTML = """<!doctype html><html><head><meta charset="utf-8">
 </main>
 <script>
 """ + TERM_JS + r"""
+// The three schedules setup_frappe_backups.sh installs, in words. Anything
+// else (a hand-edited crontab) just shows its raw cron field.
+function cronWords(sch){
+  return {'0 2 * * *': 'daily at 02:00',
+          '0 */6 * * *': 'every 6 hours',
+          '0 3 * * 0': 'Sundays at 03:00'}[sch] || '';
+}
+
 function pill(ok){ return ok ? '<span class="badge ok">installed ✓</span>'
                              : '<span class="badge miss">not installed</span>'; }
 function stagePill(ok, okText, missText){
@@ -1461,6 +1523,34 @@ async function refreshSetup(){
     }
     rows += `</div>`;
     rows += rcloneRow(s);
+    // Scheduled backups: what root's crontab will actually run, and when
+    const cj = (s.cron && s.cron.jobs) || [];
+    rows += `<div class="setup-row"><div class="setup-h"><b>Scheduled backups (cron)</b> `
+      + (cj.length ? `<span class="badge ok">${cj.length} job${cj.length===1?'':'s'} scheduled ✓</span>`
+                   : '<span class="badge miss">nothing scheduled</span>') + `</div>`;
+    for(const j of cj){
+      const w = cronWords(j.schedule);
+      rows += `<div class="note"><code>${esc(j.schedule)}</code>${w?' — '+w:''} — <code>${esc(j.command)}</code></div>`;
+    }
+    rows += cj.length
+      ? `<div class="note">This is root's crontab — the same list <code>sudo crontab -l</code> shows over SSH.</div>`
+      : `<div class="note">The backup system installer schedules these (keep its cron checkbox ticked` +
+        (c.backups.installed ? ' — re-run it to add the schedule' : '') +
+        `). Over SSH: <code>sudo crontab -l</code>.</div>`;
+    rows += `</div>`;
+    // Tooling updates: deploy the checkout's v2 scripts + panel from here
+    const upd = s.repo_panel_version && s.repo_panel_version !== s.panel_version;
+    rows += `<div class="setup-row"><div class="setup-h"><b>Tooling updates (v2 scripts &amp; panel)</b> `
+      + (upd ? `<span class="badge miss">checkout has v${esc(s.repo_panel_version)}</span>`
+             : '<span class="badge ok">panel matches the checkout ✓</span>') + `</div>
+      <div class="note">Panel running v${esc(s.panel_version||'')}. To fetch newer tooling, run
+        <code>git pull</code> in <code>${esc(s.repo_dir||'')}</code> over SSH, then deploy it here.
+        Settings (site name, cloud remote, retention, panel credentials) are preserved;
+        cron jobs are not changed.</div>
+      <div class="setup-form">
+        <button class="primary setup-install" data-inst="update_tooling"
+          data-confirm="Deploy the repo checkout's v2 scripts and panel now? Settings are preserved. The panel restarts itself a few seconds after the job finishes — reload the page then.">Update v2 scripts &amp; panel</button>
+      </div></div>`;
     const allDone = erpDone && c.backups.installed && c.update.installed;
     $('#setup-body').innerHTML =
       (allDone ? '<p style="color:var(--ok);margin:0 0 6px">✓ All components are installed. ' +

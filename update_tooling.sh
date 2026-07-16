@@ -107,6 +107,23 @@ if [ -f "$PANEL_DST/config.json" ]; then
     if [ -f /etc/systemd/system/sspl-admin.service ]; then
         sudo cp "$PANEL_SRC/sspl-admin.service" /etc/systemd/system/
         sudo systemctl daemon-reload
+        if [ "$SSPL_FROM_PANEL" = "1" ]; then
+            # Run as a panel job, this script lives inside the sspl-admin
+            # service's cgroup: restarting the service here would kill this
+            # very script mid-run. Schedule the restart as a transient systemd
+            # timer instead — it fires outside our cgroup, a moment after this
+            # job has finished cleanly.
+            echo "   → Scheduling the panel restart (this job must finish first)..."
+            if sudo systemd-run --on-active=3 --timer-property=AccuracySec=1s \
+                    systemctl restart sspl-admin >/dev/null 2>&1; then
+                echo "   ✓ The panel restarts itself into v$PANEL_VER a few seconds"
+                echo "     after this job ends — reload the page then."
+            else
+                echo "   ❌ could not schedule the restart — the new app.py is in place;"
+                echo "      restart manually: sudo systemctl restart sspl-admin"
+                exit 1
+            fi
+        else
         echo "   → Restarting sspl-admin service..."
         if sudo systemctl restart sspl-admin; then
             sleep 2
@@ -120,6 +137,7 @@ if [ -f "$PANEL_DST/config.json" ]; then
         else
             echo "   ❌ could not restart sspl-admin — check: sudo journalctl -u sspl-admin -n 30"
             exit 1
+        fi
         fi
     else
         echo "   ⚠ /etc/systemd/system/sspl-admin.service not found, so the panel was"

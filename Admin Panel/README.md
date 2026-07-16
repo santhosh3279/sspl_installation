@@ -213,9 +213,18 @@ Updating is two steps, and missing the second is the usual reason a new
 feature doesn't appear:
 
 1. `git pull && ./update_tooling.sh` — copies the new `app.py` **and**
-   restarts the service. It prints the version it installed.
+   restarts the service. It prints the version it installed. The
+   `./update_tooling.sh` half can also be run from the suite's **Tooling
+   updates** row (*Update v2 scripts & panel*): run as a panel job it defers
+   its own service restart a few seconds so the job can finish cleanly —
+   `git pull` still happens over SSH first.
 2. **Hard-refresh the browser** (Ctrl+Shift+R). The page's HTML, CSS and JS
    are served inline, so a cached page looks identical to old code.
+
+The suite also has a **Scheduled backups (cron)** row showing the
+backup-related entries in root's crontab — the same list `sudo crontab -l`
+prints over SSH (daily full backup at 02:00, DB-only every 6 hours, verify on
+Sundays at 03:00, if you let the backup installer schedule them).
 
 If the badge still shows an old version after both, the service didn't
 restart: `sudo systemctl restart sspl-admin`, then
@@ -279,11 +288,13 @@ operational buttons still work.
 - Install actions receive their inputs (site IP, passwords) as validated
   environment variables passed to the script, never as shell arguments and
   never echoed to the job log.
-- Don't restart the `sspl-admin` service (or run `update_tooling.sh`) while
-  an install or backup job is running: the panel tracks the running job in
-  memory, so a restart loses the handle and the terminal will show "no
-  job" even though the underlying script keeps running to completion. Check
-  `/opt/sspl-admin/jobs/*.log` if in doubt.
+- Don't restart the `sspl-admin` service (or run `update_tooling.sh` over
+  SSH) while an install or backup job is running: the panel tracks the
+  running job in memory, so a restart loses the handle and the terminal will
+  show "no job" even though the underlying script keeps running to
+  completion. Check `/opt/sspl-admin/jobs/*.log` if in doubt. (The suite's
+  own *Update v2 scripts & panel* button is safe: jobs are one-at-a-time, and
+  it defers the panel restart until its job has finished.)
 - **Restore** overwrites live data, so it is gated three ways, all checked
   server-side: your panel password is re-entered, the live site name is
   typed out in full, and the source must resolve to a real backup folder
