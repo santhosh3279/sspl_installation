@@ -44,7 +44,10 @@ redraws read cleanly instead of as escape-code soup.
   the foot of the page; type into it directly when a job asks a question;
   only one job can run at a time
 - **Backup browser** — full backups (with DB/Files/Private completeness badges),
-  DB-only dumps, Docker image snapshots, uploads — all downloadable
+  DB-only dumps, Docker image snapshots, uploads — all downloadable. Each
+  table shows 3 rows and scrolls for the rest. A **Clear backups older than
+  30 days** button deletes aged full and DB-only backups, always keeping the
+  newest of each (however old); uploads and image snapshots are never touched
 - **Upload backup files** to the server (stored under
   `/opt/backups/frappe/uploads/`, optionally in a named subfolder), and
   **delete** them again — files or whole folders. Deleting is confined to

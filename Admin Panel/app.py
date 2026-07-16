@@ -33,7 +33,7 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-07-16.3"
+PANEL_VERSION = "2026-07-16.4"
 FEATURES = ("ERP Next Installation suite page with rclone cloud backup setup "
             "covering full and DB-only backups, console-style terminal, "
             "guarded restore, delete uploads")
@@ -863,6 +863,55 @@ def api_clear_ram():
                     "available": human(after)})
 
 
+CLEAR_OLD_DAYS = 30
+
+
+@app.route("/api/backups/clear-old", methods=["POST"])
+@login_required
+def api_clear_old_backups():
+    """Delete full and DB-only backups older than CLEAR_OLD_DAYS.
+
+    The newest full backup and the newest DB-only dump survive regardless of
+    age: a cleanup must never leave the server with no backup at all. Uploads
+    and image snapshots are untouched — uploads have their own delete buttons,
+    and snapshots are what a rollback runs from. Age is mtime, the same clock
+    the cron retention (find -mtime) uses."""
+    cutoff = time.time() - CLEAR_OLD_DAYS * 86400
+    deleted, freed, errors = 0, 0, []
+    full = sorted((d for d in BACKUP_DIR.iterdir()
+                   if d.is_dir() and FULL_BACKUP_RE.match(d.name)),
+                  key=lambda d: d.name, reverse=True) if BACKUP_DIR.is_dir() else []
+    for d in full[1:]:                       # [0] is the newest — always kept
+        try:
+            if d.stat().st_mtime >= cutoff:
+                continue
+            size = sum(p.stat().st_size for p in d.rglob("*") if p.is_file())
+            shutil.rmtree(d)
+        except OSError as e:
+            errors.append(f"{d.name}: {e}")
+            continue
+        deleted += 1
+        freed += size
+    dumps = sorted((p for p in DB_ONLY_DIR.iterdir() if p.is_file()),
+                   key=lambda p: p.stat().st_mtime,
+                   reverse=True) if DB_ONLY_DIR.is_dir() else []
+    for p in dumps[1:]:
+        try:
+            if p.stat().st_mtime >= cutoff:
+                continue
+            size = p.stat().st_size
+            p.unlink()
+        except OSError as e:
+            errors.append(f"{p.name}: {e}")
+            continue
+        deleted += 1
+        freed += size
+    if errors:
+        return jsonify({"error": f"deleted {deleted}, but some could not be "
+                                 f"removed: {'; '.join(errors[:3])}"}), 500
+    return jsonify({"ok": True, "deleted": deleted, "freed": human(freed)})
+
+
 @app.route("/upload", methods=["POST"])
 @login_required
 def upload():
@@ -1438,6 +1487,10 @@ details{margin:2px 0} details summary{cursor:pointer}
 .tabs{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap}
 .tabs button.active{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
 .tabpane{display:none} .tabpane.active{display:block}
+/* Backup tables show ~3 rows; the rest scroll inside the pane (capRows sets
+   the exact height, since row height differs per tab). */
+.scrollrows{overflow-y:auto}
+.scrollrows thead th{position:sticky;top:0;background:var(--surface);z-index:1}
 .right{text-align:right}
 /* restore confirmation modal */
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;
@@ -1511,6 +1564,11 @@ details{margin:2px 0} details summary{cursor:pointer}
   <div class="tabpane" id="tab-db"></div>
   <div class="tabpane" id="tab-img"></div>
   <div class="tabpane" id="tab-upl"></div>
+  <div style="display:flex;gap:10px;align-items:center;margin-top:12px">
+    <button id="clear-old" class="danger"
+      data-confirm="Delete full and DB-only backups older than 30 days? The newest of each is always kept, however old. Uploads and image snapshots are not touched.">Clear backups older than 30 days</button>
+    <span id="clear-old-msg" style="font-size:13px;color:var(--ink-2)"></span>
+  </div>
 </div>
 
 <div class="card"><h2>Upload backup files to the server</h2>
@@ -1677,21 +1735,21 @@ async function refreshBackups(){
   try{
     const r = await fetch('/api/backups'); if(!r.ok) return;
     const b = await r.json();
-    $('#tab-full').innerHTML = b.full.length ? `<table><thead><tr><th>Backup</th><th>Size</th>
+    $('#tab-full').innerHTML = b.full.length ? `<div class="scrollrows"><table><thead><tr><th>Backup</th><th>Size</th>
       <th>Contents</th><th class="right">Files</th><th></th></tr></thead><tbody>` +
       b.full.map(d => `<tr><td class="num">${esc(d.name)}</td><td class="num">${esc(d.size)}</td>
         <td>${fileBadge(d.db,'DB')} ${fileBadge(d.public,'Files')} ${fileBadge(d.private,'Private')}</td>
         <td class="right"><details><summary>${d.files.length} files</summary><div class="filelist">` +
         d.files.map(f => `${esc(f.name)} (${esc(f.size)}) — ${dl('full', d.name + '/' + f.name)}`).join('<br>') +
         `</div></details></td><td class="right">${restoreBtn(d.db, 'full', d.name)}</td></tr>`).join('') +
-        '</tbody></table>'
+        '</tbody></table></div>'
       : '<p style="color:var(--muted)">No full backups found.</p>';
-    const simpleTable = (rows, kind, deletable) => rows.length ? `<table><thead><tr><th>File</th><th>Size</th>
+    const simpleTable = (rows, kind, deletable) => rows.length ? `<div class="scrollrows"><table><thead><tr><th>File</th><th>Size</th>
       <th>Date</th><th></th></tr></thead><tbody>` +
       rows.map(f => `<tr><td class="num">${esc(f.name)}${f.latest?' <span class="badge ok">latest</span>':''}</td>
         <td class="num">${esc(f.size)}</td><td class="num">${esc(f.mtime)}</td>
         <td class="right">${dl(kind, f.name)}${deletable ? ' ' + delBtn(f.name, 'file') : ''}</td></tr>`).join('') +
-        '</tbody></table>'
+        '</tbody></table></div>'
       : '<p style="color:var(--muted)">Nothing here yet.</p>';
     // Only uploads are deletable — real backups and snapshots are not.
     $('#tab-db').innerHTML = simpleTable(b.db_only, 'db');
@@ -1710,8 +1768,31 @@ async function refreshBackups(){
     sel.innerHTML = '<option value="">Latest snapshot</option>' +
       b.images.map(i => `<option value="${esc(i.name)}">${esc(i.name)} (${esc(i.size)})</option>`).join('');
     if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
+    capRows();
   }catch(e){}
 }
+
+// Show 3 rows per backup table, the rest behind a scrollbar. Measured from
+// the real 4th row rather than a fixed height, because the tabs' row heights
+// differ. Hidden panes measure as 0, so this runs again on tab switch.
+function capRows(){
+  document.querySelectorAll('.tabpane.active .scrollrows').forEach(box => {
+    const rows = box.querySelectorAll('tbody tr');
+    box.style.maxHeight = (rows.length > 3 && rows[3].offsetTop > 0)
+      ? rows[3].offsetTop + 'px' : '';
+  });
+}
+
+$('#clear-old').onclick = async () => {
+  if (!confirm($('#clear-old').dataset.confirm)) return;
+  $('#clear-old-msg').textContent = 'Clearing…';
+  const r = await fetch('/api/backups/clear-old', {method:'POST'});
+  const j = await r.json();
+  $('#clear-old-msg').textContent = j.error ? j.error
+    : (j.deleted ? `Deleted ${j.deleted} old backup${j.deleted===1?'':'s'} — freed ${j.freed}`
+                 : 'Nothing older than 30 days to delete');
+  refreshBackups();
+};
 
 document.querySelectorAll('.act').forEach(btn => btn.onclick = async () => {
   const act = btn.dataset.act;
@@ -1759,6 +1840,7 @@ document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => {
   document.querySelectorAll('.tabs button').forEach(x => x.classList.toggle('active', x === b));
   document.querySelectorAll('.tabpane').forEach(p =>
     p.classList.toggle('active', p.id === 'tab-' + b.dataset.tab));
+  capRows();
 });
 
 // A backup, update or rollback that has just finished changes what is on disk
