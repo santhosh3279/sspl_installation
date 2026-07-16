@@ -33,9 +33,9 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-07-16.1"
-FEATURES = ("ERP Next Installation suite page, console-style terminal, "
-            "guarded restore, delete uploads")
+PANEL_VERSION = "2026-07-16.2"
+FEATURES = ("ERP Next Installation suite page with rclone cloud backup setup, "
+            "console-style terminal, guarded restore, delete uploads")
 
 CONFIG_FILE = os.environ.get("SSPL_ADMIN_CONFIG", "/opt/sspl-admin/config.json")
 with open(CONFIG_FILE) as f:
@@ -81,15 +81,29 @@ ACTIONS = {
 ERP_STACK_SCRIPT = _repo("Production Installation/install_erp_stack.sh")
 BACKUP_SETUP_SCRIPT = _repo("Backup/frappe_backup_system/setup_frappe_backups.sh")
 UPDATE_SETUP_SCRIPT = _repo("Production Installation/update and rollback/install_update_rollback.sh")
+RCLONE_SETUP_SCRIPT = _repo("Backup/frappe_backup_system/install_rclone.sh")
+RCLONE_GUIDE = _repo("Backup/Rclone_Configuration_Guide.docx")
 
 INSTALL_ACTIONS = {
     "install_erp":     {"label": "Install ERPNext stack",   "cmd": ["bash", ERP_STACK_SCRIPT or ""]},
     "install_backups": {"label": "Install backup system",   "cmd": ["bash", BACKUP_SETUP_SCRIPT or ""],
                         "cwd": _repo("Backup/frappe_backup_system")},
     "install_update":  {"label": "Install update/rollback", "cmd": ["bash", UPDATE_SETUP_SCRIPT or ""]},
+    "install_rclone":  {"label": "Install rclone",          "cmd": ["bash", RCLONE_SETUP_SCRIPT or ""]},
 }
 if REPO_DIR:
     ACTIONS.update(INSTALL_ACTIONS)
+
+# The backup script the panel wires a cloud remote into. Its RCLONE_REMOTE line
+# is the switch that decides whether "Run full backup" uploads anywhere: empty
+# means local-only, and the script treats a failed upload as a warning, so a
+# misconfigured remote still reports a successful backup.
+DEPLOYED_BACKUP_SCRIPT = os.path.join(SCRIPTS_DIR, "frappe_backup.sh")
+RCLONE_LINE_RE = re.compile(r"^RCLONE_REMOTE=.*$", re.M)
+# Reads the current value out of that line: RCLONE_REMOTE="gdrive:backups" # note
+RCLONE_VALUE_RE = re.compile(r"""^RCLONE_REMOTE=(?:"([^"]*)"|'([^']*)'|([^\s#]*))""", re.M)
+RCLONE_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,40}:$")
+RCLONE_PATH_RE = re.compile(r"^[A-Za-z0-9_.\-][A-Za-z0-9_.\-/]{0,120}$")
 
 IP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.\-]{0,60}$")
 
@@ -335,6 +349,71 @@ def first_ip():
         return ""
 
 
+def rclone_remotes():
+    """Cloud remotes rclone can see, as root — the user the backup job runs as.
+
+    stdin is closed deliberately: if the config is password-protected rclone
+    prompts for it, and this runs on a 30s status poll with nobody to answer."""
+    try:
+        out = subprocess.run(["rclone", "listremotes"], capture_output=True,
+                             text=True, timeout=15, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0:
+        return []
+    return [ln.strip() for ln in out.stdout.splitlines()
+            if RCLONE_NAME_RE.match(ln.strip())]
+
+
+def rclone_version():
+    try:
+        out = subprocess.run(["rclone", "version"], capture_output=True,
+                             text=True, timeout=15, stdin=subprocess.DEVNULL)
+        return out.stdout.splitlines()[0].strip() if out.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, IndexError):
+        return None
+
+
+def wired_remote():
+    """The remote the deployed backup script uploads to, '' if local-only."""
+    try:
+        with open(DEPLOYED_BACKUP_SCRIPT) as f:
+            m = RCLONE_VALUE_RE.search(f.read())
+    except OSError:
+        return None                      # backup system isn't installed
+    if not m:
+        return None
+    return next((g for g in m.groups() if g is not None), "")
+
+
+def rclone_status():
+    """The three stages of cloud backup, reported separately.
+
+    All three have to be true before a backup actually reaches the cloud, and
+    each fails quietly on its own: an installed binary uploads nothing without
+    a remote, and a configured remote uploads nothing until the backup script
+    points at it. A single "installed" pill here would be a lie."""
+    installed = bool(shutil.which("rclone"))
+    remotes = rclone_remotes() if installed else []
+    wired = wired_remote()
+    # The backup script naming a remote is not the same as that remote
+    # existing. "gdrive:frappe-backups" is the example in the setup guide, so
+    # it is exactly what a hand-edit leaves behind on a server whose remote is
+    # actually called something else — and the upload failure is only a
+    # warning, so every backup would report success while uploading nothing.
+    wired_ok = bool(wired) and any(wired.startswith(r) for r in remotes)
+    return {
+        "installed": installed,
+        "version": rclone_version() if installed else None,
+        "remotes": remotes,
+        "configured": bool(remotes),
+        "backups_installed": wired is not None,
+        "wired": wired or "",
+        "wired_ok": wired_ok,
+        "ready": bool(installed and wired_ok),
+    }
+
+
 def setup_status():
     """What is installed on this server, to drive the Setup switches."""
     cs = container_status()
@@ -351,9 +430,11 @@ def setup_status():
                 "running": running,
                 "site": deployed_site_name(),
             },
-            "backups": {"installed": os.path.isfile(os.path.join(SCRIPTS_DIR, "frappe_backup.sh"))},
+            "backups": {"installed": os.path.isfile(DEPLOYED_BACKUP_SCRIPT)},
             "update":  {"installed": os.path.isfile(os.path.join(UPDATE_DIR, "sspl-erp-common.sh"))},
+            "rclone":  rclone_status(),
         },
+        "guide_ok": bool(RCLONE_GUIDE) and os.path.isfile(RCLONE_GUIDE),
     }
 
 
@@ -667,6 +748,11 @@ def _install_env(name, data):
                 "DB_PASSWORD": db_pw, "ADMIN_PASSWORD": admin_pw,
                 "SSPL_ERP_DIR": ERP_DIR}, None
 
+    # rclone is just a binary — it needs nothing from the ERP stack, and can be
+    # installed before it (unlike the two below, which read the site name).
+    if name == "install_rclone":
+        return {}, None
+
     # backups / update: derive the site name from the deployed ERP stack
     site = deployed_site_name()
     if not site:
@@ -676,6 +762,63 @@ def _install_env(name, data):
         return {"SSPL_SITE_NAME": site, "SSPL_RUN_TEST": "no",
                 "SSPL_INSTALL_CRON": "yes" if schedule else "no"}, None
     return {"SERVER_IP": site, "SSPL_ERP_DIR": ERP_DIR}, None  # install_update
+
+
+@app.route("/api/rclone/wire", methods=["POST"])
+@login_required
+def api_rclone_wire():
+    """Point the deployed backup script at a cloud remote.
+
+    The remote name must be one rclone actually reports: a typo here would not
+    fail the backup — the upload failure is only a warning — so it would show
+    green while nothing ever reached the cloud."""
+    data = request.get_json(silent=True) or {}
+    remote = str(data.get("remote", "")).strip()
+    path = str(data.get("path", "")).strip().strip("/")
+    if not RCLONE_NAME_RE.match(remote):
+        return jsonify({"error": "choose a remote"}), 400
+    if remote not in rclone_remotes():
+        return jsonify({"error": f"rclone does not know a remote called '{remote}' — "
+                                 "configure it with 'sudo rclone config' over SSH"}), 400
+    if path and (not RCLONE_PATH_RE.match(path) or ".." in path):
+        return jsonify({"error": "folder may only use letters, digits, . - _ and /"}), 400
+    target = remote + path
+    try:
+        with open(DEPLOYED_BACKUP_SCRIPT) as f:
+            text = f.read()
+        mode = os.stat(DEPLOYED_BACKUP_SCRIPT).st_mode & 0o7777
+    except OSError:
+        return jsonify({"error": "the backup system is not installed on this server yet"}), 400
+    # Replace the whole line, not the empty-string literal: re-pointing an
+    # already-wired script has to work too.
+    new_text, n = RCLONE_LINE_RE.subn(
+        f'RCLONE_REMOTE="{target}"  # set from the admin panel', text, count=1)
+    if n != 1:
+        return jsonify({"error": "could not find the RCLONE_REMOTE line in "
+                                 f"{DEPLOYED_BACKUP_SCRIPT}"}), 500
+    # Write via a temp file in the same directory, so a failure here can never
+    # leave a half-written backup script behind.
+    tmp = DEPLOYED_BACKUP_SCRIPT + ".panel-tmp"
+    try:
+        with open(tmp, "w") as f:
+            f.write(new_text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, DEPLOYED_BACKUP_SCRIPT)
+    except OSError as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return jsonify({"error": f"could not write the backup script: {e}"}), 500
+    return jsonify({"ok": True, "wired": target})
+
+
+@app.route("/guide/rclone")
+@login_required
+def rclone_guide():
+    if not RCLONE_GUIDE or not os.path.isfile(RCLONE_GUIDE):
+        abort(404)
+    return send_file(RCLONE_GUIDE, as_attachment=True)
 
 
 @app.route("/api/clear-ram", methods=["POST"])
@@ -986,6 +1129,17 @@ SETUP_CSS = """
 .setup-form{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px}
 .setup-form input[type=text],.setup-form input[type=password],.setup-form input:not([type]){
   padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--ink)}
+/* the rclone row: three stages, each with its own status line */
+.stage{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin:6px 0 0 14px;font-size:13px}
+.stage .n{color:var(--muted);font-variant-numeric:tabular-nums;min-width:14px}
+.stage .t{color:var(--ink-2)}
+.note{font-size:12.5px;color:var(--muted);margin:4px 0 0 36px}
+.guide{margin:10px 0 0 14px;font-size:13px}
+.guide summary{cursor:pointer;color:var(--accent)}
+.guide ol{margin:8px 0;padding-left:20px;color:var(--ink-2);line-height:1.7}
+.guide code{background:var(--track);border-radius:4px;padding:1px 5px;
+  font:12px ui-monospace,Menlo,Consolas,monospace}
+.guide .why{border-left:2px solid var(--hairline);padding-left:10px;margin:8px 0;color:var(--muted)}
 """
 
 INSTALL_HTML = """<!doctype html><html><head><meta charset="utf-8">
@@ -1019,6 +1173,108 @@ INSTALL_HTML = """<!doctype html><html><head><meta charset="utf-8">
 """ + TERM_JS + r"""
 function pill(ok){ return ok ? '<span class="badge ok">installed ✓</span>'
                              : '<span class="badge miss">not installed</span>'; }
+function stagePill(ok, okText, missText){
+  return ok ? `<span class="badge ok">${esc(okText)} ✓</span>`
+            : `<span class="badge miss">${esc(missText)}</span>`; }
+
+// Cloud backup is three separate things, and all three must be true before a
+// backup leaves the server. Each is shown on its own line, because each one
+// fails silently: the upload is a warning inside frappe_backup.sh, so a full
+// backup still reports success when nothing was uploaded.
+function rcloneRow(s){
+  const r = (s.components && s.components.rclone) || {};
+  let h = `<div class="setup-row"><div class="setup-h"><b>Cloud backup (rclone)</b> `
+    + (r.ready ? '<span class="badge ok">set up ✓</span>'
+               : '<span class="badge miss">not set up</span>')
+    + (r.ready ? ` <span class="badge">uploading to ${esc(r.wired)}</span>` : '') + `</div>`;
+
+  // 1. the binary
+  h += `<div class="stage"><span class="n">1.</span>
+        <span class="t">rclone installed</span>
+        ${stagePill(r.installed, 'installed', 'not installed')}`;
+  if(!r.installed){
+    h += `<button class="primary setup-install" data-inst="install_rclone"
+           data-confirm="Install rclone on this server? It downloads the official rclone binary.">Install rclone</button>`;
+  }
+  h += `</div>`;
+  if(r.installed && r.version) h += `<div class="note">${esc(r.version)}</div>`;
+
+  // 2. the cloud account — deliberately not a button; see the guide text below
+  h += `<div class="stage"><span class="n">2.</span>
+        <span class="t">Cloud account connected</span>
+        ${stagePill(r.configured, (r.remotes||[]).join(' ') || 'connected', 'no remote configured')}
+        </div>`;
+  if(r.installed && !r.configured){
+    h += `<div class="note">Run <code>sudo rclone config</code> over SSH — see the setup guide below.</div>`;
+  }
+
+  // 3. wiring the remote into the backup script
+  h += `<div class="stage"><span class="n">3.</span>
+        <span class="t">Backups upload to it</span>
+        ${stagePill(r.wired_ok, r.wired || 'wired', r.wired || 'backups stay local only')}</div>`;
+  // Wired to a remote rclone has never heard of: every backup would log an
+  // upload failure and still report success. Say so rather than showing green.
+  if(r.wired && !r.wired_ok){
+    h += `<div class="note" style="color:var(--crit)">Backups point at
+      <code>${esc(r.wired)}</code>, but rclone has no such remote${r.installed ? '' : ' (rclone is not installed)'} —
+      uploads are failing silently. Pick a remote below.</div>`;
+  }
+  if(!r.backups_installed){
+    h += `<div class="note">Install the backup system first.</div>`;
+  } else if(r.configured){
+    h += `<div class="setup-form" style="margin-left:14px">
+      <select id="rc-remote">` + (r.remotes||[]).map(x =>
+        `<option value="${esc(x)}" ${r.wired && r.wired.startsWith(x) ? 'selected' : ''}>${esc(x)}</option>`).join('')
+      + `</select>
+      <input type="text" id="rc-path" size="16" placeholder="folder"
+             value="${esc(r.wired ? r.wired.replace(/^[^:]*:/, '') : 'frappe-backups')}">
+      <button class="primary" id="rc-wire">${r.wired ? 'Update destination' : 'Upload backups here'}</button>
+      <span id="rc-msg" style="font-size:13px;color:var(--ink-2)"></span></div>`;
+  }
+
+  // the guide: the OAuth step can't be a button, so explain it properly
+  h += `<details class="guide"><summary>Setup guide — connecting a Google account</summary>
+    <div class="why">Step 2 is not a button. Connecting the account is an OAuth flow that
+    needs a browser, and on the way through <code>rclone config</code> prints the account's
+    long-lived token. Run as a panel job that token would be written to the job log and shown
+    in the terminal to anyone signed in here — so it is done over SSH instead.</div>
+    <ol>
+      <li>SSH to the server and run <code>sudo rclone config</code>.
+        <b>Use sudo</b> — backups run as root, and rclone only sees the config of the user
+        that created it.</li>
+      <li><code>n</code> for a new remote, name it <code>gdrive</code>, choose storage
+        <code>drive</code> (Google Drive).</li>
+      <li>Press Enter through client_id / client_secret, choose scope <code>1</code>
+        (full access), and answer <code>n</code> to advanced config.</li>
+      <li><b>Answer <code>n</code> to "Use auto config?"</b> — this server has no browser.</li>
+      <li>rclone prints a command to run on your own computer
+        (<code>rclone authorize "drive"</code>). Run it there, sign in to Google, then paste
+        the result back into the SSH session.</li>
+      <li>Confirm with <code>y</code>, then <code>q</code> to quit.</li>
+      <li>Come back here — the remote appears at step 2, and step 3 points backups at it.</li>
+    </ol>
+    ${s.guide_ok ? '<p><a href="/guide/rclone">Download the full guide (.docx)</a> — also covers '
+      + 'AWS S3, Dropbox, testing a remote, and encrypting the rclone config.</p>' : ''}
+    <p class="why">Re-running <code>setup_frappe_backups.sh</code> overwrites the backup script
+    and clears step 3, so check this page after reinstalling backups. <code>update_tooling.sh</code>
+    keeps it.</p>
+  </details>`;
+  return h + `</div>`;
+}
+
+async function wireRclone(){
+  const btn = $('#rc-wire'), msg = $('#rc-msg');
+  btn.disabled = true; msg.textContent = 'Saving…';
+  try{
+    const r = await fetch('/api/rclone/wire', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({remote: $('#rc-remote').value, path: $('#rc-path').value.trim()})});
+    const j = await r.json();
+    if(j.error){ msg.textContent = j.error; btn.disabled = false; return; }
+    msg.textContent = 'Saved — backups now upload to ' + j.wired;
+    refreshSetup();
+  }catch(e){ msg.textContent = 'request failed'; btn.disabled = false; }
+}
 
 async function refreshSetup(){
   try{
@@ -1066,11 +1322,13 @@ async function refreshSetup(){
         + (erpDone?'':'<span style="color:var(--muted);font-size:12px">install ERPNext first</span>') + `</div>`;
     }
     rows += `</div>`;
+    rows += rcloneRow(s);
     const allDone = erpDone && c.backups.installed && c.update.installed;
     $('#setup-body').innerHTML =
       (allDone ? '<p style="color:var(--ok);margin:0 0 6px">✓ All components are installed. ' +
                  'Run the server from the <a href="/">dashboard</a>.</p>' : '') + rows;
     document.querySelectorAll('.setup-install').forEach(btn => btn.onclick = () => installComponent(btn));
+    if ($('#rc-wire')) $('#rc-wire').onclick = wireRclone;
     // A job started from the dashboard (or a second browser tab) still owns the
     // panel: re-disable the buttons the render above has just recreated.
     if (jobWasActive) document.querySelectorAll('.setup-install').forEach(b => b.disabled = true);

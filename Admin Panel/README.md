@@ -28,6 +28,9 @@ redraws read cleanly instead of as escape-code soup.
   ERPNext stack, backup system, and update/rollback scripts, each with a live
   install log. The panel is the only thing you install by hand; everything
   else is a click. See [Panel-first setup](#panel-first-setup).
+- **Cloud backup (rclone)** — install rclone and point backups at a cloud
+  remote from the suite, with the three stages reported separately so a
+  half-finished setup can't look finished. See [Cloud backup](#cloud-backup).
 - **Server health** — CPU usage, load average, memory/swap/disk meters, uptime,
   live ERP container status
 - **Clear RAM caches** button (`sync` + drop_caches — safe, caches rebuild automatically)
@@ -96,6 +99,45 @@ Each row turns into an "installed ✓" status once done. After that the
 installation suite has served its purpose, and the dashboard is the page you
 use day-to-day: run backups, run updates, roll back, clear RAM, and watch
 server health.
+
+## Cloud backup
+
+By default a backup stays on the server: `frappe_backup.sh` only uploads when
+its `RCLONE_REMOTE` is set, and it ships empty. The **Cloud backup (rclone)**
+row in the installation suite sets that up, and reports the three stages
+separately — all three must be green before a backup leaves the machine:
+
+1. **rclone installed** — the *Install rclone* button. Uses the official
+   installer rather than apt, because a distro rclone can be old enough to
+   still use Google's withdrawn out-of-band auth flow, which no longer
+   completes.
+2. **Cloud account connected** — done over SSH with `sudo rclone config`, not
+   from the panel (see below). The panel lists whatever remotes it finds.
+3. **Backups upload to it** — pick the remote and folder, and the panel writes
+   `RCLONE_REMOTE` into the deployed `frappe_backup.sh`.
+
+Step 2 is deliberately not a button. It is an OAuth flow needing a browser on
+another machine, and `rclone config` prints the account's long-lived refresh
+token as it goes — run as a panel job, that token would land in the job log and
+render in the terminal for anyone signed in to the panel. The suite's built-in
+guide walks through it, and the full `Rclone_Configuration_Guide.docx`
+(S3, Dropbox, testing, encrypting the config) downloads from that page.
+
+**Run `rclone config` as root.** Backups run as root, and rclone only reads the
+config of the user that created it — a remote configured as `erpdev` is
+invisible to the backup job, which then uploads nothing.
+
+Two things worth knowing about how this fails:
+
+- A failed upload is only a **warning**. `frappe_backup.sh` still exits 0, so
+  the panel reports the backup as successful. If cloud copies matter, check the
+  job log for `WARNING: Cloud upload failed`. The suite guards the usual cause
+  from both ends: it refuses to wire a remote rclone doesn't know, and stage 3
+  turns red if the deployed script already points at one that doesn't exist
+  (easy to inherit — `gdrive:frappe-backups` is the guide's example string).
+- Re-running `setup_frappe_backups.sh` copies the script over and **clears
+  stage 3**, silently returning backups to local-only. `update_tooling.sh`
+  preserves it. Re-check the suite after reinstalling backups.
 
 The passwords you type into the ERP form are sent to the installer as
 environment variables over HTTPS and are **never written to the job log**.
