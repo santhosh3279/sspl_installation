@@ -49,6 +49,64 @@ if [ "$confirm" != "yes" ]; then
     exit 0
 fi
 
+# ─────────────────────────────────────────────── take the site offline
+# Nothing may touch the database while it is being replaced. Users can submit
+# a document from a browser, and the workers/scheduler fire background jobs on
+# their own — either lands writes in a database that is about to be overwritten
+# or, worse, half-way through the replacement. backend/db/redis stay up: the
+# restore runs through them.
+OFFLINE_WANT="frontend websocket queue-short queue-long scheduler"
+OFFLINE_SERVICES=""
+HAVE=$(docker compose -f "$COMPOSE_FILE" config --services 2>/dev/null || true)
+for s in $OFFLINE_WANT; do
+    printf '%s\n' "$HAVE" | grep -qx "$s" && OFFLINE_SERVICES="$OFFLINE_SERVICES $s"
+done
+OFFLINE_SERVICES="${OFFLINE_SERVICES# }"
+
+SITE_OFFLINE=""
+RESTORE_DONE=""
+
+bring_site_online() {
+    [ -z "$SITE_OFFLINE" ] && return 0
+    echo ""
+    if [ -z "$RESTORE_DONE" ]; then
+        echo "⚠ The restore did NOT finish. Bringing the site back online anyway —"
+        echo "  locked out is worse than up — but the database may be INCOMPLETE."
+        echo "  Check the site. If it is broken, restore again from the safety"
+        echo "  backup taken just now in $(dirname "$BACKUP_DIR")/."
+    else
+        echo "Bringing the site back online..."
+    fi
+    if docker compose -f "$COMPOSE_FILE" start $OFFLINE_SERVICES; then
+        SITE_OFFLINE=""
+    else
+        echo ""
+        echo "❌ Could not start:$OFFLINE_SERVICES"
+        echo "   The site is still OFFLINE. Start it by hand:"
+        echo "   docker compose -f $COMPOSE_FILE start$OFFLINE_SERVICES"
+    fi
+}
+
+# Whatever happens from here — a command failing under 'set -e', Ctrl-C at a
+# prompt, or the SIGTERM from 'systemctl restart sspl-admin' (the documented
+# abort path) — the site has to come back up. INT/TERM exit so EXIT fires.
+trap bring_site_online EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if [ -n "$OFFLINE_SERVICES" ]; then
+    echo ""
+    echo "Taking the site offline:$OFFLINE_SERVICES"
+    echo "Users will see the server as unavailable until the restore finishes."
+    docker compose -f "$COMPOSE_FILE" stop $OFFLINE_SERVICES
+    SITE_OFFLINE=yes
+else
+    echo ""
+    echo "⚠ WARNING: no known services found in $COMPOSE_FILE, so the site was"
+    echo "  NOT taken offline. Users and background jobs can write to the"
+    echo "  database while it is being replaced. Continuing anyway."
+fi
+
 # Find backup files (newest of each type; archives are .tgz with --compress, .tar otherwise)
 DB_BACKUP=$(find "$BACKUP_DIR" -name "*-database.sql.gz" -type f | sort | tail -1)
 FILES_BACKUP=$(find "$BACKUP_DIR" \( -name "*-files.tar" -o -name "*-files.tgz" \) ! -name "*-private-files.*" -type f | sort | tail -1)
@@ -88,13 +146,18 @@ echo "Running migrations..."
 docker compose -f "$COMPOSE_FILE" exec -T backend \
     bench --site "$SITE_NAME" migrate
 
+RESTORE_DONE=yes
+
 # 4. Clean up temporary files
 echo "Cleaning up..."
 docker compose -f "$COMPOSE_FILE" exec -T backend rm -rf "$CONTAINER_TMP"
 
-# 5. Restart services
-echo "Restarting services..."
-docker compose -f "$COMPOSE_FILE" restart
+# 5. Restart the backend so it serves the restored database, then put the
+#    user-facing services back. bring_site_online is idempotent, so the EXIT
+#    trap does nothing once this has run.
+echo "Restarting the backend..."
+docker compose -f "$COMPOSE_FILE" restart backend
+bring_site_online
 
 echo "=== Restore completed successfully ==="
 echo "Site should be available shortly."

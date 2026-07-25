@@ -372,6 +372,45 @@ def deployed_site_name():
     return None
 
 
+def get_sites_volume_path():
+    """Locate the sites volume mount point on the host."""
+    # Method 1: Check docker inspect on sspl-erp_sites volume
+    try:
+        res = subprocess.run(
+            ["docker", "volume", "inspect", "sspl-erp_sites", "--format", "{{.Mountpoint}}"],
+            capture_output=True, text=True, timeout=5
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip()
+    except Exception:
+        pass
+
+    # Method 2: Fallback to checking the systemd/docker default path
+    fallback = Path("/var/lib/docker/volumes/sspl-erp_sites/_data")
+    if fallback.exists() and fallback.is_dir():
+        return str(fallback)
+
+    # Method 3: Try to find any active volume ending with '_sites'
+    try:
+        res = subprocess.run(
+            ["docker", "volume", "ls", "--format", "{{.Name}}"],
+            capture_output=True, text=True, timeout=5
+        )
+        if res.returncode == 0:
+            for vol in res.stdout.splitlines():
+                if vol.endswith("_sites"):
+                    res2 = subprocess.run(
+                        ["docker", "volume", "inspect", vol, "--format", "{{.Mountpoint}}"],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    if res2.returncode == 0 and res2.stdout.strip():
+                        return res2.stdout.strip()
+    except Exception:
+        pass
+
+    return None
+
+
 def first_ip():
     try:
         out = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=5)
@@ -1057,6 +1096,38 @@ def upload():
     if not saved:
         return jsonify({"error": "no files received"}), 400
     return jsonify({"ok": True, "saved": saved, "dest": str(dest)})
+
+
+@app.route("/upload-license", methods=["POST"])
+@login_required
+def upload_license():
+    if "file" not in request.files:
+        return jsonify({"error": "no file part"}), 400
+    f = request.files["file"]
+    name = secure_filename(f.filename or "")
+    if not name:
+        return jsonify({"error": "no file selected"}), 400
+    
+    allowed_exts = (".lic", ".txt", ".json", ".key")
+    if not name.lower().endswith(allowed_exts):
+        return jsonify({"error": f"only {', '.join(allowed_exts)} files are allowed"}), 400
+        
+    vol_path = get_sites_volume_path()
+    if not vol_path:
+        return jsonify({"error": "Docker sites volume not found (is the ERP stack installed?)"}), 500
+        
+    dest_dir = Path(vol_path)
+    if not dest_dir.is_dir():
+        return jsonify({"error": f"Sites volume path {vol_path} is not a directory"}), 500
+        
+    try:
+        dest_path = dest_dir / name
+        f.save(dest_path)
+        os.chmod(dest_path, 0o644)
+    except Exception as e:
+        return jsonify({"error": f"failed to save file: {e}"}), 500
+        
+    return jsonify({"ok": True, "saved": name, "dest": str(dest_path)})
 
 
 @app.route("/api/uploads/delete", methods=["POST"])
@@ -1758,6 +1829,15 @@ details{margin:2px 0} details summary{cursor:pointer}
   </div>
 </div>
 
+<div class="card"><h2>Upload license file to sites volume</h2>
+  <p style="font-size:13px;color:var(--ink-2);margin-top:0">Files are uploaded directly to the root of the Docker <code>sites</code> volume (accessible by ERPNext containers). Allowed: .lic, .txt, .json, .key.</p>
+  <div class="uprow">
+    <input type="file" id="licfile">
+    <button class="primary" id="licupbtn">Upload License</button>
+    <span id="licupmsg"></span>
+  </div>
+</div>
+
 </div><!-- /col-left -->
 """ + TERM_HTML + r"""
 </main>
@@ -2029,6 +2109,30 @@ $('#upbtn').onclick = () => {
   xhr.onerror = () => $('#upmsg').textContent = 'Upload failed — network error';
   xhr.send(fd);
   $('#upmsg').textContent = 'Uploading… 0%';
+};
+
+$('#licupbtn').onclick = () => {
+  const file = $('#licfile').files[0];
+  if (!file) { $('#licupmsg').textContent = 'Choose a license file first.'; return; }
+  const fd = new FormData();
+  fd.append('file', file);
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/upload-license');
+  xhr.upload.onprogress = e => { if (e.lengthComputable)
+    $('#licupmsg').textContent = 'Uploading… ' + Math.round(100*e.loaded/e.total) + '%'; };
+  xhr.onload = () => {
+    try{
+      const j = JSON.parse(xhr.responseText);
+      if (j.error) {
+        $('#licupmsg').innerHTML = `<span style="color:var(--crit)">${esc(j.error)}</span>`;
+      } else {
+        $('#licupmsg').innerHTML = `<span style="color:var(--ok)">Uploaded: ${esc(j.saved)}</span>`;
+      }
+    }catch(e){ $('#licupmsg').innerHTML = '<span style="color:var(--crit)">Upload failed (' + xhr.status + ')</span>'; }
+  };
+  xhr.onerror = () => $('#licupmsg').innerHTML = '<span style="color:var(--crit)">Upload failed — network error</span>';
+  xhr.send(fd);
+  $('#licupmsg').textContent = 'Uploading… 0%';
 };
 
 document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => {
