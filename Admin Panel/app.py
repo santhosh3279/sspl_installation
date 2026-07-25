@@ -1111,18 +1111,29 @@ def upload_license():
     allowed_exts = (".lic", ".txt", ".json", ".key")
     if not name.lower().endswith(allowed_exts):
         return jsonify({"error": f"only {', '.join(allowed_exts)} files are allowed"}), 400
-        
+
+    raw = f.read()
+    try:
+        site = json.loads(raw).get("site")
+    except Exception:
+        site = None
+    if not site:
+        return jsonify({"error": "license file must contain a \"site\" field naming the target site"}), 400
+    site = secure_filename(site)
+    if not site:
+        return jsonify({"error": "invalid \"site\" value in license file"}), 400
+
     vol_path = get_sites_volume_path()
     if not vol_path:
         return jsonify({"error": "Docker sites volume not found (is the ERP stack installed?)"}), 500
-        
-    dest_dir = Path(vol_path)
+
+    dest_dir = Path(vol_path) / site
     if not dest_dir.is_dir():
-        return jsonify({"error": f"Sites volume path {vol_path} is not a directory"}), 500
-        
+        return jsonify({"error": f"Site folder {dest_dir} not found"}), 500
+
     try:
         dest_path = dest_dir / name
-        f.save(dest_path)
+        dest_path.write_bytes(raw)
         os.chmod(dest_path, 0o644)
     except Exception as e:
         return jsonify({"error": f"failed to save file: {e}"}), 500
@@ -1830,7 +1841,7 @@ details{margin:2px 0} details summary{cursor:pointer}
 </div>
 
 <div class="card"><h2>Upload license file to sites volume</h2>
-  <p style="font-size:13px;color:var(--ink-2);margin-top:0">Files are uploaded directly to the root of the Docker <code>sites</code> volume (accessible by ERPNext containers). Allowed: .lic, .txt, .json, .key.</p>
+  <p style="font-size:13px;color:var(--ink-2);margin-top:0">File must contain a <code>"site"</code> field; it is uploaded into that site's folder inside the Docker <code>sites</code> volume (accessible by ERPNext containers). Allowed: .lic, .txt, .json, .key.</p>
   <div class="uprow">
     <input type="file" id="licfile">
     <button class="primary" id="licupbtn">Upload License</button>
