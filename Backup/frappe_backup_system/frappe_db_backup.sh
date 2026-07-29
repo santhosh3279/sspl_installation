@@ -11,7 +11,9 @@ SITE_NAME="your-site-name"  # Change this to your site name
 COMPOSE_FILE="/opt/sspl-erp/docker-compose.yml"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 RETENTION_DAYS=14
+LOCAL_KEEP_MIN=10 # Newest N on this server survive the cleanup however old they are
 RCLONE_REMOTE=""  # Optional: e.g. "gdrive:frappe-backups" — leave empty to skip cloud upload
+CLOUD_KEEP=10     # How many dumps to keep on the remote (local keeps RETENTION_DAYS)
 
 mkdir -p "$BACKUP_DIR"
 chmod 700 "$BACKUP_DIR"
@@ -44,8 +46,27 @@ if [ "$(stat -c %s "$BACKUP_FILE")" -lt 10240 ]; then
     exit 1
 fi
 
-# Clean old backups
-find "$BACKUP_DIR" -name "*.sql.gz" -mtime +$RETENTION_DAYS -delete
+# Clean old dumps: older than RETENTION_DAYS *and* outside the newest
+# LOCAL_KEEP_MIN. Without the floor, a cron that stalled for longer than the
+# retention window wipes the folder on its next successful run.
+echo "Cleaning up old dumps (keeping newest $LOCAL_KEEP_MIN, then $RETENTION_DAYS days)..."
+# Timestamped dumps only, same pattern the cloud prune uses: a hand-made
+# manual.sql.gz would otherwise sort to the front and eat a protected slot.
+OLD_LOCAL=$(find "$BACKUP_DIR" -maxdepth 1 -type f \
+        -regextype posix-extended -regex '.*/[0-9]{8}_[0-9]{6}_.*\.sql\.gz' -printf '%f\n' 2>/dev/null \
+    | sort -r \
+    | tail -n +$((LOCAL_KEEP_MIN + 1))) || true
+if [ -n "$OLD_LOCAL" ]; then
+    echo "$OLD_LOCAL" | while read -r dump; do
+        [ -n "$dump" ] || continue
+        [ -n "$(find "$BACKUP_DIR/$dump" -maxdepth 0 -mtime +$RETENTION_DAYS 2>/dev/null)" ] || continue
+        if rm -f "${BACKUP_DIR:?}/$dump"; then
+            echo "  Removed: $dump"
+        else
+            echo "  WARNING: could not remove: $dump"
+        fi
+    done
+fi
 
 # Optional: upload to cloud storage via rclone, into a db-only/ folder so the
 # dumps don't mix with the full backups' timestamped directories. Same
@@ -54,6 +75,29 @@ if [ -n "$RCLONE_REMOTE" ]; then
     echo "Uploading backup to $RCLONE_REMOTE/db-only..."
     if rclone copy "$BACKUP_FILE" "$RCLONE_REMOTE/db-only"; then
         echo "Cloud upload completed"
+
+        # Keep only the newest CLOUD_KEEP dumps on the remote: the local
+        # find -mtime retention above does not touch the cloud. The remote is
+        # listed directly, so a dump removed locally by any other means cannot
+        # orphan its cloud copy. Names start with the timestamp, so a reverse
+        # lexicographic sort is newest-first.
+        echo "Cleaning old cloud dumps (keeping newest $CLOUD_KEEP)..."
+        OLD_REMOTE=$(rclone lsf --files-only "$RCLONE_REMOTE/db-only" 2>/dev/null \
+            | grep -E '^[0-9]{8}_[0-9]{6}_.*\.sql\.gz$' \
+            | sort -r \
+            | tail -n +$((CLOUD_KEEP + 1))) || true
+        if [ -n "$OLD_REMOTE" ]; then
+            echo "$OLD_REMOTE" | while read -r dump; do
+                [ -n "$dump" ] || continue
+                if rclone deletefile "$RCLONE_REMOTE/db-only/$dump" 2>/dev/null; then
+                    echo "  Removed from cloud: $dump"
+                else
+                    echo "  WARNING: could not remove from cloud: $dump"
+                fi
+            done
+        else
+            echo "  Nothing to remove from cloud"
+        fi
     else
         echo "WARNING: Cloud upload failed — backup exists locally only"
     fi

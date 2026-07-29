@@ -54,7 +54,9 @@ The site name is usually something like: `erp.yourdomain.com` or `sspl.local`
 Update the following in each script:
 - `SITE_NAME="your-site-name"` - Replace with your actual site name
 - `BACKUP_DIR="/opt/backups/frappe"` - Change if you want different location
-- `RETENTION_DAYS=30` - Adjust how long to keep backups
+- `RETENTION_DAYS=30` - Adjust how long to keep backups on this server
+- `LOCAL_KEEP_MIN=10` - Newest N on this server are never deleted by age
+- `CLOUD_KEEP=10` - How many backups to keep on the rclone remote
 
 ### 4. Test Manual Backup
 ```bash
@@ -97,14 +99,35 @@ sudo crontab -e
 
 ## Backup Retention
 
-Default: 30 days for full backups, 14 days for DB-only backups
+On this server: 30 days for full backups, 14 days for DB-only backups — but the
+newest **10** of each always survive, however old they are (`LOCAL_KEEP_MIN`).
+That floor is not cosmetic: with a plain age-based cleanup, backups that stop
+running for longer than the retention window (container down, site renamed,
+disk full) leave *every* copy older than the cutoff, and the next successful
+run empties the backup folder. The floor keeps the last 10 restore points no
+matter how long the gap was.
+
+On the rclone remote (when `RCLONE_REMOTE` is set): the newest **10** of each,
+regardless of age. Cloud retention is counted, not dated, because the remote is
+pruned by listing it — a backup deleted from this server by any other means
+cannot leave an orphaned copy behind in the cloud. The two are independent: the
+server can hold 30 days of full backups while the remote holds the last 10.
+
+With the default cron (full backup daily, DB-only every 6 hours), that works
+out to roughly 30 full backups and 56 dumps on disk, and 10 of each in the
+cloud.
 
 ### Adjust Retention:
-Edit `RETENTION_DAYS` in scripts:
+Edit `RETENTION_DAYS` / `LOCAL_KEEP_MIN` (local) or `CLOUD_KEEP` (remote):
 ```bash
 sudo nano /opt/scripts/v2/frappe_backup.sh
 # Change: RETENTION_DAYS=30  to your preferred value
+# Change: LOCAL_KEEP_MIN=10  to your preferred value
+# Change: CLOUD_KEEP=10      to your preferred value
 ```
+
+Note: on Google Drive, rclone deletes to the account's trash by default, so
+freed quota only returns once the trash is emptied.
 
 ### Manual Cleanup:
 ```bash

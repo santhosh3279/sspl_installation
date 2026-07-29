@@ -33,10 +33,11 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-07-16.9"
+PANEL_VERSION = "2026-07-29.1"
 FEATURES = ("ERP Next Installation suite page with rclone cloud backup setup "
             "covering full and DB-only backups, console-style terminal, "
-            "guarded restore, delete uploads, cron jobs viewer on the dashboard")
+            "guarded restore, delete uploads, cron jobs viewer on the dashboard, "
+            "one-click panel update straight from git")
 
 CONFIG_FILE = os.environ.get("SSPL_ADMIN_CONFIG", "/opt/sspl-admin/config.json")
 with open(CONFIG_FILE) as f:
@@ -85,6 +86,7 @@ UPDATE_SETUP_SCRIPT = _repo("Production Installation/update and rollback/install
 RCLONE_SETUP_SCRIPT = _repo("Backup/frappe_backup_system/install_rclone.sh")
 RCLONE_GUIDE = _repo("Backup/Rclone_Configuration_Guide.docx")
 UPDATE_TOOLING_SCRIPT = _repo("update_tooling.sh")
+UPDATE_PANEL_SCRIPT = _repo("update_panel.sh")
 
 INSTALL_ACTIONS = {
     "install_erp":     {"label": "Install ERPNext stack",   "cmd": ["bash", ERP_STACK_SCRIPT or ""]},
@@ -94,6 +96,11 @@ INSTALL_ACTIONS = {
     "install_rclone":  {"label": "Install rclone",          "cmd": ["bash", RCLONE_SETUP_SCRIPT or ""]},
     "update_tooling":  {"label": "Update v2 scripts & panel",
                         "cmd": ["bash", UPDATE_TOOLING_SCRIPT or ""]},
+    # Pulls the checkout first, then deploys only the panel from it. The
+    # dashboard's button; update_tooling above stays the deploy-everything
+    # path and does not touch git.
+    "update_panel":    {"label": "Update Admin Panel",
+                        "cmd": ["bash", UPDATE_PANEL_SCRIPT or ""]},
 }
 if REPO_DIR:
     ACTIONS.update(INSTALL_ACTIONS)
@@ -789,7 +796,12 @@ def logout():
 @app.route("/")
 @login_required
 def index():
-    return render_template_string(DASH_HTML, user=session["user"], version=PANEL_VERSION)
+    # Gate the panel updater on the script actually being on disk, not just on
+    # repo_dir being set: _repo() only joins paths, so an older checkout
+    # without update_panel.sh would render a button that fails with exit 127.
+    return render_template_string(
+        DASH_HTML, user=session["user"], version=PANEL_VERSION,
+        repo_ok=bool(UPDATE_PANEL_SCRIPT) and os.path.isfile(UPDATE_PANEL_SCRIPT))
 
 
 @app.route("/install")
@@ -915,10 +927,11 @@ def _install_env(name, data):
     if name == "install_rclone":
         return {}, None
 
-    # The tooling updater restarts the panel service at the end, which would
-    # kill its own job — the flag tells it to defer that restart until after
-    # the job has finished (see update_tooling.sh).
-    if name == "update_tooling":
+    # Both updaters restart the panel service at the end, which would kill
+    # their own job — the flag tells them to defer that restart until after
+    # the job has finished (see update_tooling.sh). update_panel.sh reaches
+    # update_tooling.sh through the environment it inherits.
+    if name in ("update_tooling", "update_panel"):
         return {"SSPL_FROM_PANEL": "1"}, None
 
     # backups / update: derive the site name from the deployed ERP stack
@@ -1218,6 +1231,9 @@ LAYOUT_CSS = """
 .top a.nav{font-size:13px;text-decoration:none;border:1px solid var(--border);
   border-radius:8px;padding:7px 12px;color:var(--ink)}
 .top a.nav:hover{border-color:var(--accent);color:var(--accent)}
+/* The panel updater sits in the top bar beside the suite link, so it reads as
+   chrome rather than as one of the server actions further down the page. */
+.top .nav-act{font-size:13px;padding:7px 12px}
 /* One column: the page's controls, then the terminal full-width at the foot.
    Starting a job scrolls the terminal into view. */
 main{max-width:1500px;margin:0 auto;padding:0 16px 40px}
@@ -1759,6 +1775,11 @@ details{margin:2px 0} details summary{cursor:pointer}
   <h1>SSPL ERP Admin</h1><span id="clock" class="badge"></span>
   <span class="badge" title="panel code version — restart the service after updating">v{{ version }}</span>
   <a class="nav" href="/install">ERP Next Installation suite →</a>
+  {% if repo_ok %}
+  <button class="act nav-act" data-act="update_panel"
+    title="git pull the checkout, then deploy this panel from it"
+    data-confirm="Pull the latest code and update the admin panel now?&#10;&#10;The panel restarts itself a few seconds after the job finishes — reload the page then. The v2 backup and update scripts are NOT changed.">Update Admin Panel</button>
+  {% endif %}
   <span class="spacer"></span>
   <span style="color:var(--muted);font-size:13px">{{ user }}</span>
   <form method="post" action="/logout" style="margin:0"><button>Log out</button></form>

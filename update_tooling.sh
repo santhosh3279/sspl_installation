@@ -32,6 +32,16 @@ BACKUP_DST="${SSPL_BACKUP_DST:-/opt/scripts/v2}"
 UPDATE_DST="${SSPL_UPDATE_DST:-/opt/sspl-erp/v2}"
 PANEL_DST="${SSPL_PANEL_DST:-/opt/sspl-admin}"
 
+# SSPL_ONLY=panel updates just the admin panel and leaves the v2 scripts
+# alone — that is what update_panel.sh (the dashboard's one-click panel
+# update) runs. Unset, or "all", updates everything, as this script always has.
+ONLY="${SSPL_ONLY:-all}"
+if [ "$ONLY" != "all" ] && [ "$ONLY" != "panel" ]; then
+    echo "Unknown SSPL_ONLY='$ONLY' — expected 'all' or 'panel'" >&2
+    exit 1
+fi
+if [ "$ONLY" = "panel" ]; then STEPS=1; else STEPS=3; fi
+
 # Copy the configuration line for $3 from the installed script $1 into the
 # staged new script $2, so user settings survive the update.
 preserve_line() {
@@ -64,13 +74,17 @@ SKIPPED=""
 echo "==============================="
 echo " SSPL Tooling Update - $(date)"
 echo "==============================="
+if [ "$ONLY" = "panel" ]; then
+    echo " Panel only — the v2 backup and update scripts are not touched."
+fi
 
 # ---------------------------------------------------------- 1. backup scripts
+if [ "$ONLY" = "all" ]; then
 echo ""
 echo "→ 1/3 Backup scripts ($BACKUP_DST)"
 if [ -f "$BACKUP_DST/frappe_backup.sh" ]; then
-    update_script "$BACKUP_SRC" "$BACKUP_DST" frappe_backup.sh        SITE_NAME BACKUP_DIR RETENTION_DAYS RCLONE_REMOTE
-    update_script "$BACKUP_SRC" "$BACKUP_DST" frappe_db_backup.sh     SITE_NAME BACKUP_DIR RETENTION_DAYS RCLONE_REMOTE
+    update_script "$BACKUP_SRC" "$BACKUP_DST" frappe_backup.sh        SITE_NAME BACKUP_DIR RETENTION_DAYS LOCAL_KEEP_MIN CLOUD_KEEP RCLONE_REMOTE
+    update_script "$BACKUP_SRC" "$BACKUP_DST" frappe_db_backup.sh     SITE_NAME BACKUP_DIR RETENTION_DAYS LOCAL_KEEP_MIN CLOUD_KEEP RCLONE_REMOTE
     update_script "$BACKUP_SRC" "$BACKUP_DST" frappe_restore.sh       SITE_NAME
     update_script "$BACKUP_SRC" "$BACKUP_DST" frappe_backup_verify.sh BACKUP_DIR ALERT_EMAIL MAX_AGE_HOURS
     update_script "$BACKUP_SRC" "$BACKUP_DST" restore_with_backup.sh
@@ -93,10 +107,11 @@ else
     echo "   – not installed, skipping (see 'Production Installation/update and rollback/README.md')"
     SKIPPED="$SKIPPED update-scripts"
 fi
+fi   # end of the two v2-script sections, skipped when SSPL_ONLY=panel
 
 # ------------------------------------------------------------- 3. admin panel
 echo ""
-echo "→ 3/3 Web admin panel ($PANEL_DST)"
+echo "→ $STEPS/$STEPS Web admin panel ($PANEL_DST)"
 if [ -f "$PANEL_DST/config.json" ]; then
     sudo cp "$PANEL_SRC/app.py" "$PANEL_DST/"
     PANEL_VER=$(grep -m1 '^PANEL_VERSION' "$PANEL_SRC/app.py" | cut -d'"' -f2)
@@ -158,5 +173,11 @@ echo "✅ Update complete"
 if [ -n "$UPDATED" ]; then echo "   Updated:$UPDATED"; fi
 if [ -n "$SKIPPED" ]; then echo "   Skipped:$SKIPPED"; fi
 echo ""
-echo "Configuration was preserved (site name, rclone remote, retention,"
-echo "panel credentials/certificates). Cron jobs were not changed."
+if [ "$ONLY" = "panel" ]; then
+    echo "Only the panel was deployed (SSPL_ONLY=panel). Its config.json,"
+    echo "certificates and job logs were preserved; the v2 scripts and cron"
+    echo "jobs were not touched."
+else
+    echo "Configuration was preserved (site name, rclone remote, retention,"
+    echo "panel credentials/certificates). Cron jobs were not changed."
+fi

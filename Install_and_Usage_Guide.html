@@ -353,7 +353,12 @@ The script exits with an error if anything is missing.</p>
 <tr><td>Watch the backup log</td><td><code>tail -f /var/log/frappe_backup_v2.log</code></td></tr>
 </table>
 <p>Retention is automatic: full backups are kept <b>30 days</b>, database-only dumps <b>14 days</b>.
-To change this, edit <code>RETENTION_DAYS</code> at the top of the respective script in <code>/opt/scripts/v2/</code>.</p>
+The newest <b>10</b> of each survive regardless of age, so backups that stop running for
+longer than the retention window can never leave you with an empty backup folder.
+If a cloud remote is configured, it keeps the newest <b>10</b> of each as well — counted, not
+dated, so cloud storage stays bounded.
+To change this, edit <code>RETENTION_DAYS</code>, <code>LOCAL_KEEP_MIN</code> or
+<code>CLOUD_KEEP</code> at the top of the respective script in <code>/opt/scripts/v2/</code>.</p>
 
 <div class="note"><b>Good habit:</b> run a manual full backup before any risky change
 (new app install, configuration change, server maintenance) — and always before an update,

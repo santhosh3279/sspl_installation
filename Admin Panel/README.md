@@ -127,9 +127,12 @@ machine:
    timestamped folder per run; DB-only dumps go under `db-only/`; the system
    update uploads its Docker image snapshot under `image-snapshots/` *after*
    the update finishes (so the multi-GB upload never extends downtime) and
-   mirrors its keep-last-3 retention on the remote. If a deployed script is an
-   older copy with no `RCLONE_REMOTE` line, the row says so — run
-   `update_tooling.sh`, then set the destination again.
+   mirrors its keep-last-3 retention on the remote. Each of the three prunes
+   the cloud independently of the local disk retention: the newest 10 full
+   backups and the newest 10 DB-only dumps stay on the remote (`CLOUD_KEEP` at
+   the top of each backup script), and the newest 3 image snapshots. If a
+   deployed script is an older copy with no `RCLONE_REMOTE` line, the row says
+   so — run `update_tooling.sh`, then set the destination again.
 
 Step 2 is deliberately not a button. It is an OAuth flow needing a browser on
 another machine, and `rclone config` prints the account's long-lived refresh
@@ -212,12 +215,24 @@ into the `app.py` that is **actually running**, so it is the honest answer to
 Updating is two steps, and missing the second is the usual reason a new
 feature doesn't appear:
 
-1. `git pull && ./update_tooling.sh` — copies the new `app.py` **and**
-   restarts the service. It prints the version it installed. The
-   `./update_tooling.sh` half can also be run from the suite's **Tooling
-   updates** row (*Update v2 scripts & panel*): run as a panel job it defers
-   its own service restart a few seconds so the job can finish cleanly —
-   `git pull` still happens over SSH first.
+1. Deploy the new `app.py` and restart the service. Three ways in, all
+   equivalent for the panel itself:
+   - **Update Admin Panel** — the button in the dashboard's top bar, beside
+     the *ERP Next Installation suite* link. This is the no-SSH route: it runs
+     `update_panel.sh`, which does the `git pull` **and** the deploy. Only the
+     panel is deployed; if the pull also brought new v2 scripts, the job says
+     so and points at the suite button below. Hidden when `repo_dir` is not
+     configured, since there would be nothing to pull from.
+   - The suite's **Tooling updates** row (*Update v2 scripts & panel*) —
+     deploys everything from the checkout, but does **not** run `git pull`, so
+     do that over SSH first.
+   - `git pull && ./update_tooling.sh` over SSH.
+
+   Both buttons defer their own service restart by a few seconds (via a
+   transient `systemd-run` timer) so the job they are running inside can finish
+   cleanly first. A fast-forward is the only pull accepted: local commits or
+   conflicting edits on the server make the button fail with the git error
+   rather than merging anything.
 2. **Hard-refresh the browser** (Ctrl+Shift+R). The page's HTML, CSS and JS
    are served inline, so a cached page looks identical to old code.
 
@@ -233,6 +248,7 @@ feature list on startup.
 
 | Version | Should show |
 |---|---|
+| `2026-07-29.1` | **Update Admin Panel** button in the dashboard top bar |
 | `2026-07-15.4` | Terminal full-width at the foot of the page, typed into directly |
 | `2026-07-15.3` | Delete buttons on uploads |
 | `2026-07-15.2` | Restore buttons on backups/uploads, interactive terminal |
