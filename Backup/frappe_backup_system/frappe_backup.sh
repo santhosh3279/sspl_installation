@@ -11,7 +11,7 @@ BACKUP_DIR="/opt/backups/frappe"
 SITE_NAME="your-site-name"  # Change this to your site name
 COMPOSE_FILE="/opt/sspl-erp/docker-compose.yml"
 RETENTION_DAYS=30
-LOCAL_KEEP_MIN=10 # Newest N on this server survive the cleanup however old they are
+LOCAL_KEEP_MIN=20 # Newest N on this server survive the cleanup however old they are
 RCLONE_REMOTE=""  # Optional: e.g. "gdrive:frappe-backups" — leave empty to skip cloud upload
 CLOUD_KEEP=10     # How many backups to keep on the remote (local keeps RETENTION_DAYS)
 

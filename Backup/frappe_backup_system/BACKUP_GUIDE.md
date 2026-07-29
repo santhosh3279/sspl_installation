@@ -55,7 +55,7 @@ Update the following in each script:
 - `SITE_NAME="your-site-name"` - Replace with your actual site name
 - `BACKUP_DIR="/opt/backups/frappe"` - Change if you want different location
 - `RETENTION_DAYS=30` - Adjust how long to keep backups on this server
-- `LOCAL_KEEP_MIN=10` - Newest N on this server are never deleted by age
+- `LOCAL_KEEP_MIN=20` - Newest N on this server are never deleted by age
 - `CLOUD_KEEP=10` - How many backups to keep on the rclone remote
 
 ### 4. Test Manual Backup
@@ -100,12 +100,13 @@ sudo crontab -e
 ## Backup Retention
 
 On this server: 30 days for full backups, 14 days for DB-only backups — but the
-newest **10** of each always survive, however old they are (`LOCAL_KEEP_MIN`).
+newest **20** of each always survive, however old they are (`LOCAL_KEEP_MIN`).
 That floor is not cosmetic: with a plain age-based cleanup, backups that stop
 running for longer than the retention window (container down, site renamed,
 disk full) leave *every* copy older than the cutoff, and the next successful
-run empties the backup folder. The floor keeps the last 10 restore points no
-matter how long the gap was.
+run empties the backup folder. The floor keeps the last 20 restore points no
+matter how long the gap was. It is the same figure the admin panel's manual
+"Clear backups older than 30 days" button uses, so the two cleanups agree.
 
 On the rclone remote (when `RCLONE_REMOTE` is set): the newest **10** of each,
 regardless of age. Cloud retention is counted, not dated, because the remote is
@@ -122,7 +123,7 @@ Edit `RETENTION_DAYS` / `LOCAL_KEEP_MIN` (local) or `CLOUD_KEEP` (remote):
 ```bash
 sudo nano /opt/scripts/v2/frappe_backup.sh
 # Change: RETENTION_DAYS=30  to your preferred value
-# Change: LOCAL_KEEP_MIN=10  to your preferred value
+# Change: LOCAL_KEEP_MIN=20  to your preferred value
 # Change: CLOUD_KEEP=10      to your preferred value
 ```
 
