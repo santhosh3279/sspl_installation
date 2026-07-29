@@ -33,7 +33,7 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-07-29.1"
+PANEL_VERSION = "2026-07-29.2"
 FEATURES = ("ERP Next Installation suite page with rclone cloud backup setup "
             "covering full and DB-only backups, console-style terminal, "
             "guarded restore, delete uploads, cron jobs viewer on the dashboard, "
@@ -1255,10 +1255,14 @@ TERM_CSS = """
    and any half-typed text — but they are styled as a single surface. */
 .term{background:#111;border-radius:8px;padding:12px;display:flex;flex-direction:column;
   min-width:0;cursor:text;
+  /* One knob for the whole pane: the log, the prompt and the input line must
+     stay the same size or the input stops looking like part of the terminal.
+     15.625px = 1.25x the original 12.5px. */
+  --term-fs:15.625px;
   /* a definite height so the log scrolls inside it rather than growing the
      page forever; drag the bottom edge to resize, as you would a terminal */
   height:min(60vh,520px);min-height:220px;resize:vertical;overflow:hidden}
-#console{color:#ddd;font:12.5px/1.45 ui-monospace,Menlo,Consolas,monospace;
+#console{color:#ddd;font:var(--term-fs)/1.45 ui-monospace,Menlo,Consolas,monospace;
   white-space:pre-wrap;overflow-wrap:anywhere;overflow:auto;flex:1;min-height:0}
 #jobstate{font-size:13px;color:var(--ink-2);margin-bottom:8px}
 #jobstate .live{color:var(--accent);font-weight:600}
@@ -1268,10 +1272,10 @@ TERM_CSS = """
    box below it; Enter submits, the way a console does. */
 .term-in{display:none;gap:8px;align-items:baseline;flex:none}
 .term-in.on{display:flex}
-.term-in input{flex:1;min-width:0;font:12.5px/1.45 ui-monospace,Menlo,Consolas,monospace;
+.term-in input{flex:1;min-width:0;font:var(--term-fs)/1.45 ui-monospace,Menlo,Consolas,monospace;
   background:transparent;color:#ddd;border:0;outline:none;padding:0;caret-color:#ddd}
 .term-in input::placeholder{color:#555}
-.term-in .ps1{color:var(--accent);font:12.5px/1.45 ui-monospace,monospace}
+.term-in .ps1{color:var(--accent);font:var(--term-fs)/1.45 ui-monospace,monospace}
 """
 
 TERM_HTML = """

@@ -248,6 +248,7 @@ feature list on startup.
 
 | Version | Should show |
 |---|---|
+| `2026-07-29.2` | Terminal text at 1.25x (15.625px) |
 | `2026-07-29.1` | **Update Admin Panel** button in the dashboard top bar |
 | `2026-07-15.4` | Terminal full-width at the foot of the page, typed into directly |
 | `2026-07-15.3` | Delete buttons on uploads |
