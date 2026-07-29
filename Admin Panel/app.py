@@ -33,7 +33,7 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-07-29.2"
+PANEL_VERSION = "2026-07-29.3"
 FEATURES = ("ERP Next Installation suite page with rclone cloud backup setup "
             "covering full and DB-only backups, console-style terminal, "
             "guarded restore, delete uploads, cron jobs viewer on the dashboard, "
@@ -504,6 +504,31 @@ def rclone_status():
 CRON_ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
+def crontab_text():
+    """Root's crontab, raw. Empty when there is none — 'crontab -l' exits
+    non-zero with "no crontab for root", which is not an error here."""
+    try:
+        out = subprocess.run(["crontab", "-l"], capture_output=True,
+                             text=True, timeout=10)
+        return out.stdout if out.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def write_crontab(text):
+    """Install `text` as root's crontab. Returns None, or an error string.
+    crontab(1) validates before replacing, so a rejected schedule leaves the
+    existing one untouched."""
+    try:
+        p = subprocess.run(["crontab", "-"], input=text, capture_output=True,
+                           text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"could not run crontab: {e}"
+    if p.returncode != 0:
+        return (p.stderr or p.stdout).strip() or "crontab rejected the new schedule"
+    return None
+
+
 def crontab_entries():
     """Every entry in root's crontab, parsed.
 
@@ -511,14 +536,8 @@ def crontab_entries():
     setup_frappe_backups.sh writes the schedule into — what you'd see over
     SSH with 'sudo crontab -l'. Environment lines (MAILTO=…) and @-shortcuts
     (@daily …) are kept: hiding them would misreport what cron will do."""
-    try:
-        out = subprocess.run(["crontab", "-l"], capture_output=True,
-                             text=True, timeout=10)
-        lines = out.stdout.splitlines() if out.returncode == 0 else []
-    except (OSError, subprocess.SubprocessError):
-        lines = []
     entries = []
-    for ln in lines:
+    for ln in crontab_text().splitlines():
         ln = ln.strip()
         if not ln or ln.startswith("#"):
             continue
@@ -535,10 +554,103 @@ def crontab_entries():
     return entries
 
 
+# The schedule a fresh install writes — kept in step by hand with the "Set up
+# cron jobs" block of setup_frappe_backups.sh. Deliberately not read from the
+# repo's frappe_backup.cron: this must work without repo_dir, and that file
+# also lists a log-rotation job the installer does not schedule, so following
+# it would make this button produce a different schedule than a fresh install.
+V2_CRON_JOBS = (
+    ("0 2 * * *",   "frappe_backup.sh",        "/var/log/frappe_backup_v2.log"),
+    ("0 */6 * * *", "frappe_db_backup.sh",     "/var/log/frappe_db_backup_v2.log"),
+    ("0 3 * * 0",   "frappe_backup_verify.sh", "/var/log/frappe_backup_verify_v2.log"),
+)
+BACKUP_SCRIPT_NAMES = tuple(job[1] for job in V2_CRON_JOBS)
+CRON_MARKER = "# Frappe Backup Jobs (v2)"
+
+
+def _v2_dir():
+    """SCRIPTS_DIR with exactly one trailing slash, for path containment tests.
+    Without the slash '/opt/scripts' matches the legacy '/opt/scripts/foo.sh'
+    that this whole feature exists to find."""
+    return SCRIPTS_DIR.rstrip("/") + "/"
+
+
+def v2_cron_line(schedule, script, log):
+    return f"{schedule} {_v2_dir()}{script} >> {log} 2>&1"
+
+
+def cron_command(line):
+    """The command part of one raw crontab line, or "" if the line is a
+    comment, blank, or an environment assignment. Used only to classify a
+    line — never to rebuild one."""
+    s = line.strip()
+    if not s or s.startswith("#") or CRON_ENV_RE.match(s):
+        return ""
+    if s.startswith("@"):
+        parts = s.split(None, 1)
+        return parts[1] if len(parts) > 1 else ""
+    parts = s.split(None, 5)
+    return parts[5] if len(parts) == 6 else ""
+
+
+def is_backup_command(cmd):
+    return any(name in cmd for name in BACKUP_SCRIPT_NAMES)
+
+
+def is_legacy_backup(cmd):
+    """A backup job running a copy of the scripts from outside SCRIPTS_DIR —
+    the pre-v2 layout the backup installer refuses to schedule alongside."""
+    return bool(cmd) and is_backup_command(cmd) and _v2_dir() not in cmd
+
+
+def migrate_cron_text(text):
+    """Rewrite a raw crontab: drop legacy backup jobs, add missing v2 ones.
+
+    Works on the raw text rather than crontab_entries(), which is a display
+    parser — it drops comments and blank lines and reflows whitespace, so
+    rebuilding a crontab from it would quietly destroy everything the user
+    has in there. Every line not deliberately removed is passed through
+    byte-for-byte.
+
+    Returns (new_text, removed_lines, added_lines).
+    """
+    kept, removed = [], []
+    for ln in text.splitlines():
+        if is_legacy_backup(cron_command(ln)):
+            removed.append(ln.strip())
+        else:
+            kept.append(ln)
+
+    # Only add what is genuinely absent. A v2 line the user has re-timed still
+    # counts as present: this repairs a schedule, it does not reset one.
+    kept_cmds = [cron_command(ln) for ln in kept]
+    added = [v2_cron_line(*job) for job in V2_CRON_JOBS
+             if not any(job[1] in cmd and _v2_dir() in cmd for cmd in kept_cmds)]
+
+    lines = list(kept)
+    if added:
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if lines:
+            lines.append("")
+        if CRON_MARKER not in text:
+            lines.append(CRON_MARKER)
+        lines.extend(added)
+    return ("\n".join(lines).rstrip("\n") + "\n" if lines else ""), removed, added
+
+
 def cron_status():
-    """The backup-related entries in root's crontab, for the setup page."""
-    return {"jobs": [e for e in crontab_entries() if e["schedule"] and
-                     (SCRIPTS_DIR in e["command"] or "frappe" in e["command"].lower())]}
+    """The backup-related entries in root's crontab, for the setup page.
+
+    legacy/missing_v2 drive the suite's repair button: on screen a legacy job
+    renders exactly like a v2 one, which is why a half-migrated schedule is
+    invisible until something stops producing backups."""
+    entries = [e for e in crontab_entries() if e["schedule"] and
+               (SCRIPTS_DIR in e["command"] or "frappe" in e["command"].lower())]
+    for e in entries:
+        e["legacy"] = is_legacy_backup(e["command"])
+    _, removed, added = migrate_cron_text(crontab_text())
+    return {"jobs": entries, "legacy": removed, "missing_v2": added}
 
 
 def repo_panel_version():
@@ -568,6 +680,7 @@ def setup_status():
     return {
         "repo_dir": REPO_DIR,
         "repo_ok": scripts_ok,
+        "scripts_dir": SCRIPTS_DIR,
         "server_ip": CONFIG.get("server_ip") or first_ip(),
         "erp_image": erp_image(),
         "components": {
@@ -1010,6 +1123,46 @@ def api_rclone_wire():
     _wire_remote_into(DEPLOYED_DB_BACKUP_SCRIPT, target)
     _wire_remote_into(DEPLOYED_UPDATE_SCRIPT, target)
     return jsonify({"ok": True, "wired": target})
+
+
+@app.route("/api/cron/migrate-v2", methods=["POST"])
+@login_required
+def api_cron_migrate_v2():
+    """Point root's backup schedule at the v2 scripts.
+
+    Drops cron jobs running the backup scripts from outside SCRIPTS_DIR and
+    adds whichever v2 jobs are absent. This is the switchover
+    setup_frappe_backups.sh deliberately refuses to perform — it will not
+    schedule v2 jobs next to legacy ones, because both would run and back up
+    the same site twice, so it leaves the crontab alone and asks for 'crontab
+    -e' over SSH. Everything unrelated in the crontab is preserved verbatim,
+    and the previous crontab is saved before anything is written."""
+    if not os.path.isfile(DEPLOYED_BACKUP_SCRIPT):
+        return jsonify({"error": "the backup system is not installed on this server yet"}), 400
+    before = crontab_text()
+    new_text, removed, added = migrate_cron_text(before)
+    if not removed and not added:
+        return jsonify({"ok": True, "removed": [], "added": [], "backup": None,
+                        "message": "the schedule already matches the v2 scripts"})
+
+    # Save the old crontab first: this is the only way back from a bad edit,
+    # and 0600 because a crontab can name paths worth not advertising.
+    backup_path = None
+    try:
+        JOB_DIR.mkdir(parents=True, exist_ok=True)
+        backup_path = JOB_DIR / f"crontab_{datetime.now():%Y%m%d_%H%M%S}.bak"
+        with os.fdopen(os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
+            f.write(before)
+    except OSError as e:
+        return jsonify({"error": f"could not save the current crontab, so nothing "
+                                 f"was changed: {e}"}), 500
+
+    err = write_crontab(new_text)
+    if err:
+        return jsonify({"error": f"crontab was not changed: {err}",
+                        "backup": str(backup_path)}), 500
+    return jsonify({"ok": True, "removed": removed, "added": added,
+                    "backup": str(backup_path)})
 
 
 @app.route("/guide/rclone")
@@ -1587,6 +1740,29 @@ function rcloneRow(s){
   return h + `</div>`;
 }
 
+// Rewrites root's crontab, so the confirmation spells out both halves of the
+// change and the fact that the old crontab is kept.
+async function migrateCron(legacy, missing){
+  const btn = $('#cron-fix'), msg = $('#cron-fix-msg');
+  const what = [];
+  if(legacy.length) what.push(`remove ${legacy.length} old backup job${legacy.length===1?'':'s'}`);
+  if(missing.length) what.push(`add ${missing.length} v2 job${missing.length===1?'':'s'}`);
+  if(!confirm(`Change root's crontab to ${what.join(' and ')}?\n\n`
+      + `Everything else in the crontab is left as it is, and a copy of the `
+      + `current one is saved before anything changes.`)) return;
+  btn.disabled = true; msg.textContent = 'Updating the crontab…';
+  try{
+    const r = await fetch('/api/cron/migrate-v2', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body:'{}'});
+    const j = await r.json();
+    if(j.error){ msg.textContent = j.error; btn.disabled = false; return; }
+    msg.textContent = j.message ||
+      `Done — removed ${j.removed.length}, added ${j.added.length}.`
+      + (j.backup ? ` Previous crontab saved to ${j.backup}` : '');
+    refreshSetup();
+  }catch(e){ msg.textContent = 'request failed'; btn.disabled = false; }
+}
+
 async function wireRclone(){
   const btn = $('#rc-wire'), msg = $('#rc-msg');
   btn.disabled = true; msg.textContent = 'Saving…';
@@ -1652,18 +1828,52 @@ async function refreshSetup(){
     rows += rcloneRow(s);
     // Scheduled backups: what root's crontab will actually run, and when
     const cj = (s.cron && s.cron.jobs) || [];
+    const legacy = (s.cron && s.cron.legacy) || [];
+    const missing = (s.cron && s.cron.missing_v2) || [];
+    // A schedule that still runs the pre-v2 scripts looks identical to a
+    // correct one in this list, so say which is which rather than just
+    // counting jobs.
+    const cronBad = legacy.length || missing.length;
     rows += `<div class="setup-row"><div class="setup-h"><b>Scheduled backups (cron)</b> `
-      + (cj.length ? `<span class="badge ok">${cj.length} job${cj.length===1?'':'s'} scheduled ✓</span>`
-                   : '<span class="badge miss">nothing scheduled</span>') + `</div>`;
+      + (legacy.length
+          ? `<span class="badge miss">${legacy.length} old job${legacy.length===1?'':'s'} still scheduled</span>`
+          : !cj.length
+            ? '<span class="badge miss">nothing scheduled</span>'
+            : missing.length
+              ? `<span class="badge miss">${missing.length} v2 job${missing.length===1?'':'s'} missing</span>`
+              : `<span class="badge ok">${cj.length} job${cj.length===1?'':'s'} scheduled ✓</span>`) + `</div>`;
     for(const j of cj){
       const w = cronWords(j.schedule);
-      rows += `<div class="note"><code>${esc(j.schedule)}</code>${w?' — '+w:''} — <code>${esc(j.command)}</code></div>`;
+      rows += `<div class="note">${j.legacy ? '<b style="color:var(--crit)">old</b> ' : ''}`
+        + `<code>${esc(j.schedule)}</code>${w?' — '+w:''} — <code>${esc(j.command)}</code></div>`;
     }
     rows += cj.length
       ? `<div class="note">This is root's crontab — the same list <code>sudo crontab -l</code> shows over SSH.</div>`
       : `<div class="note">The backup system installer schedules these (keep its cron checkbox ticked` +
         (c.backups.installed ? ' — re-run it to add the schedule' : '') +
         `). Over SSH: <code>sudo crontab -l</code>.</div>`;
+    if(cronBad){
+      // The backup installer will not fix this itself: it refuses to schedule
+      // v2 jobs while old ones are present, because both would run and back
+      // up the same site twice. This button is that switchover.
+      if(legacy.length){
+        rows += `<div class="note">These jobs run the backup scripts from outside
+          <code>${esc(s.scripts_dir||'')}</code> — the pre-v2 copies. They will be removed:</div>`;
+        for(const l of legacy) rows += `<div class="note"><code>${esc(l)}</code></div>`;
+      }
+      if(missing.length){
+        rows += `<div class="note">These v2 jobs are not scheduled and will be added:</div>`;
+        for(const l of missing) rows += `<div class="note"><code>${esc(l)}</code></div>`;
+      }
+      rows += `<div class="setup-form">
+        <button class="primary" id="cron-fix"${c.backups.installed ? '' : ' disabled'}
+          >${legacy.length ? 'Switch the schedule to the v2 scripts'
+                           : 'Schedule the v2 backup jobs'}</button>
+        <span id="cron-fix-msg" class="note" style="margin:0"></span></div>`;
+      if(!c.backups.installed)
+        rows += `<div class="note">Install the backup system first — scheduling jobs for
+          scripts that are not on the server would just fail nightly.</div>`;
+    }
     rows += `</div>`;
     // Tooling updates: deploy the checkout's v2 scripts + panel from here
     const upd = s.repo_panel_version && s.repo_panel_version !== s.panel_version;
@@ -1684,6 +1894,7 @@ async function refreshSetup(){
                  'Run the server from the <a href="/">dashboard</a>.</p>' : '') + rows;
     document.querySelectorAll('.setup-install').forEach(btn => btn.onclick = () => installComponent(btn));
     if ($('#rc-wire')) $('#rc-wire').onclick = wireRclone;
+    if ($('#cron-fix')) $('#cron-fix').onclick = () => migrateCron(legacy, missing);
     // A job started from the dashboard (or a second browser tab) still owns the
     // panel: re-disable the buttons the render above has just recreated.
     if (jobWasActive) document.querySelectorAll('.setup-install').forEach(b => b.disabled = true);

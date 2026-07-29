@@ -241,6 +241,21 @@ backup-related entries in root's crontab — the same list `sudo crontab -l`
 prints over SSH (daily full backup at 02:00, DB-only every 6 hours, verify on
 Sundays at 03:00, if you let the backup installer schedule them).
 
+Jobs still running the pre-v2 scripts (from outside `scripts_dir`) are marked
+**old** in that list, and the row grows a **Switch the schedule to the v2
+scripts** button. `setup_frappe_backups.sh` will not do this for you by
+design: it refuses to schedule v2 jobs while old ones are present, because
+both would run and back the same site up twice, so it installs the scripts and
+leaves the crontab to `sudo crontab -e`. The button is that switchover —
+it removes the old backup lines, adds whichever of the three v2 jobs are
+missing, and leaves everything else in the crontab byte-for-byte alone. A copy
+of the previous crontab is written to the job directory
+(`crontab_<timestamp>.bak`) before anything changes, and the reply names it. A
+v2 job you have re-timed yourself counts as present and is not reset. On a
+server with no schedule at all the same button reads **Schedule the v2 backup
+jobs**; it is disabled until the backup system is installed, since scheduling
+scripts that are not on disk only buys nightly failures.
+
 If the badge still shows an old version after both, the service didn't
 restart: `sudo systemctl restart sspl-admin`, then
 `sudo journalctl -u sspl-admin -n 20` — the panel prints its version and
@@ -248,6 +263,7 @@ feature list on startup.
 
 | Version | Should show |
 |---|---|
+| `2026-07-29.3` | Cron row flags pre-v2 jobs, with a button to switch them over |
 | `2026-07-29.2` | Terminal text at 1.25x (15.625px) |
 | `2026-07-29.1` | **Update Admin Panel** button in the dashboard top bar |
 | `2026-07-15.4` | Terminal full-width at the foot of the page, typed into directly |
