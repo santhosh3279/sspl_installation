@@ -84,6 +84,7 @@ ERP_STACK_SCRIPT = _repo("Production Installation/install_erp_stack.sh")
 BACKUP_SETUP_SCRIPT = _repo("Backup/frappe_backup_system/setup_frappe_backups.sh")
 UPDATE_SETUP_SCRIPT = _repo("Production Installation/update and rollback/install_update_rollback.sh")
 RCLONE_SETUP_SCRIPT = _repo("Backup/frappe_backup_system/install_rclone.sh")
+ADGUARD_SETUP_SCRIPT = _repo("Production Installation/install_adguard.sh")
 RCLONE_GUIDE = _repo("Backup/Rclone_Configuration_Guide.docx")
 UPDATE_TOOLING_SCRIPT = _repo("update_tooling.sh")
 UPDATE_PANEL_SCRIPT = _repo("update_panel.sh")
@@ -94,6 +95,7 @@ INSTALL_ACTIONS = {
                         "cwd": _repo("Backup/frappe_backup_system")},
     "install_update":  {"label": "Install update/rollback", "cmd": ["bash", UPDATE_SETUP_SCRIPT or ""]},
     "install_rclone":  {"label": "Install rclone",          "cmd": ["bash", RCLONE_SETUP_SCRIPT or ""]},
+    "install_adguard": {"label": "Install AdGuard Home",    "cmd": ["bash", ADGUARD_SETUP_SCRIPT or ""]},
     "update_tooling":  {"label": "Update v2 scripts & panel",
                         "cmd": ["bash", UPDATE_TOOLING_SCRIPT or ""]},
     # Pulls the checkout first, then deploys only the panel from it. The
@@ -427,6 +429,14 @@ def first_ip():
         return ""
 
 
+def is_adguard_running():
+    try:
+        out = subprocess.run(["systemctl", "is-active", "AdGuardHome"], capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() == "active"
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def rclone_remotes():
     """Cloud remotes rclone can see, as root — the user the backup job runs as.
 
@@ -681,7 +691,7 @@ def setup_status():
         "repo_dir": REPO_DIR,
         "repo_ok": scripts_ok,
         "scripts_dir": SCRIPTS_DIR,
-        "server_ip": CONFIG.get("server_ip") or first_ip(),
+        "server_ip": CONFIG.get("server_ip") or "",
         "erp_image": erp_image(),
         "components": {
             "erp": {
@@ -692,6 +702,10 @@ def setup_status():
             "backups": {"installed": os.path.isfile(DEPLOYED_BACKUP_SCRIPT)},
             "update":  {"installed": os.path.isfile(os.path.join(UPDATE_DIR, "sspl-erp-common.sh"))},
             "rclone":  rclone_status(),
+            "adguard": {
+                "installed": os.path.isfile("/opt/AdGuardHome/AdGuardHome"),
+                "running": is_adguard_running(),
+            },
         },
         "cron": cron_status(),
         "panel_version": PANEL_VERSION,
@@ -1037,7 +1051,7 @@ def _install_env(name, data):
 
     # rclone is just a binary — it needs nothing from the ERP stack, and can be
     # installed before it (unlike the two below, which read the site name).
-    if name == "install_rclone":
+    if name in ("install_rclone", "install_adguard"):
         return {}, None
 
     # Both updaters restart the panel service at the end, which would kill
@@ -1823,6 +1837,17 @@ async function refreshSetup(){
         <button class="primary setup-install" data-inst="install_update" ${erpDone?'':'disabled'}
           data-confirm="Install the update/rollback scripts now?">Install update/rollback</button>`
         + (erpDone?'':'<span style="color:var(--muted);font-size:12px">install ERPNext first</span>') + `</div>`;
+    }
+    rows += `</div>`;
+    // AdGuard Home DNS Service
+    rows += `<div class="setup-row"><div class="setup-h"><b>AdGuard Home DNS</b> ${pill(c.adguard.installed)}`
+      + (c.adguard.installed && c.adguard.running ? ' <span class="badge ok">running</span>' : '') + `</div>`;
+    if(!c.adguard.installed){
+      rows += `<div class="setup-form">
+        <button class="primary setup-install" data-inst="install_adguard"
+          data-confirm="Install AdGuard Home DNS service now? This will configure systemd-resolved to disable port 53 conflicts and install AdGuard Home.">Install AdGuard Home</button></div>`;
+    } else {
+      rows += `<div class="note">AdGuard Home is running. Access the dashboard to configure DNS blocking: <a href="http://${esc(s.server_ip || location.hostname)}:3000" target="_blank">http://${esc(s.server_ip || location.hostname)}:3000</a></div>`;
     }
     rows += `</div>`;
     rows += rcloneRow(s);

@@ -88,9 +88,13 @@ fi
 # ─────────────────────────────────────────────────────── ask everything upfront
 step "Configuration — answer once, then the install runs unattended"
 
-DETECTED_IP=$(hostname -I | awk '{print $1}')
-read -p "Server LAN IP (this is also the ERP site name) [$DETECTED_IP]: " SERVER_IP
-SERVER_IP=${SERVER_IP:-$DETECTED_IP}
+SERVER_IP=""
+while [ -z "$SERVER_IP" ]; do
+    read -p "Enter ERP site name (IP or domain name): " SERVER_IP
+    if [ -z "$SERVER_IP" ]; then
+        echo "ERP site name is required. Please try again."
+    fi
+done
 
 read -p "HTTP port for the ERP frontend [80]: " HTTP_PORT
 HTTP_PORT=${HTTP_PORT:-80}
@@ -180,7 +184,7 @@ if [[ "$WANT_PANEL" =~ ^[Yy] ]]; then
     echo "→ Installing web admin panel (/opt/sspl-admin)..."
     (cd "$REPO_DIR/Admin Panel" && \
         SSPL_ADMIN_USER="$PANEL_USER" SSPL_ADMIN_PW="$PANEL_PW" \
-        SSPL_PANEL_PORT=8090 SSPL_CERT_IP="$SERVER_IP" \
+        SSPL_PANEL_PORT=8090 SSPL_CERT_IP="$SERVER_IP" SSPL_SERVER_IP="$SERVER_IP" \
         bash setup_admin_panel.sh)
 else
     echo "– Admin panel skipped"

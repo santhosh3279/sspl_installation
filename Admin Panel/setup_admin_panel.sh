@@ -12,7 +12,15 @@ INSTALL_DIR=/opt/sspl-admin
 # panel's Install switches run the installers from here, so this path must
 # keep existing on the server after setup.
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-SERVER_IP="$(hostname -I | awk '{print $1}')"
+SERVER_IP="${SSPL_SERVER_IP:-}"
+if [ -z "$SERVER_IP" ]; then
+    while [ -z "$SERVER_IP" ]; do
+        read -p "Enter ERP site name (IP or domain name): " SERVER_IP
+        if [ -z "$SERVER_IP" ]; then
+            echo "ERP site name is required. Please try again."
+        fi
+    done
+fi
 
 echo "=== SSPL ERP Admin Panel Setup ==="
 
@@ -65,9 +73,12 @@ KEY="$CERT_DIR/sspl-admin.key"
 if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
     CERT_IP="${SSPL_CERT_IP:-}"
     if [ -z "$CERT_IP" ]; then
-        DETECTED_IP=$(hostname -I | awk '{print $1}')
-        read -p "Server IP for the certificate [$DETECTED_IP]: " CERT_IP
-        CERT_IP=${CERT_IP:-$DETECTED_IP}
+        while [ -z "$CERT_IP" ]; do
+            read -p "Enter Server IP/domain for the certificate: " CERT_IP
+            if [ -z "$CERT_IP" ]; then
+                echo "Certificate IP/domain is required. Please try again."
+            fi
+        done
     fi
     echo "Generating self-signed HTTPS certificate for $CERT_IP..."
     sudo mkdir -p "$CERT_DIR"
@@ -106,11 +117,10 @@ sudo systemctl enable --now sspl-admin
 sleep 2
 sudo systemctl --no-pager --lines=0 status sspl-admin || true
 
-IP=$(hostname -I | awk '{print $1}')
 echo ""
 echo "=== Installation Complete ==="
 echo ""
-echo "Admin panel:   https://$IP:$PORT"
+echo "Admin panel:   https://$SERVER_IP:$PORT"
 echo "Username:      $ADMIN_USER"
 echo ""
 echo "NOTE: the certificate is self-signed, so the browser shows a security"
