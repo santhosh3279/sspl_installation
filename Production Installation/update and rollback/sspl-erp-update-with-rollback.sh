@@ -9,6 +9,9 @@ BACKUP_FILE="$BACKUP_DIR/backup_$TIMESTAMP.tar"
 RCLONE_REMOTE=""  # Optional: e.g. "gdrive:frappe-backups" — leave empty to skip cloud upload
 CLEAR_CLOUD_TRASH=yes # When the remote is too full for the snapshot, permanently
                       # delete old backups out of its trash to make room
+MEGA_HARD_DELETE=yes  # On Mega only: prune permanently instead of binning.
+                      # Set to 'no' to keep Mega's rubbish bin as an undo path,
+                      # at the cost of it holding every pruned snapshot forever
 # Installed by the backup setup, not by this one — hence the absolute path.
 TRASH_CLEANUP="/opt/scripts/v2/rclone_trash_cleanup.sh"
 
@@ -116,13 +119,35 @@ fi
 # are multi-gigabyte, so the cloud copy follows the same retention instead
 # of growing without bound.
 echo ""
+# How the cloud side of the prune below deletes. Mega bins its deletes and
+# rclone can only empty that bin wholesale ('cleanup'), never part of it — so
+# on Mega snapshots are deleted permanently and the bin never fills. Drive
+# keeps its trash, where rclone_trash_cleanup.sh can reclaim just what an
+# upload needs. Snapshots are the biggest thing this stack uploads, so a bin
+# full of them is the fastest way to a wedged remote.
+#
+# stdin is closed: a password-protected rclone config would prompt for it.
+PRUNE_FLAGS=()
+case "$RCLONE_REMOTE" in
+    ""|:*) ;;   # unset, or a ':backend:...' connection string with no named remote
+    *:*)
+        if [ "$MEGA_HARD_DELETE" = "yes" ] && [ "$(rclone config show \
+                "${RCLONE_REMOTE%%:*}" </dev/null 2>/dev/null \
+                | grep -oP '^\s*type\s*=\s*\K\S+' | head -1)" = "mega" ]; then
+            PRUNE_FLAGS=(--mega-hard-delete)
+            echo "   Mega remote: pruned snapshots are deleted permanently, not binned"
+        fi
+        ;;
+esac
+
 echo "→ Cleaning old backups (keeping last 3)..."
 OLD_BACKUPS=$(ls -t "$BACKUP_DIR"/backup_*.tar 2>/dev/null | tail -n +4)
 if [ -n "$OLD_BACKUPS" ]; then
     echo "$OLD_BACKUPS" | while read backup; do
         rm -f "$backup"
         if [ -n "$RCLONE_REMOTE" ]; then
-            rclone deletefile "$RCLONE_REMOTE/image-snapshots/$(basename "$backup")" 2>/dev/null || true
+            rclone deletefile "${PRUNE_FLAGS[@]}" \
+                "$RCLONE_REMOTE/image-snapshots/$(basename "$backup")" 2>/dev/null || true
         fi
         echo "   ✓ Deleted: $(basename "$backup")"
     done

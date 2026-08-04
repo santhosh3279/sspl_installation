@@ -16,6 +16,9 @@ RCLONE_REMOTE=""  # Optional: e.g. "gdrive:frappe-backups" — leave empty to sk
 CLOUD_KEEP=10     # How many dumps to keep on the remote (local keeps RETENTION_DAYS)
 CLEAR_CLOUD_TRASH=yes # When the remote is too full for the upload, permanently
                       # delete old backups out of its trash to make room
+MEGA_HARD_DELETE=yes  # On Mega only: prune permanently instead of binning.
+                      # Set to 'no' to keep Mega's rubbish bin as an undo path,
+                      # at the cost of it holding every pruned dump forever
 
 mkdir -p "$BACKUP_DIR"
 chmod 700 "$BACKUP_DIR"
@@ -74,6 +77,26 @@ fi
 # dumps don't mix with the full backups' timestamped directories. Same
 # semantics as the full backup: a failed upload is a warning, not a failure.
 if [ -n "$RCLONE_REMOTE" ]; then
+    # How the cloud prune below deletes. Mega bins its deletes and rclone can
+    # only empty that bin wholesale ('cleanup'), never part of it — so on Mega
+    # the prune deletes permanently and the bin never fills. Drive keeps its
+    # trash, where rclone_trash_cleanup.sh can reclaim just what an upload
+    # needs. See BACKUP_GUIDE.md, "Reclaiming trashed space".
+    #
+    # stdin is closed: a password-protected rclone config would prompt for it.
+    PRUNE_FLAGS=()
+    case "$RCLONE_REMOTE" in
+        :*) ;;   # ':backend:...' connection string — no named remote to look up
+        *:*)
+            if [ "$MEGA_HARD_DELETE" = "yes" ] && [ "$(rclone config show \
+                    "${RCLONE_REMOTE%%:*}" </dev/null 2>/dev/null \
+                    | grep -oP '^\s*type\s*=\s*\K\S+' | head -1)" = "mega" ]; then
+                PRUNE_FLAGS=(--mega-hard-delete)
+                echo "Mega remote: pruned dumps are deleted permanently, not binned"
+            fi
+            ;;
+    esac
+
     # Make room first if the remote is short: the cloud prune below deletes
     # with 'rclone deletefile', which on Google Drive only moves the old dumps
     # to the account's trash, where they keep consuming quota. Never fatal —
@@ -102,7 +125,7 @@ if [ -n "$RCLONE_REMOTE" ]; then
         if [ -n "$OLD_REMOTE" ]; then
             echo "$OLD_REMOTE" | while read -r dump; do
                 [ -n "$dump" ] || continue
-                if rclone deletefile "$RCLONE_REMOTE/db-only/$dump" 2>/dev/null; then
+                if rclone deletefile "${PRUNE_FLAGS[@]}" "$RCLONE_REMOTE/db-only/$dump" 2>/dev/null; then
                     echo "  Removed from cloud: $dump"
                 else
                     echo "  WARNING: could not remove from cloud: $dump"

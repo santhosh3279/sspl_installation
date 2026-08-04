@@ -209,12 +209,39 @@ log "short by $(human "$DEFICIT") — aiming to free $(human "$TARGET") (+${HEAD
 
 # ------------------------------------------------------- backend must be Drive
 # The selective part of this ('permanently delete these specific trashed
-# items') is a Drive-backend capability. Everywhere else the only tool is
-# 'rclone cleanup', which empties the entire trash — more than was asked for,
-# so it is not offered here, not even behind a flag.
+# items') needs a trashed-only listing, and Drive is the only backend rclone
+# gives one for. Everywhere else the only tool is 'rclone cleanup', which
+# empties the entire trash — more than was asked for, so it is not offered
+# here, not even behind a flag. Mega gets its own message because it does have
+# a bin that fills the same way; the other backends may not have one at all.
 REMOTE_TYPE=$(rclone config show "$REMOTE_NAME" </dev/null 2>/dev/null \
     | grep -oP '^\s*type\s*=\s*\K\S+' | head -1)
-if [ "$REMOTE_TYPE" != "drive" ]; then
+if [ "$REMOTE_TYPE" = "drive" ]; then
+    :
+elif [ "$REMOTE_TYPE" = "mega" ]; then
+    # Mega has a rubbish bin with the same quota problem, but none of the tools
+    # to work on it selectively: rclone exposes no trashed-only listing for
+    # Mega, so there is nothing to enumerate, sort oldest-first, or stop halfway
+    # through. The only lever is 'rclone cleanup', which empties the whole bin —
+    # exactly the unbounded delete this script exists to avoid. So it reports
+    # and stops, and the backup scripts keep Mega's bin empty at the other end
+    # instead, by pruning with --mega-hard-delete.
+    log "remote '$REMOTE_NAME' is Mega."
+    TRASHED=$(rclone about --json "$REMOTE_ROOT" </dev/null 2>/dev/null \
+        | grep -oP '"trashed"\s*:\s*\K[0-9]+' | head -1)
+    case "$TRASHED" in
+        ''|0|*[!0-9]*) ;;
+        *) log "its rubbish bin holds $(human "$TRASHED")" ;;
+    esac
+    log "rclone cannot list or delete individual items in a Mega bin — only"
+    log "'rclone cleanup $REMOTE_ROOT', which empties all of it. That is more"
+    log "than this upload needs, so it is not done here."
+    log "With MEGA_HARD_DELETE=yes (the default) the backup scripts prune Mega"
+    log "permanently, so the bin should not be filling. If it is, either that"
+    log "was turned off or the bin predates it — empty it once by hand:"
+    log "  rclone cleanup $REMOTE_ROOT"
+    exit 2
+else
     log "remote '$REMOTE_NAME' is type '${REMOTE_TYPE:-unknown}', not 'drive'"
     log "selective trash clearing is Drive-only ('rclone cleanup' elsewhere would"
     log "empty the whole trash, not just what is needed) — skipping"

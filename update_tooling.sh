@@ -83,8 +83,8 @@ if [ "$ONLY" = "all" ]; then
 echo ""
 echo "→ 1/3 Backup scripts ($BACKUP_DST)"
 if [ -f "$BACKUP_DST/frappe_backup.sh" ]; then
-    update_script "$BACKUP_SRC" "$BACKUP_DST" frappe_backup.sh        SITE_NAME BACKUP_DIR RETENTION_DAYS LOCAL_KEEP_MIN CLOUD_KEEP RCLONE_REMOTE CLEAR_CLOUD_TRASH
-    update_script "$BACKUP_SRC" "$BACKUP_DST" frappe_db_backup.sh     SITE_NAME BACKUP_DIR RETENTION_DAYS LOCAL_KEEP_MIN CLOUD_KEEP RCLONE_REMOTE CLEAR_CLOUD_TRASH
+    update_script "$BACKUP_SRC" "$BACKUP_DST" frappe_backup.sh        SITE_NAME BACKUP_DIR RETENTION_DAYS LOCAL_KEEP_MIN CLOUD_KEEP RCLONE_REMOTE CLEAR_CLOUD_TRASH MEGA_HARD_DELETE
+    update_script "$BACKUP_SRC" "$BACKUP_DST" frappe_db_backup.sh     SITE_NAME BACKUP_DIR RETENTION_DAYS LOCAL_KEEP_MIN CLOUD_KEEP RCLONE_REMOTE CLEAR_CLOUD_TRASH MEGA_HARD_DELETE
     update_script "$BACKUP_SRC" "$BACKUP_DST" frappe_restore.sh       SITE_NAME
     update_script "$BACKUP_SRC" "$BACKUP_DST" frappe_backup_verify.sh BACKUP_DIR ALERT_EMAIL MAX_AGE_HOURS
     update_script "$BACKUP_SRC" "$BACKUP_DST" restore_with_backup.sh
@@ -102,7 +102,7 @@ echo ""
 echo "→ 2/3 Update & rollback scripts ($UPDATE_DST)"
 if [ -f "$UPDATE_DST/sspl-erp-common.sh" ]; then
     update_script "$UPDATE_SRC" "$UPDATE_DST" sspl-erp-common.sh SITE_NAME SERVICE_WAIT_TIMEOUT
-    update_script "$UPDATE_SRC" "$UPDATE_DST" sspl-erp-update-with-rollback.sh RCLONE_REMOTE CLEAR_CLOUD_TRASH
+    update_script "$UPDATE_SRC" "$UPDATE_DST" sspl-erp-update-with-rollback.sh RCLONE_REMOTE CLEAR_CLOUD_TRASH MEGA_HARD_DELETE
     update_script "$UPDATE_SRC" "$UPDATE_DST" sspl-erp-rollback.sh
     update_script "$UPDATE_SRC" "$UPDATE_DST" sspl-erp-backup-manager.sh
     UPDATED="$UPDATED update-scripts"

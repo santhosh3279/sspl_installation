@@ -16,6 +16,9 @@ RCLONE_REMOTE=""  # Optional: e.g. "gdrive:frappe-backups" — leave empty to sk
 CLOUD_KEEP=10     # How many backups to keep on the remote (local keeps RETENTION_DAYS)
 CLEAR_CLOUD_TRASH=yes # When the remote is too full for the upload, permanently
                       # delete old backups out of its trash to make room
+MEGA_HARD_DELETE=yes  # On Mega only: prune permanently instead of binning.
+                      # Set to 'no' to keep Mega's rubbish bin as an undo path,
+                      # at the cost of it holding every pruned backup forever
 
 # Create backup directory if it doesn't exist (restricted: backups contain credentials)
 mkdir -p "$BACKUP_DIR"
@@ -130,6 +133,29 @@ echo "Backup size: $BACKUP_SIZE"
 
 # 7. Optional: upload to cloud storage via rclone (see Rclone_Configuration_Guide)
 if [ -n "$RCLONE_REMOTE" ]; then
+    # How the cloud prune at the bottom of this block deletes.
+    #
+    # Mega deletes into the account's rubbish bin, where the files go on
+    # consuming quota — and unlike Drive there is no way to clear part of that
+    # bin: rclone has no trashed-only listing for Mega, only 'cleanup', which
+    # empties all of it. So on Mega the prune deletes permanently and the bin
+    # never fills. Drive keeps its trash, because there rclone_trash_cleanup.sh
+    # can reclaim exactly what an upload needs — the undo path costs nothing.
+    #
+    # stdin is closed: a password-protected rclone config would prompt for it.
+    PRUNE_FLAGS=()
+    case "$RCLONE_REMOTE" in
+        :*) ;;   # ':backend:...' connection string — no named remote to look up
+        *:*)
+            if [ "$MEGA_HARD_DELETE" = "yes" ] && [ "$(rclone config show \
+                    "${RCLONE_REMOTE%%:*}" </dev/null 2>/dev/null \
+                    | grep -oP '^\s*type\s*=\s*\K\S+' | head -1)" = "mega" ]; then
+                PRUNE_FLAGS=(--mega-hard-delete)
+                echo "Mega remote: pruned backups are deleted permanently, not binned"
+            fi
+            ;;
+    esac
+
     # Make room before uploading, if the remote is short. The cloud prune below
     # uses 'rclone purge', which on Google Drive only moves the old backups to
     # the account's trash — where they go on consuming quota. This reclaims
@@ -169,7 +195,7 @@ if [ -n "$RCLONE_REMOTE" ]; then
             echo "$OLD_REMOTE" | while read -r folder; do
                 # An empty name here would purge the whole remote
                 [ -n "$folder" ] || continue
-                if rclone purge "$RCLONE_REMOTE/$folder" 2>/dev/null; then
+                if rclone purge "${PRUNE_FLAGS[@]}" "$RCLONE_REMOTE/$folder" 2>/dev/null; then
                     echo "  Removed from cloud: $folder"
                 else
                     echo "  WARNING: could not remove from cloud: $folder"

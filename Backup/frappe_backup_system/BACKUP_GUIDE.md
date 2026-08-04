@@ -170,6 +170,35 @@ this takes them out of it for good. Selective clearing is a Google Drive
 capability; on other backends the script reports that and skips, because
 `rclone cleanup` there would empty far more than was asked for.
 
+### MEGA:
+
+MEGA works for backups — upload and retention behave the same as anywhere
+else. Its rubbish bin has the same quota problem as Drive's trash, but none of
+the tools to work on it: rclone offers no trashed-only listing for MEGA, so
+there is nothing to enumerate, sort oldest-first, or stop halfway through. The
+only lever is `rclone cleanup mega:`, which empties the whole bin — the exact
+unbounded delete the cleanup script exists to avoid.
+
+So on MEGA the problem is prevented instead of repaired. `MEGA_HARD_DELETE=yes`
+(the default) makes the retention prune pass `--mega-hard-delete`, which per
+rclone's docs *"delete[s] files permanently rather than putting them into the
+trash"*. Pruned backups never reach the bin, so the bin never fills.
+
+The trade-off is the one Drive avoids: on MEGA a pruned backup is gone
+immediately, with no bin to fish it back out of. Set `MEGA_HARD_DELETE=no` to
+keep the undo path — the bin will then accumulate every pruned backup, and
+you will have to run `rclone cleanup mega:` yourself when quota runs out.
+
+The flag is only applied when the remote really is a MEGA remote (checked with
+`rclone config show`), so Drive and every other backend are untouched by it.
+Pointing the cleanup script at a MEGA remote reports all of the above, tells
+you how much the bin currently holds, and exits without deleting anything.
+
+Two MEGA-specific cautions: the free tier is 20 GB, and image snapshots alone
+run to several GB each. And rclone's docs warn that *"Mega allows duplicate
+files which may confuse rclone"* — repeated backup uploads are exactly that
+pattern, so `rclone dedupe mega:frappe-backups` is worth knowing about.
+
 ### Manual Cleanup:
 ```bash
 # Remove backups older than 60 days
