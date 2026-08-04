@@ -33,7 +33,7 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-07-29.3"
+PANEL_VERSION = "2026-08-04.1"
 FEATURES = ("ERP Next Installation suite page with rclone cloud backup setup "
             "covering full and DB-only backups, console-style terminal, "
             "guarded restore, delete uploads, cron jobs viewer on the dashboard, "
@@ -462,6 +462,22 @@ def rclone_version():
         return None
 
 
+def expand_targets(spec, remotes):
+    """The destinations an RCLONE_REMOTE value actually resolves to.
+
+    Mirrors rclone_expand_targets() in the backup scripts, and must keep
+    mirroring it: a space-separated list of "remote:folder", or "*:folder"
+    meaning every remote rclone reports. If the two ever disagree the panel
+    shows a destination list the backups do not use."""
+    spec = (spec or "").strip()
+    if not spec:
+        return []
+    if spec.startswith("*:"):
+        folder = spec[2:]
+        return [r + folder for r in remotes]
+    return spec.split()
+
+
 def wired_remote(script=DEPLOYED_BACKUP_SCRIPT):
     """The remote a deployed backup script uploads to, '' if local-only.
 
@@ -487,12 +503,19 @@ def rclone_status():
     installed = bool(shutil.which("rclone"))
     remotes = rclone_remotes() if installed else []
     wired = wired_remote()
+    targets = expand_targets(wired, remotes)
     # The backup script naming a remote is not the same as that remote
     # existing. "gdrive:frappe-backups" is the example in the setup guide, so
     # it is exactly what a hand-edit leaves behind on a server whose remote is
     # actually called something else — and the upload failure is only a
     # warning, so every backup would report success while uploading nothing.
-    wired_ok = bool(wired) and any(wired.startswith(r) for r in remotes)
+    #
+    # every(), not any(): with several destinations, one bad name means that
+    # copy of the backup is silently not being made. "*:" expands from the
+    # remote list itself so it cannot contain a bad name — but it expands to
+    # nothing when no remote is configured, and that is not green either.
+    wired_ok = bool(targets) and all(
+        any(t.startswith(r) for r in remotes) for t in targets)
     return {
         "installed": installed,
         "version": rclone_version() if installed else None,
@@ -501,6 +524,11 @@ def rclone_status():
         "backups_installed": wired is not None,
         "wired": wired or "",
         "wired_ok": wired_ok,
+        # What that value resolves to, and whether it is the "every remote"
+        # form — the panel checks boxes from these, and shows the expansion so
+        # "*:" is never a destination list the user cannot see.
+        "wired_targets": targets,
+        "wired_all": (wired or "").strip().startswith("*:"),
         # The DB-only and update scripts upload separately; None = the
         # deployed copy has no RCLONE_REMOTE line (predates cloud upload), so
         # wiring can't help until update_tooling.sh replaces it.
@@ -1108,29 +1136,61 @@ def _wire_remote_into(script, target):
 @app.route("/api/rclone/wire", methods=["POST"])
 @login_required
 def api_rclone_wire():
-    """Point both deployed backup scripts at a cloud remote.
+    """Point the deployed backup scripts at one or more cloud remotes.
 
-    The remote name must be one rclone actually reports: a typo here would not
-    fail the backup — the upload failure is only a warning — so it would show
-    green while nothing ever reached the cloud."""
+    Every remote name must be one rclone actually reports: a typo here would
+    not fail the backup — the upload failure is only a warning — so it would
+    show green while nothing ever reached the cloud.
+
+    Accepts {"remotes": ["gdrive:", "mega:"], "path": "frappe-backups"}, or
+    {"all": true, "path": ...} for the "*:" form. The older singular
+    {"remote": ...} is still honoured, so a cached copy of the previous panel
+    keeps working against a restarted server."""
     data = request.get_json(silent=True) or {}
-    remote = str(data.get("remote", "")).strip()
     path = str(data.get("path", "")).strip().strip("/")
-    if not RCLONE_NAME_RE.match(remote):
-        return jsonify({"error": "choose a remote"}), 400
-    if remote not in rclone_remotes():
-        return jsonify({"error": f"rclone does not know a remote called '{remote}' — "
-                                 "configure it with 'sudo rclone config' over SSH"}), 400
+    use_all = bool(data.get("all"))
+    names = data.get("remotes")
+    if names is None and data.get("remote"):
+        names = [data.get("remote")]
+    names = [str(n).strip() for n in (names or []) if str(n).strip()]
+
     if path and (not RCLONE_PATH_RE.match(path) or ".." in path):
         return jsonify({"error": "folder may only use letters, digits, . - _ and /"}), 400
-    target = remote + path
+
+    known = rclone_remotes()
+    if use_all:
+        # "*:" is expanded by the backup scripts at run time, not here, so a
+        # remote added tomorrow is included without touching the panel. That
+        # is the whole point of it — and the reason it needs the warning the
+        # checkbox carries.
+        if not known:
+            return jsonify({"error": "rclone has no remotes configured yet — "
+                                     "run 'sudo rclone config' over SSH first"}), 400
+        target = "*:" + path
+    else:
+        if not names:
+            return jsonify({"error": "choose at least one remote"}), 400
+        seen = []
+        for n in names:
+            if not RCLONE_NAME_RE.match(n):
+                return jsonify({"error": f"'{n}' is not a valid remote name"}), 400
+            if n not in known:
+                return jsonify({"error": f"rclone does not know a remote called '{n}' — "
+                                         "configure it with 'sudo rclone config' over SSH"}), 400
+            if n not in seen:
+                seen.append(n)
+        # Space-separated, which is what the scripts split on — so neither the
+        # remote names nor the folder may contain a space. RCLONE_NAME_RE and
+        # RCLONE_PATH_RE have already guaranteed that.
+        target = " ".join(n + path for n in seen)
+
     err = _wire_remote_into(DEPLOYED_BACKUP_SCRIPT, target)
     if err == "is not installed":
         return jsonify({"error": "the backup system is not installed on this server yet"}), 400
     if err:
         return jsonify({"error": f"{DEPLOYED_BACKUP_SCRIPT} {err}"}), 500
     # The DB-only script (db-only/) and the update script's image snapshot
-    # (image-snapshots/) upload to the same remote. Failing to wire them is
+    # (image-snapshots/) upload to the same remotes. Failing to wire them is
     # not a failure of the request — an older deployed copy has no
     # RCLONE_REMOTE line, and the update system may not be installed at all —
     # the status row reports any mismatch.
@@ -1658,10 +1718,15 @@ function stagePill(ok, okText, missText){
 // backup still reports success when nothing was uploaded.
 function rcloneRow(s){
   const r = (s.components && s.components.rclone) || {};
+  // "*:frappe-backups" says nothing about where backups actually land, so
+  // show what it expanded to alongside it.
+  const wiredShow = (r.wired_all && (r.wired_targets||[]).length)
+    ? r.wired + ' → ' + r.wired_targets.join(' ')
+    : (r.wired || '');
   let h = `<div class="setup-row"><div class="setup-h"><b>Cloud backup (rclone)</b> `
     + (r.ready ? '<span class="badge ok">set up ✓</span>'
                : '<span class="badge miss">not set up</span>')
-    + (r.ready ? ` <span class="badge">uploading to ${esc(r.wired)}</span>` : '') + `</div>`;
+    + (r.ready ? ` <span class="badge">uploading to ${esc(wiredShow)}</span>` : '') + `</div>`;
 
   // 1. the binary
   h += `<div class="stage"><span class="n">1.</span>
@@ -1686,13 +1751,19 @@ function rcloneRow(s){
   // 3. wiring the remote into the backup script
   h += `<div class="stage"><span class="n">3.</span>
         <span class="t">Backups upload to it</span>
-        ${stagePill(r.wired_ok, r.wired || 'wired', r.wired || 'backups stay local only')}</div>`;
+        ${stagePill(r.wired_ok, wiredShow || 'wired', wiredShow || 'backups stay local only')}</div>`;
   // Wired to a remote rclone has never heard of: every backup would log an
   // upload failure and still report success. Say so rather than showing green.
+  // With several destinations, name the bad ones — the others may be fine,
+  // and "one of your three copies is not being made" is the real message.
   if(r.wired && !r.wired_ok){
+    const bad = (r.wired_targets||[]).filter(t => !(r.remotes||[]).some(x => t.startsWith(x)));
     h += `<div class="note" style="color:var(--crit)">Backups point at
-      <code>${esc(r.wired)}</code>, but rclone has no such remote${r.installed ? '' : ' (rclone is not installed)'} —
-      uploads are failing silently. Pick a remote below.</div>`;
+      <code>${esc(bad.length ? bad.join(' ') : r.wired)}</code>, but rclone has
+      no such remote${r.installed ? '' : ' (rclone is not installed)'} —
+      ${bad.length && bad.length < (r.wired_targets||[]).length
+        ? 'that copy is silently not being made' : 'uploads are failing silently'}.
+      Pick your remotes below.</div>`;
   }
   // The DB-only backup and the update's image snapshot upload on their own
   // RCLONE_REMOTE lines, so they can lag behind: wired before they existed,
@@ -1714,13 +1785,28 @@ function rcloneRow(s){
   if(!r.backups_installed){
     h += `<div class="note">Install the backup system first.</div>`;
   } else if(r.configured){
-    h += `<div class="setup-form" style="margin-left:14px">
-      <select id="rc-remote">` + (r.remotes||[]).map(x =>
-        `<option value="${esc(x)}" ${r.wired && r.wired.startsWith(x) ? 'selected' : ''}>${esc(x)}</option>`).join('')
-      + `</select>
-      <input type="text" id="rc-path" size="16" placeholder="folder"
-             value="${esc(r.wired ? r.wired.replace(/^[^:]*:/, '') : 'frappe-backups')}">
-      <button class="primary" id="rc-wire">${r.wired ? 'Update destination' : 'Upload backups here'}</button>
+    // Backups go to every remote ticked here, independently — one failing
+    // does not stop the others. The folder is the same on all of them.
+    const targets = r.wired_targets || [];
+    // The folder to prefill: take it off the first destination, whatever
+    // form it was written in ("*:frappe-backups" and "gdrive:frappe-backups"
+    // both yield "frappe-backups").
+    const first = (r.wired || '').split(/\s+/)[0] || '';
+    const folder = first ? first.replace(/^[^:]*:/, '') : 'frappe-backups';
+    h += `<div class="setup-form" style="margin-left:14px;flex-wrap:wrap">
+      <div style="width:100%;display:flex;gap:14px;flex-wrap:wrap;margin-bottom:4px">`
+      + (r.remotes||[]).map(x =>
+        `<label style="font-size:13px"><input type="checkbox" class="rc-rem" value="${esc(x)}"
+          ${!r.wired_all && targets.some(t => t.startsWith(x)) ? 'checked' : ''}> ${esc(x)}</label>`).join('')
+      + `</div>
+      <label style="width:100%;font-size:13px"><input type="checkbox" id="rc-all"
+        ${r.wired_all ? 'checked' : ''}> Every remote rclone knows, including any added later</label>
+      <div class="note" style="width:100%;margin-left:0">Backups contain
+        <code>site_config.json</code> and <code>.env</code> — the database and admin
+        credentials. Every remote you tick receives them. "Every remote rclone knows"
+        also hands them to remotes you add in future, without asking again.</div>
+      <input type="text" id="rc-path" size="16" placeholder="folder" value="${esc(folder)}">
+      <button class="primary" id="rc-wire">${r.wired ? 'Update destinations' : 'Upload backups here'}</button>
       <span id="rc-msg" style="font-size:13px;color:var(--ink-2)"></span></div>`;
   }
 
@@ -1777,13 +1863,32 @@ async function migrateCron(legacy, missing){
   }catch(e){ msg.textContent = 'request failed'; btn.disabled = false; }
 }
 
+// "Every remote" and picking them individually are the same choice made two
+// ways, so ticking the first greys out the second rather than silently
+// ignoring it.
+function syncRcloneAll(){
+  const all = $('#rc-all');
+  if(!all) return;
+  document.querySelectorAll('.rc-rem').forEach(c => {
+    c.disabled = all.checked;
+    c.parentElement.style.opacity = all.checked ? 0.45 : 1;
+  });
+}
+
 async function wireRclone(){
-  const btn = $('#rc-wire'), msg = $('#rc-msg');
+  const btn = $('#rc-wire'), msg = $('#rc-msg'), allBox = $('#rc-all');
+  if(!btn || !allBox) return;   // refreshSetup() replaced the form mid-click
+  const all = allBox.checked;
+  const remotes = Array.from(document.querySelectorAll('.rc-rem:checked')).map(c => c.value);
+  if(!all && !remotes.length){ msg.textContent = 'Tick at least one remote'; return; }
+  if(all && !confirm('Upload backups to EVERY remote rclone knows, now and in future?\n\n'
+      + 'Backups contain site_config.json and .env — database and admin credentials.\n'
+      + 'Every remote in this server\'s rclone config will receive them.')) return;
   btn.disabled = true; msg.textContent = 'Saving…';
   try{
     const r = await fetch('/api/rclone/wire', {method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({remote: $('#rc-remote').value, path: $('#rc-path').value.trim()})});
+      body: JSON.stringify({remotes: remotes, all: all, path: $('#rc-path').value.trim()})});
     const j = await r.json();
     if(j.error){ msg.textContent = j.error; btn.disabled = false; return; }
     msg.textContent = 'Saved — backups now upload to ' + j.wired;
@@ -1919,6 +2024,7 @@ async function refreshSetup(){
                  'Run the server from the <a href="/">dashboard</a>.</p>' : '') + rows;
     document.querySelectorAll('.setup-install').forEach(btn => btn.onclick = () => installComponent(btn));
     if ($('#rc-wire')) $('#rc-wire').onclick = wireRclone;
+    if ($('#rc-all')) { $('#rc-all').onchange = syncRcloneAll; syncRcloneAll(); }
     if ($('#cron-fix')) $('#cron-fix').onclick = () => migrateCron(legacy, missing);
     // A job started from the dashboard (or a second browser tab) still owns the
     // panel: re-disable the buttons the render above has just recreated.

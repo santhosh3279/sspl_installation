@@ -12,8 +12,13 @@ SITE_NAME="your-site-name"  # Change this to your site name
 COMPOSE_FILE="/opt/sspl-erp/docker-compose.yml"
 RETENTION_DAYS=30
 LOCAL_KEEP_MIN=20 # Newest N on this server survive the cleanup however old they are
-RCLONE_REMOTE=""  # Optional: e.g. "gdrive:frappe-backups" — leave empty to skip cloud upload
-CLOUD_KEEP=10     # How many backups to keep on the remote (local keeps RETENTION_DAYS)
+RCLONE_REMOTE=""  # Optional cloud destinations — empty skips the upload entirely.
+                  # One:  "gdrive:frappe-backups"
+                  # Many: "gdrive:frappe-backups mega:frappe-backups"
+                  # All:  "*:frappe-backups"  (every remote rclone knows, now
+                  #       and in future — and backups carry site_config.json
+                  #       and .env, so every one of them gets your credentials)
+CLOUD_KEEP=10     # How many backups to keep on each remote (local keeps RETENTION_DAYS)
 CLEAR_CLOUD_TRASH=yes # When the remote is too full for the upload, permanently
                       # delete old backups out of its trash to make room
 MEGA_HARD_DELETE=yes  # On Mega only: prune permanently instead of binning.
@@ -132,8 +137,55 @@ echo "Backup location: $DATED_BACKUP_DIR"
 echo "Backup size: $BACKUP_SIZE"
 
 # 7. Optional: upload to cloud storage via rclone (see Rclone_Configuration_Guide)
-if [ -n "$RCLONE_REMOTE" ]; then
-    # How the cloud prune at the bottom of this block deletes.
+
+# Expand RCLONE_REMOTE into the destinations to upload to, in RCLONE_TARGETS:
+#
+#   ""                            no upload
+#   "gdrive:frappe-backups"       that one
+#   "gdrive:backups mega:backups" both, independently
+#   "*:backups"                   every remote 'rclone listremotes' reports
+#
+# The list is space-separated, so a folder name may not contain spaces.
+#
+# '*:' picks up remotes added later, automatically and silently. Backups carry
+# site_config.json and .env — database and admin credentials — so every remote
+# in root's rclone config receives them. Naming the destinations explicitly is
+# the form that cannot surprise you.
+rclone_expand_targets() {
+    local spec="$1" folder r
+    RCLONE_TARGETS=()
+    case "$spec" in
+        "") return 0 ;;
+        '*:'*)
+            folder="${spec#'*:'}"
+            while IFS= read -r r; do
+                # 'rclone listremotes' prints "name:" per line; anything else
+                # is noise and must not become an upload destination.
+                case "$r" in *:) ;; *) continue ;; esac
+                RCLONE_TARGETS+=("${r}${folder}")
+            done < <(rclone listremotes </dev/null 2>/dev/null)
+            ;;
+        *)
+            # Deliberate word split. Globbing is off for it: an unexpanded '*'
+            # would otherwise expand against the working directory and turn
+            # filenames into upload destinations.
+            set -f
+            RCLONE_TARGETS=($spec)
+            set +f
+            ;;
+    esac
+}
+
+# Upload this backup to one remote and apply that remote's cloud retention.
+# Each destination is independent: a remote that fails to take the upload is a
+# warning, the others still get their copy, and a remote is only pruned when
+# its own upload succeeded — pruning to keep-10 a remote that is missing
+# today's backup would quietly turn keep-10 into keep-9.
+upload_and_prune() {
+    local REMOTE="$1"
+    local PRUNE_FLAGS=() OLD_REMOTE
+
+    # How this remote's prune deletes.
     #
     # Mega deletes into the account's rubbish bin, where the files go on
     # consuming quota — and unlike Drive there is no way to clear part of that
@@ -143,69 +195,91 @@ if [ -n "$RCLONE_REMOTE" ]; then
     # can reclaim exactly what an upload needs — the undo path costs nothing.
     #
     # stdin is closed: a password-protected rclone config would prompt for it.
-    PRUNE_FLAGS=()
-    case "$RCLONE_REMOTE" in
+    case "$REMOTE" in
         :*) ;;   # ':backend:...' connection string — no named remote to look up
         *:*)
             if [ "$MEGA_HARD_DELETE" = "yes" ] && [ "$(rclone config show \
-                    "${RCLONE_REMOTE%%:*}" </dev/null 2>/dev/null \
+                    "${REMOTE%%:*}" </dev/null 2>/dev/null \
                     | grep -oP '^\s*type\s*=\s*\K\S+' | head -1)" = "mega" ]; then
                 PRUNE_FLAGS=(--mega-hard-delete)
-                echo "Mega remote: pruned backups are deleted permanently, not binned"
+                echo "  Mega remote: pruned backups are deleted permanently, not binned"
             fi
             ;;
     esac
 
-    # Make room before uploading, if the remote is short. The cloud prune below
-    # uses 'rclone purge', which on Google Drive only moves the old backups to
-    # the account's trash — where they go on consuming quota. This reclaims
-    # just enough of that trash for this upload, and never fails the backup:
-    # if it cannot free the space, the upload still gets its attempt.
-    TRASH_CLEANUP="$(dirname "$0")/rclone_trash_cleanup.sh"
+    # Make room before uploading, if this remote is short. The prune below uses
+    # 'rclone purge', which on Google Drive only moves the old backups to the
+    # account's trash — where they go on consuming quota. This reclaims just
+    # enough of that trash for this upload, and never fails the backup: if it
+    # cannot free the space, the upload still gets its attempt. Backends differ,
+    # so this is asked per remote and each answer stands on its own.
+    local TRASH_CLEANUP="$(dirname "$0")/rclone_trash_cleanup.sh"
     if [ "$CLEAR_CLOUD_TRASH" = "yes" ] && [ -x "$TRASH_CLEANUP" ]; then
-        echo "Checking free space on $RCLONE_REMOTE..."
-        "$TRASH_CLEANUP" --remote "$RCLONE_REMOTE" --need-path "$DATED_BACKUP_DIR" \
+        echo "  Checking free space on $REMOTE..."
+        "$TRASH_CLEANUP" --remote "$REMOTE" --need-path "$DATED_BACKUP_DIR" \
             || echo "  Proceeding with the upload anyway"
     fi
 
-    echo "Uploading backup to $RCLONE_REMOTE..."
-    if rclone copy "$DATED_BACKUP_DIR" "$RCLONE_REMOTE/$TIMESTAMP"; then
-        echo "Cloud upload completed"
+    echo "  Uploading backup to $REMOTE..."
+    if ! rclone copy "$DATED_BACKUP_DIR" "$REMOTE/$TIMESTAMP"; then
+        echo "  WARNING: upload to $REMOTE failed — not pruning it"
+        return 1
+    fi
+    echo "  Cloud upload to $REMOTE completed"
 
-        # Keep only the newest CLOUD_KEEP backups on the remote. The local
-        # find -mtime retention above does not touch the cloud, so without
-        # this the remote grows without bound.
-        #
-        # The remote is listed directly rather than deriving the deletes from
-        # what was just removed locally (which is what the update script does
-        # for image snapshots): a local backup that disappears any other way —
-        # a manual rm, the backup manager — would otherwise orphan its cloud
-        # copy forever and quietly turn keep-10 into keep-N.
-        #
-        # Only timestamped folders are candidates. db-only/ and
-        # image-snapshots/ live in the same remote root and have their own
-        # retention, so the pattern must stay exact.
-        echo "Cleaning old cloud backups (keeping newest $CLOUD_KEEP)..."
-        OLD_REMOTE=$(rclone lsf --dirs-only "$RCLONE_REMOTE" 2>/dev/null \
-            | sed 's:/$::' \
-            | grep -E '^[0-9]{8}_[0-9]{6}$' \
-            | sort -r \
-            | tail -n +$((CLOUD_KEEP + 1))) || true
-        if [ -n "$OLD_REMOTE" ]; then
-            echo "$OLD_REMOTE" | while read -r folder; do
-                # An empty name here would purge the whole remote
-                [ -n "$folder" ] || continue
-                if rclone purge "${PRUNE_FLAGS[@]}" "$RCLONE_REMOTE/$folder" 2>/dev/null; then
-                    echo "  Removed from cloud: $folder"
-                else
-                    echo "  WARNING: could not remove from cloud: $folder"
-                fi
-            done
-        else
-            echo "  Nothing to remove from cloud"
-        fi
+    # Keep only the newest CLOUD_KEEP backups on this remote. The local
+    # find -mtime retention above does not touch the cloud, so without this the
+    # remote grows without bound.
+    #
+    # The remote is listed directly rather than deriving the deletes from what
+    # was just removed locally (which is what the update script does for image
+    # snapshots): a local backup that disappears any other way — a manual rm,
+    # the backup manager — would otherwise orphan its cloud copy forever and
+    # quietly turn keep-10 into keep-N.
+    #
+    # Only timestamped folders are candidates. db-only/ and image-snapshots/
+    # live in the same remote root and have their own retention, so the pattern
+    # must stay exact.
+    echo "  Cleaning old cloud backups on $REMOTE (keeping newest $CLOUD_KEEP)..."
+    OLD_REMOTE=$(rclone lsf --dirs-only "$REMOTE" 2>/dev/null \
+        | sed 's:/$::' \
+        | grep -E '^[0-9]{8}_[0-9]{6}$' \
+        | sort -r \
+        | tail -n +$((CLOUD_KEEP + 1))) || true
+    if [ -n "$OLD_REMOTE" ]; then
+        echo "$OLD_REMOTE" | while read -r folder; do
+            # An empty name here would purge the whole remote
+            [ -n "$folder" ] || continue
+            if rclone purge "${PRUNE_FLAGS[@]}" "$REMOTE/$folder" 2>/dev/null; then
+                echo "    Removed from cloud: $folder"
+            else
+                echo "    WARNING: could not remove from cloud: $folder"
+            fi
+        done
     else
-        echo "WARNING: Cloud upload failed — backup exists locally only"
+        echo "    Nothing to remove from cloud"
+    fi
+    return 0
+}
+
+if [ -n "$RCLONE_REMOTE" ]; then
+    rclone_expand_targets "$RCLONE_REMOTE"
+    if [ ${#RCLONE_TARGETS[@]} -eq 0 ]; then
+        echo "WARNING: RCLONE_REMOTE is '$RCLONE_REMOTE' but names no usable remote"
+        echo "         — this backup was NOT uploaded anywhere"
+    else
+        echo "Cloud destinations: ${RCLONE_TARGETS[*]}"
+        CLOUD_OK=0
+        for REMOTE in "${RCLONE_TARGETS[@]}"; do
+            if upload_and_prune "$REMOTE"; then
+                CLOUD_OK=$((CLOUD_OK + 1))
+            fi
+        done
+        if [ "$CLOUD_OK" -eq 0 ]; then
+            echo "WARNING: no cloud destination accepted this backup — it exists locally only"
+        else
+            echo "Cloud upload: $CLOUD_OK of ${#RCLONE_TARGETS[@]} destination(s) succeeded"
+        fi
     fi
 fi
 

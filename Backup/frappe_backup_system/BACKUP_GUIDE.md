@@ -56,7 +56,36 @@ Update the following in each script:
 - `BACKUP_DIR="/opt/backups/frappe"` - Change if you want different location
 - `RETENTION_DAYS=30` - Adjust how long to keep backups on this server
 - `LOCAL_KEEP_MIN=20` - Newest N on this server are never deleted by age
-- `CLOUD_KEEP=10` - How many backups to keep on the rclone remote
+- `CLOUD_KEEP=10` - How many backups to keep on each rclone remote
+- `RCLONE_REMOTE=""` - Where backups upload to; see below
+
+### 3a. Cloud Destinations
+
+`RCLONE_REMOTE` takes one destination, several, or all of them:
+
+| Value | Backups go to |
+|---|---|
+| `""` | nowhere — local only |
+| `"gdrive:frappe-backups"` | that one remote |
+| `"gdrive:frappe-backups mega:frappe-backups"` | both, independently |
+| `"*:frappe-backups"` | every remote `rclone listremotes` reports |
+
+The list is space-separated, so folder names may not contain spaces. The panel
+writes this line for you — tick the remotes you want under "Cloud backup
+(rclone)".
+
+Destinations are independent. Each one gets its own free-space check, its own
+upload, and its own `CLOUD_KEEP` retention. A remote that refuses the upload is
+a warning, the rest still get their copy, and a remote is pruned **only** when
+its own upload succeeded — otherwise pruning to keep-10 a remote that is
+missing today's backup would quietly leave you with nine.
+
+`*:` is evaluated on every run, so a remote added next month starts receiving
+backups without anyone re-wiring anything. That is the point of it, and also
+the risk: **backups contain `site_config.json` and `.env` — your database and
+admin credentials.** Every remote in root's rclone config gets them. If the
+server's rclone is ever used for anything unrelated, name your destinations
+explicitly instead.
 
 ### 4. Test Manual Backup
 ```bash
