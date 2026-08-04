@@ -128,7 +128,47 @@ sudo nano /opt/scripts/v2/frappe_backup.sh
 ```
 
 Note: on Google Drive, rclone deletes to the account's trash by default, so
-freed quota only returns once the trash is emptied.
+freed quota only returns once the trash is emptied. This is deliberate — it is
+the undo path for a mistaken prune — but it means the remote can report itself
+full while every byte of the overage is old backups that retention already
+threw away. See "Reclaiming trashed space" below.
+
+### Reclaiming Trashed Space:
+
+Before every cloud upload, the backup scripts run
+`/opt/scripts/v2/rclone_trash_cleanup.sh`. If the remote has room, it does
+nothing. If it does not, it permanently deletes trashed backups — **oldest
+first, and only until the shortfall plus 20% has been recovered**. It is not
+`rclone cleanup`, which empties the whole trash unconditionally.
+
+Two things keep it from doing more than that:
+
+- It only considers trash **inside the backup folder** `RCLONE_REMOTE` points
+  at, and only items named like this project's own backups
+  (`20260101_020000/`, `*_erp.sql.gz`, `backup_*.tar`). Everything else in the
+  account's trash is left alone unless `--all-trash` is passed by hand.
+- It re-reads `rclone about` after **every single delete** and stops on the
+  free space it actually observes, never on its own arithmetic. If three
+  deletes in a row free nothing measurable (Drive's quota figures can lag by
+  minutes), it stops and warns instead of working through the whole trash.
+
+It can never fail a backup: if it cannot make room, the upload is attempted
+anyway and the log carries the warning.
+
+```bash
+# See what it would delete, without deleting anything
+sudo /opt/scripts/v2/rclone_trash_cleanup.sh --remote gdrive:frappe-backups \
+     --need-path /opt/backups/frappe/20260101_020000 --dry-run
+
+# Turn it off entirely (per script)
+sudo nano /opt/scripts/v2/frappe_backup.sh
+# Change: CLEAR_CLOUD_TRASH=yes  to  no
+```
+
+Deletions made here are permanent — the items are already in the trash, and
+this takes them out of it for good. Selective clearing is a Google Drive
+capability; on other backends the script reports that and skips, because
+`rclone cleanup` there would empty far more than was asked for.
 
 ### Manual Cleanup:
 ```bash

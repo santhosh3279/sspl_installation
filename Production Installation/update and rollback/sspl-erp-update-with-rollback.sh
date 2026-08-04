@@ -7,6 +7,10 @@ source "$(dirname "$0")/sspl-erp-common.sh"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 BACKUP_FILE="$BACKUP_DIR/backup_$TIMESTAMP.tar"
 RCLONE_REMOTE=""  # Optional: e.g. "gdrive:frappe-backups" — leave empty to skip cloud upload
+CLEAR_CLOUD_TRASH=yes # When the remote is too full for the snapshot, permanently
+                      # delete old backups out of its trash to make room
+# Installed by the backup setup, not by this one — hence the absolute path.
+TRASH_CLEANUP="/opt/scripts/v2/rclone_trash_cleanup.sh"
 
 trap 'echo ""; echo "❌ Update failed!"; echo "   Services may be in a partial state."; echo "   To roll back images: /opt/sspl-erp/v2/sspl-erp-rollback.sh"; echo "   To restore data:      sudo /opt/scripts/v2/frappe_restore.sh <backup-folder>"' ERR
 
@@ -89,6 +93,17 @@ echo "   Backup file: $BACKUP_FILE"
 # a warning, not a failure.
 if [ -n "$RCLONE_REMOTE" ] && [ -f "$BACKUP_FILE" ]; then
     echo ""
+    # Snapshots are multi-gigabyte, so this is the upload most likely to hit a
+    # full remote. The retention below deletes with 'rclone deletefile', which
+    # on Google Drive only moves old snapshots to the account's trash, where
+    # they keep consuming quota — reclaim just enough of it for this upload.
+    # Never fatal: the update has already succeeded by this point.
+    if [ "$CLEAR_CLOUD_TRASH" = "yes" ] && [ -x "$TRASH_CLEANUP" ]; then
+        echo "→ Checking free space on $RCLONE_REMOTE..."
+        "$TRASH_CLEANUP" --remote "$RCLONE_REMOTE" --need-path "$BACKUP_FILE" \
+            || echo "   Proceeding with the upload anyway"
+    fi
+
     echo "→ Uploading image snapshot to $RCLONE_REMOTE/image-snapshots..."
     if rclone copy "$BACKUP_FILE" "$RCLONE_REMOTE/image-snapshots"; then
         echo "   ✓ Cloud upload completed"

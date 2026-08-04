@@ -14,6 +14,8 @@ RETENTION_DAYS=30
 LOCAL_KEEP_MIN=20 # Newest N on this server survive the cleanup however old they are
 RCLONE_REMOTE=""  # Optional: e.g. "gdrive:frappe-backups" — leave empty to skip cloud upload
 CLOUD_KEEP=10     # How many backups to keep on the remote (local keeps RETENTION_DAYS)
+CLEAR_CLOUD_TRASH=yes # When the remote is too full for the upload, permanently
+                      # delete old backups out of its trash to make room
 
 # Create backup directory if it doesn't exist (restricted: backups contain credentials)
 mkdir -p "$BACKUP_DIR"
@@ -128,6 +130,18 @@ echo "Backup size: $BACKUP_SIZE"
 
 # 7. Optional: upload to cloud storage via rclone (see Rclone_Configuration_Guide)
 if [ -n "$RCLONE_REMOTE" ]; then
+    # Make room before uploading, if the remote is short. The cloud prune below
+    # uses 'rclone purge', which on Google Drive only moves the old backups to
+    # the account's trash — where they go on consuming quota. This reclaims
+    # just enough of that trash for this upload, and never fails the backup:
+    # if it cannot free the space, the upload still gets its attempt.
+    TRASH_CLEANUP="$(dirname "$0")/rclone_trash_cleanup.sh"
+    if [ "$CLEAR_CLOUD_TRASH" = "yes" ] && [ -x "$TRASH_CLEANUP" ]; then
+        echo "Checking free space on $RCLONE_REMOTE..."
+        "$TRASH_CLEANUP" --remote "$RCLONE_REMOTE" --need-path "$DATED_BACKUP_DIR" \
+            || echo "  Proceeding with the upload anyway"
+    fi
+
     echo "Uploading backup to $RCLONE_REMOTE..."
     if rclone copy "$DATED_BACKUP_DIR" "$RCLONE_REMOTE/$TIMESTAMP"; then
         echo "Cloud upload completed"

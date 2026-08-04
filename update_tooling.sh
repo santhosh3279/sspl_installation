@@ -83,11 +83,14 @@ if [ "$ONLY" = "all" ]; then
 echo ""
 echo "→ 1/3 Backup scripts ($BACKUP_DST)"
 if [ -f "$BACKUP_DST/frappe_backup.sh" ]; then
-    update_script "$BACKUP_SRC" "$BACKUP_DST" frappe_backup.sh        SITE_NAME BACKUP_DIR RETENTION_DAYS LOCAL_KEEP_MIN CLOUD_KEEP RCLONE_REMOTE
-    update_script "$BACKUP_SRC" "$BACKUP_DST" frappe_db_backup.sh     SITE_NAME BACKUP_DIR RETENTION_DAYS LOCAL_KEEP_MIN CLOUD_KEEP RCLONE_REMOTE
+    update_script "$BACKUP_SRC" "$BACKUP_DST" frappe_backup.sh        SITE_NAME BACKUP_DIR RETENTION_DAYS LOCAL_KEEP_MIN CLOUD_KEEP RCLONE_REMOTE CLEAR_CLOUD_TRASH
+    update_script "$BACKUP_SRC" "$BACKUP_DST" frappe_db_backup.sh     SITE_NAME BACKUP_DIR RETENTION_DAYS LOCAL_KEEP_MIN CLOUD_KEEP RCLONE_REMOTE CLEAR_CLOUD_TRASH
     update_script "$BACKUP_SRC" "$BACKUP_DST" frappe_restore.sh       SITE_NAME
     update_script "$BACKUP_SRC" "$BACKUP_DST" frappe_backup_verify.sh BACKUP_DIR ALERT_EMAIL MAX_AGE_HOURS
     update_script "$BACKUP_SRC" "$BACKUP_DST" restore_with_backup.sh
+    # New in this release — installed even on servers set up before it existed,
+    # because the backup scripts now look for it next to themselves.
+    update_script "$BACKUP_SRC" "$BACKUP_DST" rclone_trash_cleanup.sh HEADROOM_PERCENT ONLY_BACKUP_ITEMS MAX_NO_PROGRESS MAX_DEPTH
     UPDATED="$UPDATED backup-scripts"
 else
     echo "   – not installed, skipping (install with: Backup/frappe_backup_system/setup_frappe_backups.sh)"
@@ -99,7 +102,7 @@ echo ""
 echo "→ 2/3 Update & rollback scripts ($UPDATE_DST)"
 if [ -f "$UPDATE_DST/sspl-erp-common.sh" ]; then
     update_script "$UPDATE_SRC" "$UPDATE_DST" sspl-erp-common.sh SITE_NAME SERVICE_WAIT_TIMEOUT
-    update_script "$UPDATE_SRC" "$UPDATE_DST" sspl-erp-update-with-rollback.sh RCLONE_REMOTE
+    update_script "$UPDATE_SRC" "$UPDATE_DST" sspl-erp-update-with-rollback.sh RCLONE_REMOTE CLEAR_CLOUD_TRASH
     update_script "$UPDATE_SRC" "$UPDATE_DST" sspl-erp-rollback.sh
     update_script "$UPDATE_SRC" "$UPDATE_DST" sspl-erp-backup-manager.sh
     UPDATED="$UPDATED update-scripts"

@@ -14,6 +14,8 @@ RETENTION_DAYS=14
 LOCAL_KEEP_MIN=20 # Newest N on this server survive the cleanup however old they are
 RCLONE_REMOTE=""  # Optional: e.g. "gdrive:frappe-backups" — leave empty to skip cloud upload
 CLOUD_KEEP=10     # How many dumps to keep on the remote (local keeps RETENTION_DAYS)
+CLEAR_CLOUD_TRASH=yes # When the remote is too full for the upload, permanently
+                      # delete old backups out of its trash to make room
 
 mkdir -p "$BACKUP_DIR"
 chmod 700 "$BACKUP_DIR"
@@ -72,6 +74,17 @@ fi
 # dumps don't mix with the full backups' timestamped directories. Same
 # semantics as the full backup: a failed upload is a warning, not a failure.
 if [ -n "$RCLONE_REMOTE" ]; then
+    # Make room first if the remote is short: the cloud prune below deletes
+    # with 'rclone deletefile', which on Google Drive only moves the old dumps
+    # to the account's trash, where they keep consuming quota. Never fatal —
+    # if the space cannot be freed, the upload still gets its attempt.
+    TRASH_CLEANUP="$(dirname "$0")/rclone_trash_cleanup.sh"
+    if [ "$CLEAR_CLOUD_TRASH" = "yes" ] && [ -x "$TRASH_CLEANUP" ]; then
+        echo "Checking free space on $RCLONE_REMOTE..."
+        "$TRASH_CLEANUP" --remote "$RCLONE_REMOTE" --need-path "$BACKUP_FILE" \
+            || echo "  Proceeding with the upload anyway"
+    fi
+
     echo "Uploading backup to $RCLONE_REMOTE/db-only..."
     if rclone copy "$BACKUP_FILE" "$RCLONE_REMOTE/db-only"; then
         echo "Cloud upload completed"
