@@ -247,7 +247,7 @@ chmod +x setup_admin_panel.sh
 <p>The installer asks for an admin username, password, port (default <b>8090</b>), and the server IP
 for the HTTPS certificate. It installs a Python environment to <code>/opt/sspl-admin/</code>, records
 the repo location (<code>repo_dir</code> in its config), and starts a systemd service
-(<code>sspl-admin</code>) that survives reboots.</p>
+(<code>sspl-admin</code>) that survives reboots — see <i>Autostart</i> below.</p>
 <div class="note"><b>The panel can install everything else</b> — Parts 2 and 3 do <i>not</i> need to be
 in place first. Keep the git checkout on the server (the Setup switches run the installers from it;
 <code>git pull</code> there keeps them current).</div>
@@ -310,6 +310,30 @@ sudo systemctl restart sspl-admin      # restart
 sudo journalctl -u sspl-admin -f       # follow the logs</pre>
 <p>To change the password or port, re-run <code>./setup_admin_panel.sh</code> — it keeps the
 certificate and Python environment. Keep port 8090 LAN-only; never port-forward it to the internet.</p>
+
+<h3>Autostart — the panel runs on its own</h3>
+<p>The panel is <b>not</b> a program you keep open in a terminal. The installer finishes with
+<code>systemctl enable --now sspl-admin</code>, so the service:</p>
+<ul>
+  <li>starts <b>automatically at boot</b>, before anyone logs in;</li>
+  <li>keeps running after you close the terminal window, log out, or drop the SSH session;</li>
+  <li>restarts itself if it crashes (<code>Restart=on-failure</code>, 5-second delay).</li>
+</ul>
+<p>Confirm autostart is armed — <code>enabled</code> means it comes back after a reboot,
+<code>active</code> means it is running right now:</p>
+<pre>systemctl is-enabled sspl-admin        # -> enabled
+systemctl is-active sspl-admin         # -> active</pre>
+<p>If it ever reports <code>disabled</code>, turn it back on with
+<code>sudo systemctl enable --now sspl-admin</code>. To stop the panel starting at boot (for
+maintenance, say), use <code>sudo systemctl disable --now sspl-admin</code> — that stops it now
+<i>and</i> keeps it stopped after a reboot.</p>
+<div class="note"><b>Do not run <code>python app.py</code> by hand once the service is installed.</b>
+Two copies would fight over port 8090, and the hand-started one dies with the terminal. The service
+runs the <i>installed</i> copy at <code>/opt/sspl-admin/app.py</code>, not the file in the git
+checkout — so after editing the panel in the repo, either re-run
+<code>./setup_admin_panel.sh</code> or copy it across and restart.</div>
+<pre>sudo cp app.py /opt/sspl-admin/     # after editing the repo copy
+sudo systemctl restart sspl-admin</pre>
 
 <div class="pagebreak"></div>
 <h2>5. Part 2 — Backup system: installation</h2>
