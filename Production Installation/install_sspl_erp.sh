@@ -28,7 +28,9 @@
 # detected and kept — nothing is destroyed on a second run.
 #
 # If ERPNext is already installed and running, this script refuses to run
-# (see SSPL_FORCE below). If it does run and finds an OLDER backup cron job
+# (see SSPL_FORCE below). An install that was interrupted before any container
+# or volume existed is NOT an install: it resumes on the next run without
+# SSPL_FORCE. If it does run and finds an OLDER backup cron job
 # still active (outside /opt/scripts/v2/), it installs the v2 backup
 # scripts but skips scheduling their cron jobs automatically, to avoid
 # running backups twice.
@@ -65,24 +67,47 @@ echo "✓ git, docker and docker compose are available"
 # say so and stop before touching anything. (SSPL_FORCE=1 bypasses this,
 # e.g. to finish a half-completed install — re-running is safe: existing
 # site, .env files and certificates are detected and kept.)
+#
+# The compose file alone proves nothing: it is written before the image pull,
+# so a run that died during the pull leaves it behind with no stack attached.
+# Only real Docker state counts — containers in any state, or the stack's
+# named volumes (which survive a `docker compose down` and hold the site).
 if [ -z "$SSPL_FORCE" ] && [ -f "$COMPOSE_FILE" ]; then
-    RUNNING=$(sudo docker compose -f "$COMPOSE_FILE" ps --status running --services 2>/dev/null | grep -c . || true)
-    echo ""
-    if [ "$RUNNING" -gt 0 ]; then
-        echo "✅ ERPNext is already installed and running here ($RUNNING services up)."
+    # The volume filter needs the real project name. install_erp_stack.sh
+    # generates this file with `docker compose config` run inside
+    # $ERP_DIR/frappe_docker, so the file carries `name: frappe_docker` — and a
+    # top-level name: beats the compose-file directory. Read it, and only fall
+    # back to the directory for a hand-written file that has no name:.
+    PROJECT=$(sudo awk '/^name:[[:space:]]/{gsub(/["\047]/,"",$2); print $2; exit}' "$COMPOSE_FILE" 2>/dev/null || true)
+    PROJECT=${PROJECT:-$(basename "$ERP_DIR" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')}
+    CONTAINERS=$(sudo docker compose -f "$COMPOSE_FILE" ps -aq 2>/dev/null | grep -c . || true)
+    VOLUMES=$(sudo docker volume ls -q --filter "label=com.docker.compose.project=$PROJECT" 2>/dev/null | grep -c . || true)
+
+    if [ "$CONTAINERS" -gt 0 ] || [ "$VOLUMES" -gt 0 ]; then
+        RUNNING=$(sudo docker compose -f "$COMPOSE_FILE" ps --status running --services 2>/dev/null | grep -c . || true)
         echo ""
-        echo "Nothing to do. Useful commands instead:"
-        echo "  Update ERP to the latest release:  sudo /opt/sspl-erp/v2/sspl-erp-update-with-rollback.sh"
-        echo "  Refresh this repo's tooling:       git pull && ./update_tooling.sh"
+        if [ "$RUNNING" -gt 0 ]; then
+            echo "✅ ERPNext is already installed and running here ($RUNNING services up)."
+            echo ""
+            echo "Nothing to do. Useful commands instead:"
+            echo "  Update ERP to the latest release:  sudo /opt/sspl-erp/v2/sspl-erp-update-with-rollback.sh"
+            echo "  Refresh this repo's tooling:       git pull && ./update_tooling.sh"
+            echo ""
+            echo "To force a re-run anyway:            SSPL_FORCE=1 ./install_sspl_erp.sh"
+            exit 0
+        fi
+        echo "⚠ ERPNext is already installed here but not running"
+        echo "  ($CONTAINERS containers, $VOLUMES volumes under project '$PROJECT')."
         echo ""
-        echo "To force a re-run anyway:            SSPL_FORCE=1 ./install_sspl_erp.sh"
-        exit 0
+        echo "  Start it with:      sudo docker compose -f $COMPOSE_FILE up -d"
+        echo "  Force a re-install: SSPL_FORCE=1 ./install_sspl_erp.sh"
+        exit 1
     fi
-    echo "⚠ ERPNext is already installed here ($COMPOSE_FILE exists) but not running."
+
     echo ""
-    echo "  Start it with:      sudo docker compose -f $COMPOSE_FILE up -d"
-    echo "  Force a re-install: SSPL_FORCE=1 ./install_sspl_erp.sh"
-    exit 1
+    echo "→ $COMPOSE_FILE exists but no containers or volumes back it — leftovers"
+    echo "  from an install that was interrupted before the stack came up."
+    echo "  Continuing; existing files are reused, not destroyed."
 fi
 
 # ─────────────────────────────────────────────────────── ask everything upfront
