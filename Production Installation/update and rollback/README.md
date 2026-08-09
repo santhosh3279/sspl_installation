@@ -51,9 +51,18 @@ cd /opt/sspl-erp/v2
 3. Stops all services
 4. Pulls latest images
 5. Starts services and waits until the database and backend are actually ready
-6. Fixes DB grants, runs migrations, and clears cache
+6. Fixes DB grants and runs migrations
+7. Installs any app the new image added that the site does not have yet —
+   `bench migrate` only touches apps already installed, so an app added to the
+   image reaches an existing site only here. Already-installed apps are skipped.
+8. Clears cache
 
 If any step fails, the script stops and prints rollback instructions.
+
+Note that step 7 writes to the database, and `sspl-erp-rollback.sh` restores
+images only — it cannot uninstall an app. If an update fails while installing
+one, restore the data backup from step 1 with `frappe_restore.sh`. Rehearse the
+first update after an image gains an app on a test server.
 
 ### Rollback to Previous Version
 

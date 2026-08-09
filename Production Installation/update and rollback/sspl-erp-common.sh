@@ -40,6 +40,57 @@ wait_for_services() {
     echo "   ✓ Services are ready"
 }
 
+# Install every app the image ships that the site does not have yet.
+#
+# The image is the source of truth for which apps a site runs, but only at
+# creation time: install_erp_stack.sh passes them all to 'bench new-site'.
+# After that an app added to the image reaches an existing site only here,
+# because 'bench migrate' walks the site's installed apps and a new one is
+# not among them — it would ship in the image and silently never appear.
+install_new_apps() {
+    echo "→ Checking for apps added to the image..."
+    local installed available app
+    local missing=()
+
+    # Advisory probes: neither failing is a reason to abort an update that
+    # has otherwise succeeded, so keep them out of the caller's ERR trap.
+    installed=$(docker compose -f "$COMPOSE_FILE" exec -T backend \
+        bench --site "$SITE_NAME" list-apps 2>/dev/null) || true
+    available=$(docker compose -f "$COMPOSE_FILE" exec -T backend ls apps 2>/dev/null) || true
+
+    if [ -z "$installed" ] || [ -z "$available" ]; then
+        echo "   ⚠ Could not list apps — skipping (install any new app by hand)"
+        return 0
+    fi
+
+    for app in $available; do
+        [ "$app" = "frappe" ] && continue
+        # Matched against the whole of 'list-apps' rather than a parsed first
+        # column, because its layout differs between bench versions (bare
+        # names, or name + version + branch). -w keeps 'hrms' from matching
+        # an 'hrms_extra' line. Do not loosen this match: a name matched
+        # somewhere other than its own line reads as installed and is
+        # skipped, which is the silent no-op this function exists to stop.
+        grep -qw -- "$app" <<<"$installed" || missing+=("$app")
+    done
+
+    if [ ${#missing[@]} -eq 0 ]; then
+        echo "   ✓ No new apps to install"
+        return 0
+    fi
+
+    echo "   New apps in the image: ${missing[*]}"
+    for app in "${missing[@]}"; do
+        echo "→ Installing $app on $SITE_NAME (this may take a few minutes)..."
+        # Unguarded on purpose. A half-installed app is a database change,
+        # and sspl-erp-rollback.sh only rolls back images — so this must
+        # reach the caller's ERR trap, which points at frappe_restore.sh.
+        docker compose -f "$COMPOSE_FILE" exec -T backend \
+            bench --site "$SITE_NAME" install-app "$app"
+        echo "   ✓ $app installed"
+    done
+}
+
 # Re-create the site DB user with host '%' so grants survive container IP changes
 fix_db_grants() {
     echo "→ Fixing MariaDB user grants (handling IP changes)..."

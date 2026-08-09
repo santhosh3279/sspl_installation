@@ -167,8 +167,10 @@ step "ERPNext site $SERVER_IP"
 if dc exec -T backend test -d "sites/$SERVER_IP" 2>/dev/null; then
     echo "✓ Site $SERVER_IP already exists — skipping creation (one-time step)"
 else
-    # Install every app shipped in the image (erpnext, india_compliance,
-    # ssplbilling, printer_server_configuration, frappe_whatsapp, ...)
+    # Install every app shipped in the image (erpnext, hrms, india_compliance,
+    # ssplbilling, printer_server_configuration, frappe_whatsapp, ...).
+    # An app added to the image after a site exists is picked up on the next
+    # update instead — see install_new_apps in sspl-erp-common.sh.
     APP_ARGS=""
     for app in $(dc exec -T backend ls apps); do
         [ "$app" = "frappe" ] && continue

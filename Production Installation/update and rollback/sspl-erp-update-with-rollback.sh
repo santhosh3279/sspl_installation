@@ -79,15 +79,20 @@ wait_for_services
 fix_db_grants
 
 echo "→ Running migrations..."
-docker compose -f "$COMPOSE_FILE" exec backend \
+docker compose -f "$COMPOSE_FILE" exec -T backend \
   bench --site "$SITE_NAME" migrate
 
+# After the migration, so a new app installs against the schema the rest of
+# the stack has just been brought up to; before the cache clear, so that
+# covers the new app too.
+install_new_apps
+
 echo "→ Clearing cache..."
-docker compose -f "$COMPOSE_FILE" exec backend \
+docker compose -f "$COMPOSE_FILE" exec -T backend \
   bench --site "$SITE_NAME" clear-cache
 
 echo "✅ Update complete!"
-docker compose -f "$COMPOSE_FILE" exec backend bench version
+docker compose -f "$COMPOSE_FILE" exec -T backend bench version
 
 echo ""
 echo "📦 Backup Information:"

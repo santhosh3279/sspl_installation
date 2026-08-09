@@ -192,7 +192,7 @@ page drives the whole rest of the installation, in order:</p>
       <code>/opt/sspl-erp/docker-compose.yml</code>, pulls the <code>sspl-erpnext</code> image from
       GHCR, starts the containers and waits until the database and backend are really ready, then
       creates the site named after the server IP with <b>every app shipped in the image</b>
-      installed automatically (erpnext, india_compliance, ssplbilling,
+      installed automatically (erpnext, hrms, india_compliance, ssplbilling,
       printer_server_configuration, frappe_whatsapp, …), sets it as the default site and repairs the
       MariaDB grants. This takes 10–20 minutes and streams live into the terminal at the foot of
       the page.</li>
@@ -473,10 +473,20 @@ so install Part 2 first.</div>
   <li>Snapshots the current Docker images to <code>/opt/sspl-erp/image-backups/backup_TIMESTAMP.tar</code>.</li>
   <li>Stops all services, prunes unused Docker resources, and pulls the latest images.</li>
   <li>Starts services and <b>waits until the database and backend are actually ready</b> (up to 3 minutes).</li>
-  <li>Repairs MariaDB user grants, runs <code>bench migrate</code>, clears the cache.</li>
+  <li>Repairs MariaDB user grants and runs <code>bench migrate</code>.</li>
+  <li><b>Installs any app the new image has added</b> that the site does not already
+      have — <code>bench migrate</code> only touches apps the site already runs, so
+      without this an app added to the image would never appear. Apps already
+      installed are left alone.</li>
+  <li>Clears the cache.</li>
   <li>Prints the new version and deletes image snapshots older than the 3 most recent.</li>
 </ol>
 <p>If any step fails, the script stops immediately and prints rollback instructions.</p>
+<div class="note"><b>Note:</b> installing a new app writes to the database, and a
+rollback only restores the Docker images (section 11) — it will not remove an app
+that installed. If an update fails while installing one, restore the data backup the
+update took at the start (section 7). When an image adds an app for the first time,
+rehearse the update on a test server restored from a production backup.</div>
 
 <h3>Verify after every update</h3>
 <pre>docker compose ps
