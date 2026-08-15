@@ -20,6 +20,14 @@ TRASH_CLEANUP="/opt/scripts/v2/rclone_trash_cleanup.sh"
 
 trap 'echo ""; echo "❌ Update failed!"; echo "   Services may be in a partial state."; echo "   To roll back images: /opt/sspl-erp/v2/sspl-erp-rollback.sh"; echo "   To restore data:      sudo /opt/scripts/v2/frappe_restore.sh <backup-folder>"' ERR
 
+# Whatever ends this script — a failure under 'set -e', Ctrl-C, a kill — the
+# site must not be left in the migration's offline window. Idempotent, and a
+# no-op if the window was never opened, so the success path closing it inline
+# makes this do nothing. INT/TERM exit so EXIT fires.
+trap 'migrate_window_close' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 echo "=============================="
 echo " SSPL ERP Update - $(date)"
 echo "=============================="
@@ -78,18 +86,46 @@ docker compose -f "$COMPOSE_FILE" up -d
 wait_for_services
 fix_db_grants
 
-echo "→ Running migrations..."
-docker compose -f "$COMPOSE_FILE" exec -T backend \
-  bench --site "$SITE_NAME" migrate
+# 'up -d' above started everything, including the frontend — so users are
+# already on a site whose code is new and whose database is not yet migrated.
+# Close that door before the schema starts moving.
+migrate_window_open
 
-# After the migration, so a new app installs against the schema the rest of
-# the stack has just been brought up to; before the cache clear, so that
-# covers the new app too.
-install_new_apps
+if run_migrate; then
+    # After the migration, so a new app installs against the schema the rest
+    # of the stack has just been brought up to; before the cache clear, so
+    # that covers the new app too.
+    install_new_apps
 
-echo "→ Clearing cache..."
-docker compose -f "$COMPOSE_FILE" exec -T backend \
-  bench --site "$SITE_NAME" clear-cache
+    echo "→ Clearing cache..."
+    docker compose -f "$COMPOSE_FILE" exec -T backend \
+      bench --site "$SITE_NAME" clear-cache
+
+    migrate_window_close
+else
+    # The site is serving new code against a part-migrated database. Do not
+    # install apps or clear caches on top of that — put the site back up so
+    # it is not dark, say plainly what state it is in, and stop.
+    migrate_window_close
+    echo ""
+    echo "❌ Update stopped: the migration failed."
+    echo "   The site is back online, running the NEW images against a"
+    echo "   database whose patches did not finish. Expect errors."
+    echo ""
+    echo "   Two ways out:"
+    echo "   1. Fix the app that failed (the traceback above names it), then"
+    echo "      re-run only the migration — the images stay as they are:"
+    echo "      sudo $MIGRATE_SCRIPT $SITE_NAME"
+    echo "   2. Roll the images back:"
+    echo "      /opt/sspl-erp/v2/sspl-erp-rollback.sh"
+    echo "      Note this is NOT a clean undo. The schema sync ran before the"
+    echo "      patch that failed, so the tables have already changed and the"
+    echo "      rollback restores images only. If the old code cannot cope,"
+    echo "      restore the data backup this update took at the start."
+    echo ""
+    echo "   New apps were NOT installed and the cache was NOT cleared."
+    exit 1
+fi
 
 echo "✅ Update complete!"
 docker compose -f "$COMPOSE_FILE" exec -T backend bench version

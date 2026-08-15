@@ -51,17 +51,50 @@ cd /opt/sspl-erp/v2
 3. Stops all services
 4. Pulls latest images
 5. Starts services and waits until the database and backend are actually ready
-6. Fixes DB grants and runs migrations
-7. Installs any app the new image added that the site does not have yet —
+6. Fixes DB grants
+7. Takes the user-facing services (frontend, websocket, queues, scheduler)
+   offline and runs migrations via `/opt/scripts/v2/frappe_migrate.sh`.
+   `up -d` in step 5 started everything, so without this window users would be
+   on a site whose code is new and whose schema is still moving.
+8. Installs any app the new image added that the site does not have yet —
    `bench migrate` only touches apps already installed, so an app added to the
    image reaches an existing site only here. Already-installed apps are skipped.
-8. Clears cache
+9. Clears cache, and brings the site back online
 
-If any step fails, the script stops and prints rollback instructions.
+If any step fails, the script stops and prints rollback instructions. The site
+is brought back online whatever happens — the offline window is closed from a
+trap, so a failure, a Ctrl-C or a kill cannot leave the site dark.
 
-Note that step 7 writes to the database, and `sspl-erp-rollback.sh` restores
+### If the update fails at the migration step
+
+The migration is the one step that changes the database, and a patch belonging
+to any app in the new image can fail there. The script stops, puts the site
+back online, and does **not** install new apps or clear caches on top of a
+part-migrated database. You are then running the new images against a database
+whose patches did not finish, so expect errors until you do one of:
+
+1. **Fix the app that failed** (the traceback names it), then re-run only the
+   migration, leaving the new images in place:
+   `sudo /opt/scripts/v2/frappe_migrate.sh`
+2. **Roll the images back**: `/opt/sspl-erp/v2/sspl-erp-rollback.sh`
+
+Rollback is second, not first, because it is not a clean undo here. `bench
+migrate` synchronises the schema *before* it runs the post-sync patches, so by
+the time a patch fails the tables have already been altered — and the rollback
+restores images only. Old code against a moved schema usually works, because
+Frappe tolerates columns it does not know about, but it is not the matching
+pair it looks like. If the old code cannot cope, restore the data backup the
+update took in step 1.
+
+Restoring a data backup is not the first thing to reach for either: the data is
+intact, the patches are what is missing. See the restore section of
+`BACKUP_GUIDE.md` for the `--skip-failing` and `bypass-patch` escape hatches.
+
+Note that step 8 writes to the database, and `sspl-erp-rollback.sh` restores
 images only — it cannot uninstall an app. If an update fails while installing
-one, restore the data backup from step 1 with `frappe_restore.sh`. Rehearse the
+one, restore the data backup from step 1 with `frappe_restore.sh` — this is a
+genuine data change, unlike a failed migration, which restoring does not fix.
+Rehearse the
 first update after an image gains an app on a test server.
 
 ### Rollback to Previous Version

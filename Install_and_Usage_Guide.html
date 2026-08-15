@@ -144,7 +144,8 @@ so a backup made by one can be restored with the other.</p>
 │       ├── frappe_backup.sh            ← full backup (DB + files + config)
 │       ├── frappe_db_backup.sh         ← quick database-only backup
 │       ├── frappe_backup_verify.sh     ← checks backups are complete &amp; fresh
-│       └── frappe_restore.sh           ← restore a full backup
+│       ├── frappe_restore.sh           ← restore a full backup
+│       └── frappe_migrate.sh           ← run bench migrate on its own
 └── /opt/backups/frappe/                ← data backups (shared)
     ├── 20260712_020000/                ← one folder per full backup
     │   ├── *-database.sql.gz           ← database dump
@@ -281,8 +282,10 @@ install the rest, in order:</p>
 <h3>Day-to-day use</h3>
 <ul>
   <li><b>Actions</b> — full backup, DB-only backup, verify, system update, rollback (with a snapshot
-      picker), and a Clear-RAM-caches button. Only one job runs at a time; its output streams into
-      the terminal at the foot of the page.</li>
+      picker), <b>Run migrations</b>, and a Clear-RAM-caches button. Only one job runs at a time;
+      its output streams into the terminal at the foot of the page. Run migrations is the retry for
+      an update or restore that failed at the migration step and nothing else — it is the same
+      <code>bench migrate</code> those two run internally.</li>
   <li><b>Backups</b> — full backups with DB / Files / Private completeness badges, DB-only dumps,
       image snapshots, and uploads; every file can be downloaded. A full backup also has a
       <b>Download</b> button beside its Restore button that saves the whole folder — database dump
@@ -427,6 +430,27 @@ panel itself is unavailable.</p>
 </ol>
 <p>Afterwards, log in to ERPNext and verify recent documents, attachments, and print formats.</p>
 
+<h3>If the restore stops at the migration</h3>
+<p>A restore is two steps: loading the data, then <code>bench migrate</code> so the patches match the
+app code in the running image. They fail differently, and the script says which one you got.</p>
+<div class="note"><b>"The data was restored, but the migration did NOT finish."</b> The data loaded
+correctly; what did not finish is the patching, so the database is part-patched. What failed is a
+patch belonging to one of the apps — usually because the code in the image is older or newer than
+the data. <b>Do not restore again</b>: that only puts you back at this same point, since the
+database was never the problem.</div>
+<p>Read the traceback for the app and patch it names, fix or update that app, then re-run only the
+migration — from the panel's <b>Run migrations</b> button, or:</p>
+<pre>sudo /opt/scripts/v2/frappe_migrate.sh</pre>
+<p>If the patch is known-broken upstream and you accept a part-patched database until it is fixed:</p>
+<pre>sudo SSPL_MIGRATE_SKIP_FAILING=yes /opt/scripts/v2/frappe_migrate.sh</pre>
+<p>Or, if this bench has the command (check with <code>bench --site &lt;your-site&gt; --help</code>),
+mark that one patch as done, permanently, and migrate again:</p>
+<pre>docker compose -f /opt/sspl-erp/docker-compose.yml exec backend \
+    bench --site &lt;your-site&gt; bypass-patch &lt;patch.module.name&gt;</pre>
+<div class="warn"><b>"The restore did NOT finish."</b> No such reassurance — the old database is
+gone and the new one is partial. Restore again, from the safety backup the panel took immediately
+before this attempt.</div>
+
 <h2>8. Part 2 — Optional cloud upload (rclone)</h2>
 <p>By default backups stay on the server's own disk. To survive a disk failure, upload them
 to cloud storage. Full provider walkthrough: see <i>Rclone_Configuration_Guide.docx</i>.</p>
@@ -482,7 +506,11 @@ so install Part 2 first.</div>
   <li>Snapshots the current Docker images to <code>/opt/sspl-erp/image-backups/backup_TIMESTAMP.tar</code>.</li>
   <li>Stops all services, prunes unused Docker resources, and pulls the latest images.</li>
   <li>Starts services and <b>waits until the database and backend are actually ready</b> (up to 3 minutes).</li>
-  <li>Repairs MariaDB user grants and runs <code>bench migrate</code>.</li>
+  <li>Repairs MariaDB user grants.</li>
+  <li>Takes the user-facing services (frontend, websocket, queues, scheduler) <b>offline</b>
+      and runs <code>bench migrate</code>. Step 4 started everything, so without this window
+      users would be on a site whose code is new and whose schema is still moving. The site
+      is brought back up whatever happens — a failure, a Ctrl-C or a kill cannot leave it dark.</li>
   <li><b>Installs any app the new image has added</b> that the site does not already
       have — <code>bench migrate</code> only touches apps the site already runs, so
       without this an app added to the image would never appear. Apps already
@@ -491,6 +519,24 @@ so install Part 2 first.</div>
   <li>Prints the new version and deletes image snapshots older than the 3 most recent.</li>
 </ol>
 <p>If any step fails, the script stops immediately and prints rollback instructions.</p>
+<div class="warn"><b>If the update fails at the migration:</b> the migration is the one step that
+changes the database, and a patch belonging to any app in the new image can fail there. The script
+stops, puts the site back online, and deliberately does <b>not</b> install new apps or clear caches
+on top of a part-migrated database. You are then running the new images against a database whose
+patches did not finish, so expect errors until you do one of:
+<ol>
+  <li><b>Fix the app that failed</b> (the traceback names it), then re-run only the migration,
+      leaving the new images in place: <code>sudo /opt/scripts/v2/frappe_migrate.sh</code></li>
+  <li><b>Roll the images back</b>: <code>/opt/sspl-erp/v2/sspl-erp-rollback.sh</code></li>
+</ol>
+Rollback is second, not first, because it is not a clean undo here: <code>bench migrate</code>
+synchronises the schema <i>before</i> it runs the post-sync patches, so by the time a patch fails the
+tables have already been altered — and the rollback restores images only (section 11). Old code
+against a moved schema usually works, because Frappe tolerates columns it does not know about, but
+it is not the matching pair it looks like. If it cannot cope, restore the data backup the update
+took at the start. Restoring is not the first thing to reach for either: the data is intact, the
+patches are what is missing. See section 7 for the <code>--skip-failing</code> and
+<code>bypass-patch</code> escape hatches.</div>
 <div class="note"><b>Note:</b> installing a new app writes to the database, and a
 rollback only restores the Docker images (section 11) — it will not remove an app
 that installed. If an update fails while installing one, restore the data backup the
@@ -567,6 +613,7 @@ skipped with a pointer to the right installer.</p>
 <tr><td>Back up only the database</td><td><code>sudo /opt/scripts/v2/frappe_db_backup.sh</code></td></tr>
 <tr><td>Check my backups are OK</td><td><code>sudo /opt/scripts/v2/frappe_backup_verify.sh</code></td></tr>
 <tr><td>Restore a backup</td><td><code>sudo /opt/scripts/v2/frappe_restore.sh /opt/backups/frappe/&lt;TIMESTAMP&gt;</code></td></tr>
+<tr><td>Retry migrations after a failed update or restore</td><td><code>sudo /opt/scripts/v2/frappe_migrate.sh</code></td></tr>
 <tr><td>Update to the latest release</td><td><code>cd /opt/sspl-erp/v2 &amp;&amp; ./sspl-erp-update-with-rollback.sh</code></td></tr>
 <tr><td>Undo the last update</td><td><code>cd /opt/sspl-erp/v2 &amp;&amp; ./sspl-erp-rollback.sh</code></td></tr>
 <tr><td>See image snapshots</td><td><code>./sspl-erp-backup-manager.sh list</code></td></tr>

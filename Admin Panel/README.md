@@ -43,7 +43,12 @@ before a cron migration, which is not job output.
   live ERP container status
 - **Clear RAM caches** button (`sync` + drop_caches — safe, caches rebuild automatically)
 - **One-click actions** — full backup, DB-only backup, backup verification,
-  system update, image rollback (with snapshot picker)
+  system update, image rollback (with snapshot picker), run migrations
+- **Run migrations** — `bench migrate` on its own, the same step the update and
+  the restore run internally. It exists as its own button because when that is
+  the step that failed, the data is fine and a patch is not: the fix is to
+  re-run the migration, not to restore a database that was never the problem.
+  Runs `frappe_migrate.sh` from the backup scripts directory.
 - **Guarded restore** — restore a full backup or an uploaded backup folder:
   re-enter your admin password, type the site name to confirm, and a safety
   backup is taken first. The MariaDB root password is typed into the live

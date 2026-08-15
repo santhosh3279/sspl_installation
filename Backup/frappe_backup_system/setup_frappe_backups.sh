@@ -25,6 +25,7 @@ echo "Installing backup scripts to $INSTALL_DIR..."
 sudo cp frappe_backup.sh "$INSTALL_DIR/"
 sudo cp frappe_db_backup.sh "$INSTALL_DIR/"
 sudo cp frappe_restore.sh "$INSTALL_DIR/"
+sudo cp frappe_migrate.sh "$INSTALL_DIR/"
 sudo cp frappe_backup_verify.sh "$INSTALL_DIR/"
 sudo cp restore_with_backup.sh "$INSTALL_DIR/"
 sudo cp rclone_trash_cleanup.sh "$INSTALL_DIR/"
@@ -50,6 +51,7 @@ if [ ! -z "$SITE_NAME" ]; then
     sudo sed -i "s/your-site-name/$SITE_NAME/g" "$INSTALL_DIR/frappe_backup.sh"
     sudo sed -i "s/your-site-name/$SITE_NAME/g" "$INSTALL_DIR/frappe_db_backup.sh"
     sudo sed -i "s/your-site-name/$SITE_NAME/g" "$INSTALL_DIR/frappe_restore.sh"
+    sudo sed -i "s/your-site-name/$SITE_NAME/g" "$INSTALL_DIR/frappe_migrate.sh"
     echo "Site name configured: $SITE_NAME"
 fi
 

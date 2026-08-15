@@ -30,7 +30,7 @@ This backup system provides automated, reliable backups for your Frappe/ERPNext 
 ### 1. Download and Install
 ```bash
 # Make scripts executable
-chmod +x frappe_backup.sh frappe_db_backup.sh frappe_restore.sh
+chmod +x frappe_backup.sh frappe_db_backup.sh frappe_restore.sh frappe_migrate.sh
 chmod +x frappe_backup_verify.sh setup_frappe_backups.sh
 
 # Run installation script
@@ -246,7 +246,46 @@ ls -lh /opt/backups/frappe/
 sudo /opt/scripts/v2/frappe_restore.sh /opt/backups/frappe/20250330_020000
 ```
 
-### 3. Manual Restore (if script fails):
+### 3. If the restore fails at the migration step
+
+A restore is two things: loading the data, then running `bench migrate` so the
+patches match the app code in the running image. They fail differently, and the
+script tells you which one you got.
+
+**"The data was restored, but the migration did NOT finish."** The data loaded
+correctly; what did not finish is the patching, so the database is part-patched.
+What failed is a patch belonging to one of the apps — usually because the code
+in the image is older or newer than the data. Restoring again only puts you back
+at this same point: the database was never the problem.
+
+Read the traceback for the app and patch that failed, fix or update that app,
+then re-run only the migration:
+
+```bash
+sudo /opt/scripts/v2/frappe_migrate.sh
+```
+
+If the patch is known-broken upstream and you accept a part-patched database
+until it is fixed:
+
+```bash
+sudo SSPL_MIGRATE_SKIP_FAILING=yes /opt/scripts/v2/frappe_migrate.sh
+```
+
+Or, if this bench has the command — check with
+`bench --site your-site-name --help` — mark that one patch as done,
+permanently, and migrate again:
+
+```bash
+docker compose -f /opt/sspl-erp/docker-compose.yml exec backend \
+    bench --site your-site-name bypass-patch <patch.module.name>
+```
+
+**"The restore did NOT finish."** No such reassurance — the old database is
+gone and the new one is partial. Restore again, from the safety backup the
+Restore button took just before this one.
+
+### 4. Manual Restore (if script fails):
 ```bash
 # Copy backup to container
 docker compose -f /opt/sspl-erp/docker-compose.yml cp \
@@ -411,6 +450,9 @@ sudo /opt/scripts/v2/frappe_backup_verify.sh
 
 # Restore
 sudo /opt/scripts/v2/frappe_restore.sh /path/to/backup
+
+# Migrations alone — retry after a restore or update failed at that step
+sudo /opt/scripts/v2/frappe_migrate.sh
 
 # Check cron jobs
 sudo crontab -l

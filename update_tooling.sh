@@ -88,6 +88,10 @@ if [ -f "$BACKUP_DST/frappe_backup.sh" ]; then
     update_script "$BACKUP_SRC" "$BACKUP_DST" frappe_restore.sh       SITE_NAME
     update_script "$BACKUP_SRC" "$BACKUP_DST" frappe_backup_verify.sh BACKUP_DIR ALERT_EMAIL MAX_AGE_HOURS
     update_script "$BACKUP_SRC" "$BACKUP_DST" restore_with_backup.sh
+    # New in this release — the restore and the update both call it, and the
+    # panel's Run migrations button runs it, so it has to reach servers set up
+    # before it existed.
+    update_script "$BACKUP_SRC" "$BACKUP_DST" frappe_migrate.sh       SITE_NAME
     # New in this release — installed even on servers set up before it existed,
     # because the backup scripts now look for it next to themselves.
     update_script "$BACKUP_SRC" "$BACKUP_DST" rclone_trash_cleanup.sh HEADROOM_PERCENT ONLY_BACKUP_ITEMS MAX_NO_PROGRESS MAX_DEPTH

@@ -78,6 +78,11 @@ ACTIONS = {
     # arguments, env vars, or log lines. Guarded by _restore_request().
     "restore":   {"label": "Restore from backup",
                   "cmd": [f"{SCRIPTS_DIR}/restore_with_backup.sh"], "interactive": True},
+    # The migration on its own. Both the restore and the update run this step
+    # internally; it is here so that when it is the step that failed — the
+    # data is fine, a patch is not — you can re-run just it, instead of
+    # restoring a database that was never the problem.
+    "migrate":   {"label": "Run migrations", "cmd": [f"{SCRIPTS_DIR}/frappe_migrate.sh"]},
 }
 
 # Component installers, driven from the panel's Setup switches. Only wired
@@ -1097,6 +1102,16 @@ def api_run(name):
         extra_env, extra_args, err, status = _restore_request(data)
         if err:
             return jsonify({"error": err}), status
+
+    elif name == "migrate":
+        # Pass the live site rather than relying on the copy the backup
+        # installer sed'd a name into: this action exists to be run when
+        # something has already gone wrong, so it should not also depend on
+        # that installer having been answered.
+        site = deployed_site_name()
+        if not site:
+            return jsonify({"error": "no deployed site found — nothing to migrate"}), 400
+        extra_env = {"SSPL_SITE_NAME": site}
 
     elif name == "rollback":
         snap = data.get("snapshot", "")
@@ -2302,6 +2317,8 @@ details{margin:2px 0} details summary{cursor:pointer}
     <select id="rb-snap" title="Image snapshot to roll back to"></select>
     <button class="danger act" data-act="rollback"
       data-confirm="Roll back Docker images to the selected snapshot? Services will restart.">Rollback</button>
+    <button class="act" data-act="migrate"
+      data-confirm="Run database migrations now? Use this to retry after an update or restore failed at the migration step.">Run migrations</button>
     <span class="sep"></span>
     <button id="clear-ram"
       data-confirm="Clear RAM caches now? This is safe but may briefly slow the system while caches rebuild.">Clear RAM caches</button>
