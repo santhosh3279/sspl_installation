@@ -52,7 +52,11 @@ before a cron migration, which is not job output.
   the foot of the page; type into it directly when a job asks a question;
   only one job can run at a time
 - **Backup browser** — full backups (with DB/Files/Private completeness badges),
-  DB-only dumps, Docker image snapshots, uploads — all downloadable. Each
+  DB-only dumps, Docker image snapshots, uploads — all downloadable. A full
+  backup also has a **Download** button next to Restore that streams the whole
+  folder as one uncompressed `.tar` (contents are already compressed), so a
+  backup can be moved off the server in one go; it is offered even for a
+  backup with no database dump, which Restore is not. Each
   table shows 3 rows and scrolls for the rest. A **Clear backups older than
   30 days** button deletes aged full and DB-only backups, always keeping the
   newest 20 of each (however old); uploads and image snapshots are never

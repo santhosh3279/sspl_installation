@@ -16,6 +16,7 @@ import pty
 import re
 import shutil
 import subprocess
+import tarfile
 import termios
 import threading
 import time
@@ -23,7 +24,7 @@ from datetime import datetime
 from functools import wraps
 from pathlib import Path
 
-from flask import (Flask, abort, jsonify, redirect, render_template_string,
+from flask import (Flask, Response, abort, jsonify, redirect, render_template_string,
                    request, send_file, session, url_for)
 from werkzeug.security import check_password_hash
 from werkzeug.utils import secure_filename
@@ -33,12 +34,12 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-08-15.1"
+PANEL_VERSION = "2026-08-15.2"
 FEATURES = ("ERP Next Installation suite page with rclone cloud backup setup "
             "covering full and DB-only backups, console-style terminal whose log "
-            "is downloadable and whose past runs are browsable, guarded restore, "
-            "delete uploads, cron jobs viewer on the dashboard, one-click panel "
-            "update straight from git")
+            "is downloadable and whose past runs are browsable, whole-folder "
+            "backup download, guarded restore, delete uploads, cron jobs viewer "
+            "on the dashboard, one-click panel update straight from git")
 
 CONFIG_FILE = os.environ.get("SSPL_ADMIN_CONFIG", "/opt/sspl-admin/config.json")
 with open(CONFIG_FILE) as f:
@@ -959,6 +960,44 @@ def _safe_download_path(kind, name):
     return target
 
 
+def _safe_backup_folder(name):
+    """Resolve one full-backup folder for download. Unlike _restore_source it
+    does not insist on a database dump: a files-only backup is still worth
+    downloading, it just cannot be restored from."""
+    if not FULL_BACKUP_RE.match(name):
+        abort(400)
+    target = (BACKUP_DIR / name).resolve()
+    if not str(target).startswith(str(BACKUP_DIR.resolve()) + os.sep) or not target.is_dir():
+        abort(404)
+    return target
+
+
+def _tar_stream(folder):
+    """Stream a folder as an uncompressed tar, built in a thread and read out
+    through a pipe. The pipe is what keeps memory flat: tarfile blocks on the
+    write side until the browser has taken the previous chunk, so a multi-GB
+    backup never lands in RAM. If the client hangs up, the read end closes,
+    the thread's next write raises EPIPE and it ends with it — nothing is left
+    running. Not gzipped: the contents are already .gz and .tar."""
+    r_fd, w_fd = os.pipe()
+
+    def build():
+        try:
+            with os.fdopen(w_fd, "wb") as pipe:
+                with tarfile.open(fileobj=pipe, mode="w|", bufsize=64 * 1024) as tar:
+                    tar.add(folder, arcname=folder.name)
+        except OSError:
+            pass
+
+    threading.Thread(target=build, daemon=True).start()
+    with os.fdopen(r_fd, "rb") as out:
+        while True:
+            chunk = out.read(64 * 1024)
+            if not chunk:
+                return
+            yield chunk
+
+
 # ---------------------------------------------------------------- routes
 
 @app.route("/login", methods=["GET", "POST"])
@@ -1447,6 +1486,17 @@ def api_uploads_delete():
 @login_required
 def download(kind, name):
     return send_file(_safe_download_path(kind, name), as_attachment=True)
+
+
+@app.route("/download-folder/full/<name>")
+@login_required
+def download_folder(name):
+    """A whole full-backup folder as one tar — the database dump and the file
+    archives together, which is what makes a backup usable somewhere else.
+    Streamed, so the size of the backup does not matter."""
+    folder = _safe_backup_folder(name)
+    return Response(_tar_stream(folder), mimetype="application/x-tar",
+                    headers={"Content-Disposition": f'attachment; filename="{folder.name}.tar"'})
 
 
 # ---------------------------------------------------------------- templates
@@ -2445,6 +2495,13 @@ async function refreshSite(){
 
 function fileBadge(ok, label){ return `<span class="badge ${ok?'ok':'miss'}">${label}${ok?' ✓':' missing'}</span>`; }
 function dl(kind, name){ return `<a href="/download/${kind}/${encodeURIComponent(name).replace(/%2F/g,'/')}">download</a>`; }
+// The whole folder in one tar, beside Restore. Always offered — a backup with
+// no database dump cannot be restored but is still worth taking a copy of.
+// Deliberately not .danger: Restore stays the only red button in that cell.
+function folderDlBtn(name){
+  return `<button onclick="location='/download-folder/full/${encodeURIComponent(name)}'"
+    title="Download this whole backup folder as one .tar">Download</button>`;
+}
 
 async function refreshBackups(){
   try{
@@ -2456,7 +2513,7 @@ async function refreshBackups(){
         <td>${fileBadge(d.db,'DB')} ${fileBadge(d.public,'Files')} ${fileBadge(d.private,'Private')}</td>
         <td class="right"><details><summary>${d.files.length} files</summary><div class="filelist">` +
         d.files.map(f => `${esc(f.name)} (${esc(f.size)}) — ${dl('full', d.name + '/' + f.name)}`).join('<br>') +
-        `</div></details></td><td class="right">${restoreBtn(d.db, 'full', d.name)}</td></tr>`).join('') +
+        `</div></details></td><td class="right">${folderDlBtn(d.name)} ${restoreBtn(d.db, 'full', d.name)}</td></tr>`).join('') +
         '</tbody></table></div>'
       : '<p style="color:var(--muted)">No full backups found.</p>';
     const simpleTable = (rows, kind, deletable) => rows.length ? `<div class="scrollrows"><table><thead><tr><th>File</th><th>Size</th>
