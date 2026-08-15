@@ -16,10 +16,10 @@ import pty
 import re
 import shutil
 import subprocess
-import tarfile
 import termios
 import threading
 import time
+import zipfile
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
@@ -34,7 +34,7 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-08-15.2"
+PANEL_VERSION = "2026-08-15.3"
 FEATURES = ("ERP Next Installation suite page with rclone cloud backup setup "
             "covering full and DB-only backups, console-style terminal whose log "
             "is downloadable and whose past runs are browsable, whole-folder "
@@ -972,20 +972,27 @@ def _safe_backup_folder(name):
     return target
 
 
-def _tar_stream(folder):
-    """Stream a folder as an uncompressed tar, built in a thread and read out
-    through a pipe. The pipe is what keeps memory flat: tarfile blocks on the
-    write side until the browser has taken the previous chunk, so a multi-GB
-    backup never lands in RAM. If the client hangs up, the read end closes,
-    the thread's next write raises EPIPE and it ends with it — nothing is left
-    running. Not gzipped: the contents are already .gz and .tar."""
+def _zip_stream(folder):
+    """Stream a folder as a zip, built in a thread and read out through a
+    pipe. The pipe is what keeps memory flat: zipfile blocks on the write side
+    until the browser has taken the previous chunk, so a multi-GB backup never
+    lands in RAM. If the client hangs up, the read end closes, the thread's
+    next write raises EPIPE and it ends with it — nothing is left running.
+
+    Stored, not deflated: the contents are already .gz and .tar, so
+    compressing again costs CPU for nothing. The pipe is not seekable, which
+    zipfile handles by writing data descriptors after each member instead of
+    seeking back to patch the local headers."""
     r_fd, w_fd = os.pipe()
 
     def build():
         try:
             with os.fdopen(w_fd, "wb") as pipe:
-                with tarfile.open(fileobj=pipe, mode="w|", bufsize=64 * 1024) as tar:
-                    tar.add(folder, arcname=folder.name)
+                with zipfile.ZipFile(pipe, "w", zipfile.ZIP_STORED,
+                                     allowZip64=True) as zf:
+                    for p in sorted(folder.rglob("*")):
+                        if p.is_file():
+                            zf.write(p, arcname=str(Path(folder.name) / p.relative_to(folder)))
         except OSError:
             pass
 
@@ -1491,12 +1498,12 @@ def download(kind, name):
 @app.route("/download-folder/full/<name>")
 @login_required
 def download_folder(name):
-    """A whole full-backup folder as one tar — the database dump and the file
+    """A whole full-backup folder as one zip — the database dump and the file
     archives together, which is what makes a backup usable somewhere else.
     Streamed, so the size of the backup does not matter."""
     folder = _safe_backup_folder(name)
-    return Response(_tar_stream(folder), mimetype="application/x-tar",
-                    headers={"Content-Disposition": f'attachment; filename="{folder.name}.tar"'})
+    return Response(_zip_stream(folder), mimetype="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="{folder.name}.zip"'})
 
 
 # ---------------------------------------------------------------- templates
@@ -2500,7 +2507,7 @@ function dl(kind, name){ return `<a href="/download/${kind}/${encodeURIComponent
 // Deliberately not .danger: Restore stays the only red button in that cell.
 function folderDlBtn(name){
   return `<button onclick="location='/download-folder/full/${encodeURIComponent(name)}'"
-    title="Download this whole backup folder as one .tar">Download</button>`;
+    title="Download this whole backup folder as one .zip">Download</button>`;
 }
 
 async function refreshBackups(){
