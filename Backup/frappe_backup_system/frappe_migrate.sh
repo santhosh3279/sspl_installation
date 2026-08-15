@@ -58,13 +58,19 @@ if [ "${SSPL_MIGRATE_SKIP_FAILING:-}" = "yes" ]; then
 fi
 
 echo "Running migrations on $SITE_NAME..."
-if docker compose -f "$COMPOSE_FILE" exec -T backend \
-        bench --site "$SITE_NAME" migrate \
-        ${MIGRATE_ARGS[@]+"${MIGRATE_ARGS[@]}"}; then
+# Status captured from the command itself, not from an 'if' around it: a
+# failed 'if' condition with no else branch leaves $? at 0, so reading it
+# after the block reports success for a migration that did not happen — and
+# every caller here branches on this script's exit status.
+docker compose -f "$COMPOSE_FILE" exec -T backend \
+    bench --site "$SITE_NAME" migrate \
+    ${MIGRATE_ARGS[@]+"${MIGRATE_ARGS[@]}"}
+STATUS=$?
+
+if [ "$STATUS" -eq 0 ]; then
     echo "✓ Migrations completed"
     exit 0
 fi
-STATUS=$?
 
 cat >&2 <<EOF
 
