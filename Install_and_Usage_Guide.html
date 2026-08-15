@@ -260,6 +260,12 @@ particular PC, import <code>/opt/sspl-admin/certs/sspl-admin.crt</code> into its
 <p>The page is one column: the <b>control panel</b> (setup, server health, actions, backups) with a
 full-width <b>terminal</b> at the foot of the page showing the live output of whatever is running.
 Starting a job scrolls the terminal into view; drag its bottom edge to make it taller.</p>
+<p>Every run is also written to a log file on the server, so nothing is lost when the page is
+closed or the browser is refreshed. <i>Download Log</i> beside the terminal heading saves the
+current run's log; <b>Log history — past runs</b> just below the terminal folds open into every
+earlier run, newest first, each with its own download link. Send that file when reporting a failed
+install or backup. The logs can quote configuration and backup contents, so treat them as
+confidential.</p>
 <p>The <b>Setup — install components</b> card at the top shows what is installed and lets you
 install the rest, in order:</p>
 <ol>

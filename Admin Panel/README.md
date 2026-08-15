@@ -22,6 +22,14 @@ terminal renders it — ANSI colour/cursor escapes are obeyed as control codes
 rather than printed, and `\r` overwrites its line, so docker's progress
 redraws read cleanly instead of as escape-code soup.
 
+Every run is logged to `JOB_DIR` (`/opt/sspl-admin/jobs` by default) as
+`<YYYYmmdd>_<HHMMSS>_<action>.log`, mode 0600 — job output can quote config
+and backup contents. *Download Log* beside the terminal heading fetches the
+current run; **Log history — past runs** below the terminal lists every
+earlier run with a download link each. Only `*.log` matching that name shape
+is listed or served: the same directory also holds the `crontab_*.bak` taken
+before a cron migration, which is not job output.
+
 ## Features
 
 - **ERP Next Installation suite** — install the whole system from the browser:

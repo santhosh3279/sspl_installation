@@ -33,8 +33,9 @@ fi
 sudo mkdir -p "$INSTALL_DIR" "$INSTALL_DIR/jobs" /opt/backups/frappe/uploads
 
 # 2. Python virtualenv with Flask
-if [ ! -x "$INSTALL_DIR/venv/bin/python" ]; then
+if [ ! -x "$INSTALL_DIR/venv/bin/python" ] || [ ! -x "$INSTALL_DIR/venv/bin/pip" ]; then
     echo "Creating Python virtualenv..."
+    sudo rm -rf "$INSTALL_DIR/venv"
     sudo python3 -m venv "$INSTALL_DIR/venv"
 fi
 echo "Installing Flask..."

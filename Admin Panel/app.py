@@ -33,11 +33,12 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-08-04.1"
+PANEL_VERSION = "2026-08-15.1"
 FEATURES = ("ERP Next Installation suite page with rclone cloud backup setup "
-            "covering full and DB-only backups, console-style terminal, "
-            "guarded restore, delete uploads, cron jobs viewer on the dashboard, "
-            "one-click panel update straight from git")
+            "covering full and DB-only backups, console-style terminal whose log "
+            "is downloadable and whose past runs are browsable, guarded restore, "
+            "delete uploads, cron jobs viewer on the dashboard, one-click panel "
+            "update straight from git")
 
 CONFIG_FILE = os.environ.get("SSPL_ADMIN_CONFIG", "/opt/sspl-admin/config.json")
 with open(CONFIG_FILE) as f:
@@ -300,7 +301,35 @@ def job_status():
             "started": datetime.fromtimestamp(_job["started"]).strftime("%Y-%m-%d %H:%M:%S"),
             "elapsed": int((_job["finished"] or time.time()) - _job["started"]),
             "log": log,
+            "logfile": Path(_job["logfile"]).name if _job.get("logfile") else None,
         }
+
+
+# Job log names are '<YYYYmmdd>_<HHMMSS>_<action>.log' — see start_job. The
+# action is recovered from the name so the history can show the same label as
+# the terminal did while the job ran.
+JOB_LOG_RE = re.compile(r"^(\d{8})_(\d{6})_(\w+)\.log$")
+
+
+def job_logs(limit=60):
+    """Every past terminal run, newest first. Only *.log is listed: JOB_DIR
+    also holds crontab_*.bak, which is not job output and is not offered."""
+    items = []
+    if JOB_DIR.is_dir():
+        for p in JOB_DIR.iterdir():
+            m = JOB_LOG_RE.match(p.name)
+            if not (m and p.is_file()):
+                continue
+            st = p.stat()
+            action = ACTIONS.get(m.group(3))
+            items.append({
+                "name": p.name,
+                "label": action["label"] if action else m.group(3),
+                "size": human(st.st_size),
+                "mtime": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M"),
+            })
+    items.sort(key=lambda x: x["name"], reverse=True)
+    return items[:limit]
 
 
 # ---------------------------------------------------------------- system stats
@@ -907,13 +936,17 @@ def _safe_upload_target(name):
 
 
 def _safe_download_path(kind, name):
-    roots = {"full": BACKUP_DIR, "db": DB_ONLY_DIR, "image": IMAGE_BACKUP_DIR, "upload": UPLOAD_DIR}
+    roots = {"full": BACKUP_DIR, "db": DB_ONLY_DIR, "image": IMAGE_BACKUP_DIR, "upload": UPLOAD_DIR, "log": JOB_DIR}
     root = roots.get(kind)
     if root is None:
         abort(400)
     parts = name.split("/")
     if kind == "full":
         if len(parts) != 2 or not FULL_BACKUP_RE.match(parts[0]) or not SAFE_NAME_RE.match(parts[1]):
+            abort(400)
+    elif kind == "log":
+        # JOB_DIR also holds crontab_*.bak; only job output is downloadable.
+        if len(parts) != 1 or not JOB_LOG_RE.match(parts[0]):
             abort(400)
     elif kind == "upload" and len(parts) == 2:
         if not SAFE_FOLDER_RE.match(parts[0]) or not SAFE_NAME_RE.match(parts[1]):
@@ -981,6 +1014,13 @@ def api_backups():
 @login_required
 def api_job():
     return jsonify(job_status())
+
+
+@app.route("/api/logs")
+@login_required
+def api_logs():
+    """The terminal's log history — every past run, newest first."""
+    return jsonify({"logs": job_logs()})
 
 
 @app.route("/api/setup-status")
@@ -1503,11 +1543,23 @@ TERM_CSS = """
   background:transparent;color:#ddd;border:0;outline:none;padding:0;caret-color:#ddd}
 .term-in input::placeholder{color:#555}
 .term-in .ps1{color:var(--accent);font:var(--term-fs)/1.45 ui-monospace,monospace}
+/* Log history: every past run's log file, folded away under the terminal so
+   the live output stays the thing you see first. */
+#log-history{margin-top:12px;font-size:13px}
+#log-history summary{cursor:pointer;color:var(--ink-2)}
+#log-history .rows{max-height:240px;overflow-y:auto;margin-top:8px}
+#log-history td a{color:var(--accent)}
+#log-history .right{text-align:right}
 """
+
 
 TERM_HTML = """
 <aside class="col-right">
-<div class="card" id="job-card"><h2>Terminal — live output</h2>
+<div class="card" id="job-card">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+    <h2 style="margin:0">Terminal — live output</h2>
+    <a id="term-download" class="badge" style="display:none;text-decoration:none;cursor:pointer;font-size:12px;padding:3px 8px;border-color:var(--accent);color:var(--accent)" href="#" download>Download Log</a>
+  </div>
   <div id="jobstate">No job has been run yet.</div>
   <div class="term" id="term">
     <div id="console"></div>
@@ -1517,6 +1569,10 @@ TERM_HTML = """
              autocapitalize="off" autocorrect="off" spellcheck="false">
     </div>
   </div>
+  <details id="log-history">
+    <summary>Log history — past runs</summary>
+    <div class="rows" id="log-rows"></div>
+  </details>
 </div>
 </aside>
 """
@@ -1610,13 +1666,39 @@ async function refreshJob(){
           ? '<span class="okrc">success</span>' : `<span class="badrc">FAILED (exit ${j.rc})</span>`)
         + ` after ${j.elapsed}s (started ${esc(j.started)})`;
     $('#jobstate').innerHTML = st;
+    const dl = $('#term-download');
+    if (j.logfile) {
+      dl.href = `/download/log/${encodeURIComponent(j.logfile)}`;
+      dl.style.display = 'inline-block';
+    } else {
+      dl.style.display = 'none';
+    }
     const c = $('#console'), atEnd = c.scrollTop + c.clientHeight >= c.scrollHeight - 30;
     c.textContent = termText(j.log || '') || '(no output yet)';
     if (atEnd) c.scrollTop = c.scrollHeight;
-    if (jobWasActive && !j.active) onJobFinished();
+    if (jobWasActive && !j.active) { refreshLogs(); onJobFinished(); }
     jobWasActive = j.active;
   }catch(e){}
 }
+
+// ---- log history -----------------------------------------------------------
+// Read once on load and again when a job finishes — not on every poll tick,
+// which would scan the jobs directory a few times a second for a list that
+// only changes when a run starts or ends.
+async function refreshLogs(){
+  try{
+    const r = await fetch('/api/logs'); if(!r.ok) return;
+    const logs = (await r.json()).logs || [];
+    $('#log-rows').innerHTML = logs.length
+      ? `<table><thead><tr><th>Run</th><th>Date</th><th>Size</th><th></th></tr></thead><tbody>` +
+        logs.map(l => `<tr><td>${esc(l.label)}</td><td class="num">${esc(l.mtime)}</td>
+          <td class="num">${esc(l.size)}</td>
+          <td class="right"><a href="/download/log/${encodeURIComponent(l.name)}">download</a></td></tr>`).join('') +
+        '</tbody></table>'
+      : '<p style="color:var(--muted)">No runs yet.</p>';
+  }catch(e){}
+}
+refreshLogs();
 
 // Poll the job faster while one is running, so prompts and output feel
 // prompt to type against; idle back off when nothing is happening.
