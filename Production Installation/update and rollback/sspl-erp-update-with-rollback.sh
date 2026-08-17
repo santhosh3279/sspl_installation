@@ -94,7 +94,22 @@ docker system prune -f || echo "   ⚠ Prune failed, continuing"
 # has changed, so a registry failure here is not the partial state the trap
 # describes.
 echo "→ Pulling latest image (services stay up during the download)..."
-if ! docker compose -f "$COMPOSE_FILE" pull; then
+# --quiet, plus a heartbeat of our own. Compose's default progress writer only
+# collapses to a live-updating block when stdout is a terminal; the panel runs
+# this job with its output going to a log file, so that same progress arrives
+# as one line per layer per refresh — hundreds of them, burying the rest of the
+# update. A line every 30s says the same thing: it is still going, and for how
+# long. Backgrounded so the heartbeat can run while the pull does; the pull's
+# own exit status is still what decides below.
+docker compose -f "$COMPOSE_FILE" pull --quiet &
+PULL_PID=$!
+PULL_START=$SECONDS
+while kill -0 "$PULL_PID" 2>/dev/null; do
+    sleep 30
+    kill -0 "$PULL_PID" 2>/dev/null &&
+        echo "   … downloading, $((SECONDS - PULL_START))s elapsed"
+done
+if ! wait "$PULL_PID"; then
     echo ""
     echo "❌ Update stopped: the image pull failed."
     echo "   Nothing was changed — the site is still up on the current images."
