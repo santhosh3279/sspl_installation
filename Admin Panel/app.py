@@ -34,7 +34,7 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-08-15.3"
+PANEL_VERSION = "2026-08-17.1"
 FEATURES = ("ERP Next Installation suite page with rclone cloud backup setup "
             "covering full and DB-only backups, console-style terminal whose log "
             "is downloadable and whose past runs are browsable, whole-folder "
@@ -2313,7 +2313,7 @@ details{margin:2px 0} details summary{cursor:pointer}
     <button class="act" data-act="verify">Verify backups</button>
     <span class="sep"></span>
     <button class="primary act" data-act="update"
-      data-confirm="Update the ERP system now? Services will restart and users will be disconnected for a few minutes.">Update system</button>
+      data-confirm="Update the ERP system now?&#10;&#10;The backup and the image download run with the site up — services only restart once the new images are on disk, so users are disconnected for a few minutes at the end, not for the whole job.">Update system</button>
     <select id="rb-snap" title="Image snapshot to roll back to"></select>
     <button class="danger act" data-act="rollback"
       data-confirm="Roll back Docker images to the selected snapshot? Services will restart.">Rollback</button>

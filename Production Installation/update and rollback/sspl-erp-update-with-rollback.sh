@@ -71,14 +71,39 @@ else
     echo "   ⚠ No images found to backup"
 fi
 
+# The prune and the pull both happen with the site still up, so the download —
+# by far the longest step — costs no downtime. Order inside this block matters:
+#
+#   - the snapshot above must come first. IMAGES are tags, and the rollback
+#     does a bare 'docker load', so it depends on the tar carrying the old
+#     images' RepoTags. Pull first and ':latest' already points at the new
+#     image, so the snapshot would save the new images and the rollback would
+#     be a no-op. (Nothing is lost by that ordering: the frappe backup and the
+#     snapshot already run with the site up.)
+#   - the prune must come before the pull, as it always has. It only reclaims
+#     dangling images, which are the *previous* update's leftovers — the pull
+#     is what orphans the current ones. Pruning after the pull would make each
+#     update hold two generations of images plus the tar at once.
+echo "→ Cleaning up unused Docker resources..."
+# Cleanup, not a precondition — and it now runs while the site is up, so
+# failing it here would abort a still-healthy system into the ERR trap's
+# "partial state" message.
+docker system prune -f || echo "   ⚠ Prune failed, continuing"
+
+# Guarded rather than left to the ERR trap: until 'down' runs below, nothing
+# has changed, so a registry failure here is not the partial state the trap
+# describes.
+echo "→ Pulling latest image (services stay up during the download)..."
+if ! docker compose -f "$COMPOSE_FILE" pull; then
+    echo ""
+    echo "❌ Update stopped: the image pull failed."
+    echo "   Nothing was changed — the site is still up on the current images."
+    echo "   Check the network/registry and run the update again."
+    exit 1
+fi
+
 echo "→ Stopping all services..."
 docker compose -f "$COMPOSE_FILE" down
-
-echo "→ Cleaning up unused Docker resources..."
-docker system prune -f
-
-echo "→ Pulling latest image..."
-docker compose -f "$COMPOSE_FILE" pull
 
 echo "→ Starting all services..."
 docker compose -f "$COMPOSE_FILE" up -d

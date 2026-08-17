@@ -504,8 +504,11 @@ so install Part 2 first.</div>
 <ol>
   <li>Runs a <b>full Frappe data backup</b> (database + files). If this fails you are asked whether to continue.</li>
   <li>Snapshots the current Docker images to <code>/opt/sspl-erp/image-backups/backup_TIMESTAMP.tar</code>.</li>
-  <li>Stops all services, prunes unused Docker resources, and pulls the latest images.</li>
-  <li>Starts services and <b>waits until the database and backend are actually ready</b> (up to 3 minutes).</li>
+  <li>Prunes unused Docker resources and <b>pulls the latest images with the site still running</b> —
+      the download is the longest step of an update, so it is kept out of the downtime window.
+      If the pull fails nothing has been changed and the site stays up on the current images.</li>
+  <li>Stops all services, then starts them on the new images and <b>waits until the database and
+      backend are actually ready</b> (up to 3 minutes).</li>
   <li>Repairs MariaDB user grants.</li>
   <li>Takes the user-facing services (frontend, websocket, queues, scheduler) <b>offline</b>
       and runs <code>bench migrate</code>. Step 4 started everything, so without this window

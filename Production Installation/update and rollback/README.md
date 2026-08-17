@@ -48,8 +48,10 @@ cd /opt/sspl-erp/v2
 **What it does:**
 1. Runs a full Frappe backup (database + files) via `/opt/scripts/v2/frappe_backup.sh`
 2. Backs up current Docker images to `/opt/sspl-erp/image-backups/backup_TIMESTAMP.tar`
-3. Stops all services
-4. Pulls latest images
+3. Prunes unused Docker resources and pulls the latest images **with the site still
+   running** — the download is the longest step, so it is kept out of the downtime
+   window. A failed pull changes nothing and leaves the site up on current images.
+4. Stops all services
 5. Starts services and waits until the database and backend are actually ready
 6. Fixes DB grants
 7. Takes the user-facing services (frontend, websocket, queues, scheduler)
