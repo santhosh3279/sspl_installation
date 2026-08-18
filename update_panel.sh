@@ -3,7 +3,7 @@
 # SSPL admin panel updater — the dashboard's "Update Admin Panel" button.
 #
 # Does the two steps that previously needed an SSH session:
-#   1. git pull the repo checkout (fast-forward only)
+#   1. reset the repo checkout to what the remote has
 #   2. deploy the panel from it, via update_tooling.sh with SSPL_ONLY=panel
 #
 # Only the panel is deployed. The v2 backup / update scripts are left alone
@@ -65,36 +65,80 @@ main() {
     BRANCH=$("${GIT[@]}" rev-parse --abbrev-ref HEAD)
     echo "   Branch: $BRANCH, currently at $(echo "$BEFORE" | cut -c1-7)"
 
-    DIRTY=$("${GIT[@]}" status --porcelain --untracked-files=no)
-    if [ -n "$DIRTY" ]; then
-        echo "   ⚠ The checkout has uncommitted changes to tracked files:"
-        echo "$DIRTY" | sed 's/^/     /'
-        echo "     A fast-forward that would overwrite them will be refused below."
+    # A detached HEAD has no upstream to follow, and resetting one to a guess
+    # would be picking a branch on the operator's behalf.
+    if [ "$BRANCH" = "HEAD" ]; then
+        echo "   ❌ The checkout is on a detached HEAD — nothing to follow."
+        echo "      Put it on a branch over SSH:"
+        echo "        cd $REPO_DIR && git checkout main"
+        exit 1
     fi
 
-    # --ff-only: never create a merge commit on the server, and fail loudly if
-    # the checkout has diverged from the remote. A silent merge here would
-    # deploy a state that exists on no other machine.
-    if ! "${GIT[@]}" pull --ff-only; then
+    # Whatever this branch tracks, or origin/<branch> if it tracks nothing.
+    # for-each-ref rather than 'rev-parse @{u}': with no upstream configured
+    # that prints the literal '@{u}' on stdout as well as failing, which would
+    # sail past an emptiness check and become a nonsense remote name.
+    UPSTREAM=$("${GIT[@]}" for-each-ref --format='%(upstream:short)' \
+                   "refs/heads/$BRANCH" 2>/dev/null || true)
+    [ -n "$UPSTREAM" ] || UPSTREAM="origin/$BRANCH"
+    REMOTE_NAME="${UPSTREAM%%/*}"
+
+    if ! "${GIT[@]}" fetch --prune "$REMOTE_NAME"; then
         echo ""
-        echo "   ❌ git pull failed — the panel was NOT updated."
-        echo "      Common causes: local commits or edits on this server that"
-        echo "      have diverged from the remote, or no network access to the"
-        echo "      remote. Nothing was changed. Sort it out over SSH:"
+        echo "   ❌ git fetch failed — the panel was NOT updated."
+        echo "      No network access to the remote, or it needs credentials"
+        echo "      this server does not have. Nothing was changed."
+        exit 1
+    fi
+
+    if ! TARGET=$("${GIT[@]}" rev-parse --verify --quiet "$UPSTREAM^{commit}"); then
+        echo ""
+        echo "   ❌ $UPSTREAM does not exist on the remote — the panel was NOT"
+        echo "      updated. The branch may have been deleted or renamed."
+        exit 1
+    fi
+
+    # The remote is the truth; this checkout is a deploy target, not a place
+    # anyone should be committing. So take whatever the remote has, rather
+    # than fast-forwarding to it — a fast-forward cannot move backwards past a
+    # force-push, and cannot move at all once the checkout has diverged, which
+    # leaves the server stuck on a commit that exists nowhere else with no way
+    # to fix it from the panel. Anything the reset is about to throw away is
+    # listed first, because that is the cost of this being automatic.
+    DIRTY=$("${GIT[@]}" status --porcelain --untracked-files=no)
+    if [ -n "$DIRTY" ]; then
+        echo "   ⚠ Discarding uncommitted changes to tracked files:"
+        echo "$DIRTY" | sed 's/^/     /'
+    fi
+    AHEAD=$("${GIT[@]}" --no-pager log --oneline "$TARGET..$BEFORE" 2>/dev/null || true)
+    if [ -n "$AHEAD" ]; then
+        echo "   ⚠ Discarding commits on this server that the remote does not have:"
+        echo "$AHEAD" | sed 's/^/     /'
+        echo "     They survive in this checkout's reflog for a while; recover"
+        echo "     one over SSH with 'git cherry-pick <sha>' if it mattered."
+    fi
+
+    if ! "${GIT[@]}" reset --hard "$TARGET"; then
+        echo ""
+        echo "   ❌ git reset failed — the panel was NOT updated."
+        echo "      Sort it out over SSH:"
         echo "        cd $REPO_DIR && git status"
         exit 1
     fi
 
     AFTER=$("${GIT[@]}" rev-parse HEAD)
     if [ "$BEFORE" = "$AFTER" ]; then
-        echo "   ✓ Already at the latest commit — deploying the checkout anyway,"
+        echo "   ✓ Already at $UPSTREAM — deploying the checkout anyway,"
         echo "     in case the running panel is older than it."
         CHANGED=""
     else
         echo "   ✓ Updated $(echo "$BEFORE" | cut -c1-7) → $(echo "$AFTER" | cut -c1-7)"
-        echo ""
-        echo "   New commits:"
-        "${GIT[@]}" --no-pager log --oneline "$BEFORE..$AFTER" | sed 's/^/     /'
+        NEWLOG=$("${GIT[@]}" --no-pager log --oneline "$BEFORE..$AFTER" 2>/dev/null || true)
+        if [ -n "$NEWLOG" ]; then
+            echo ""
+            echo "   New commits:"
+            echo "$NEWLOG" | sed 's/^/     /'
+        fi
         CHANGED=$("${GIT[@]}" diff --name-only "$BEFORE" "$AFTER")
     fi
 
