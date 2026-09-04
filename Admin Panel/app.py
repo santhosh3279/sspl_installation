@@ -34,12 +34,13 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-08-18.1"
+PANEL_VERSION = "2026-09-04.1"
 FEATURES = ("ERP Next Installation suite page with rclone cloud backup setup "
             "covering full and DB-only backups, console-style terminal whose log "
             "is downloadable and whose past runs are browsable, whole-folder "
             "backup download, guarded restore, delete uploads, cron jobs viewer "
-            "on the dashboard, one-click panel update straight from git")
+            "on the dashboard, one-click panel update straight from git, license file "
+            "upload to and download from the sites volume")
 
 CONFIG_FILE = os.environ.get("SSPL_ADMIN_CONFIG", "/opt/sspl-admin/config.json")
 with open(CONFIG_FILE) as f:
@@ -1439,6 +1440,9 @@ def upload():
     return jsonify({"ok": True, "saved": saved, "dest": str(dest)})
 
 
+LICENSE_EXTENSIONS = (".lic", ".txt", ".json", ".key")
+
+
 @app.route("/upload-license", methods=["POST"])
 @login_required
 def upload_license():
@@ -1449,9 +1453,8 @@ def upload_license():
     if not name:
         return jsonify({"error": "no file selected"}), 400
     
-    allowed_exts = (".lic", ".txt", ".json", ".key")
-    if not name.lower().endswith(allowed_exts):
-        return jsonify({"error": f"only {', '.join(allowed_exts)} files are allowed"}), 400
+    if not name.lower().endswith(LICENSE_EXTENSIONS):
+        return jsonify({"error": f"only {', '.join(LICENSE_EXTENSIONS)} files are allowed"}), 400
 
     raw = f.read()
     try:
@@ -1480,6 +1483,79 @@ def upload_license():
         return jsonify({"error": f"failed to save file: {e}"}), 500
         
     return jsonify({"ok": True, "saved": name, "dest": str(dest_path)})
+
+
+def _license_candidates(site_dir):
+    """License files sitting directly in a site folder.
+
+    A Frappe site folder also holds site_config.json — the database password
+    and the encryption key live in there — so config files are excluded by
+    name: a download button must never hand those out. Sub-folders (private,
+    public, logs) are not looked at at all.
+    """
+    out = []
+    for f in sorted(site_dir.iterdir()):
+        if not f.is_file():
+            continue
+        low = f.name.lower()
+        if low.endswith("_config.json") or low == "site_config.json":
+            continue
+        if low.endswith(LICENSE_EXTENSIONS):
+            out.append(f.name)
+    return out
+
+
+def _license_site_dir(site):
+    """Resolve the site folder inside the sites volume, or an error message."""
+    site = secure_filename(site or deployed_site_name() or "")
+    if not site:
+        return None, "no site to read a license from — pass ?site=<name>", 400
+    vol_path = get_sites_volume_path()
+    if not vol_path:
+        return None, "Docker sites volume not found (is the ERP stack installed?)", 500
+    root = Path(vol_path).resolve()
+    site_dir = (root / site).resolve()
+    if not str(site_dir).startswith(str(root) + os.sep) or not site_dir.is_dir():
+        return None, f"Site folder for {site} not found", 500
+    return site_dir, None, None
+
+
+@app.route("/api/licenses")
+@login_required
+def api_licenses():
+    """What the download button can offer: the license files that are there."""
+    site_dir, err, code = _license_site_dir(request.args.get("site", ""))
+    if err:
+        return jsonify({"error": err}), code
+    return jsonify({"ok": True, "site": site_dir.name, "files": _license_candidates(site_dir)})
+
+
+@app.route("/download-license")
+@login_required
+def download_license():
+    """Send one license file back out of the sites volume.
+
+    Without ?name= this only works when the site holds exactly one license
+    file — anything else is ambiguous and the caller has to say which."""
+    site_dir, err, code = _license_site_dir(request.args.get("site", ""))
+    if err:
+        return jsonify({"error": err}), code
+    files = _license_candidates(site_dir)
+    name = request.args.get("name", "")
+    if name:
+        name = secure_filename(name)
+        if name not in files:
+            return jsonify({"error": "no such license file"}), 404
+    elif len(files) == 1:
+        name = files[0]
+    elif not files:
+        return jsonify({"error": "no license file found for this site"}), 404
+    else:
+        return jsonify({"error": "several license files — pick one"}), 409
+    target = (site_dir / name).resolve()
+    if not str(target).startswith(str(site_dir) + os.sep) or not target.is_file():
+        return jsonify({"error": "no such license file"}), 404
+    return send_file(target, as_attachment=True)
 
 
 @app.route("/api/uploads/delete", methods=["POST"])
@@ -2368,6 +2444,8 @@ details{margin:2px 0} details summary{cursor:pointer}
   <div class="uprow">
     <input type="file" id="licfile">
     <button class="primary" id="licupbtn">Upload License</button>
+    <button id="licdlbtn">Download License</button>
+    <select id="licdlpick" style="display:none"></select>
     <span id="licupmsg"></span>
   </div>
 </div>
@@ -2674,6 +2752,36 @@ $('#licupbtn').onclick = () => {
   xhr.onerror = () => $('#licupmsg').innerHTML = '<span style="color:var(--crit)">Upload failed — network error</span>';
   xhr.send(fd);
   $('#licupmsg').textContent = 'Uploading… 0%';
+};
+
+$('#licdlbtn').onclick = async () => {
+  const pick = $('#licdlpick');
+  pick.style.display = 'none';
+  $('#licupmsg').textContent = 'Looking for a license file…';
+  try{
+    const r = await fetch('/api/licenses');
+    const j = await r.json();
+    if (j.error) { $('#licupmsg').innerHTML = `<span style="color:var(--crit)">${esc(j.error)}</span>`; return; }
+    if (!j.files.length) {
+      $('#licupmsg').innerHTML = `<span style="color:var(--crit)">No license file in ${esc(j.site)}.</span>`;
+      return;
+    }
+    // One file downloads straight away; several need the user to say which.
+    if (j.files.length > 1) {
+      pick.innerHTML = '<option value="">Choose a license file…</option>' +
+        j.files.map(f => `<option>${esc(f)}</option>`).join('');
+      pick.style.display = '';
+      // The first option is a placeholder: without it, picking the first file
+      // fires no change event and nothing downloads.
+      pick.onchange = () => { if (pick.value)
+        window.location = '/download-license?name=' + encodeURIComponent(pick.value); };
+      $('#licupmsg').innerHTML = `<span>${j.files.length} license files — pick one.</span>`;
+      return;
+    }
+    const name = j.files[0];
+    $('#licupmsg').innerHTML = `<span style="color:var(--ok)">Downloading ${esc(name)}</span>`;
+    window.location = '/download-license?name=' + encodeURIComponent(name);
+  }catch(e){ $('#licupmsg').innerHTML = '<span style="color:var(--crit)">Could not reach the server</span>'; }
 };
 
 document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => {
