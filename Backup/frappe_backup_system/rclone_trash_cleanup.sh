@@ -5,11 +5,10 @@
 # WHY THIS EXISTS
 # ---------------
 # The cloud retention in frappe_backup.sh, frappe_db_backup.sh and
-# sspl-erp-update-with-rollback.sh prunes the remote with 'rclone purge' /
-# 'rclone deletefile'. On Google Drive those move the files to the account's
-# trash, and trashed files still count against the quota. So the remote can
-# report "full" while every byte of the overage is old backups that retention
-# already decided to throw away.
+# Older versions of the backup and update scripts pruned Google Drive with
+# 'rclone purge' / 'rclone deletefile', moving backups into the account's
+# trash. Trashed files still count against quota. Current retention deletes
+# permanently, but this helper can clear old trash when an upload needs room.
 #
 # This script permanently deletes those trashed items — but only when an
 # upload would not otherwise fit, and only enough of them to cover the

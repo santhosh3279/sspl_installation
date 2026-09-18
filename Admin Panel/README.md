@@ -151,7 +151,9 @@ machine:
    mirrors its keep-last-3 retention on the remote. Each of the three prunes
    the cloud independently of the local disk retention: the newest 10 full
    backups and the newest 10 DB-only dumps stay on the remote (`CLOUD_KEEP` at
-   the top of each backup script), and the newest 3 image snapshots. If a
+   the top of each backup script), and the newest 3 image snapshots. Google
+   Drive retention permanently deletes older copies instead of trashing them.
+   If a
    deployed script is an older copy with no `RCLONE_REMOTE` line, the row says
    so — run `update_tooling.sh`, then set the destination again.
 

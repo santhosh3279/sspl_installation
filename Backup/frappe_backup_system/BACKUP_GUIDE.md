@@ -156,15 +156,15 @@ sudo nano /opt/scripts/v2/frappe_backup.sh
 # Change: CLOUD_KEEP=10      to your preferred value
 ```
 
-Note: on Google Drive, rclone deletes to the account's trash by default, so
-freed quota only returns once the trash is emptied. This is deliberate — it is
-the undo path for a mistaken prune — but it means the remote can report itself
-full while every byte of the overage is old backups that retention already
-threw away. See "Reclaiming trashed space" below.
+On Google Drive, cloud retention permanently deletes old full backups and
+DB-only dumps with `--drive-use-trash=false`. The update script does the same
+for old image snapshots. These pruned copies cannot be restored from Drive's
+trash. Older versions of these scripts may have left backups in trash; the
+space-reclaiming helper below can still clear those when needed.
 
 ### Reclaiming Trashed Space:
 
-Before every cloud upload, the backup scripts run
+Before every cloud upload, the backup scripts can run
 `/opt/scripts/v2/rclone_trash_cleanup.sh`. If the remote has room, it does
 nothing. If it does not, it permanently deletes trashed backups — **oldest
 first, and only until the shortfall plus 20% has been recovered**. It is not

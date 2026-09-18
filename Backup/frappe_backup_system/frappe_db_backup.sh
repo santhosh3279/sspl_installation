@@ -121,31 +121,35 @@ rclone_expand_targets() {
 # only when its own upload succeeded.
 upload_and_prune() {
     local REMOTE="$1"
-    local PRUNE_FLAGS=() OLD_REMOTE
+    local PRUNE_FLAGS=() OLD_REMOTE REMOTE_TYPE
 
-    # How this remote's prune deletes. Mega bins its deletes and rclone can
-    # only empty that bin wholesale ('cleanup'), never part of it — so on Mega
-    # the prune deletes permanently and the bin never fills. Drive keeps its
-    # trash, where rclone_trash_cleanup.sh can reclaim just what an upload
-    # needs. See BACKUP_GUIDE.md, "Reclaiming trashed space".
-    #
+    # Retention deletes Google Drive backups permanently so old copies free
+    # quota immediately. Mega also supports a permanent-delete flag. Other
+    # backends keep their native delete behavior.
     # stdin is closed: a password-protected rclone config would prompt for it.
     case "$REMOTE" in
         :*) ;;   # ':backend:...' connection string — no named remote to look up
         *:*)
-            if [ "$MEGA_HARD_DELETE" = "yes" ] && [ "$(rclone config show \
-                    "${REMOTE%%:*}" </dev/null 2>/dev/null \
-                    | grep -oP '^\s*type\s*=\s*\K\S+' | head -1)" = "mega" ]; then
-                PRUNE_FLAGS=(--mega-hard-delete)
-                echo "  Mega remote: pruned dumps are deleted permanently, not binned"
-            fi
+            REMOTE_TYPE=$(rclone config show "${REMOTE%%:*}" </dev/null 2>/dev/null \
+                | grep -oP '^\s*type\s*=\s*\K\S+' | head -1) || true
+            case "$REMOTE_TYPE" in
+                drive)
+                    PRUNE_FLAGS=(--drive-use-trash=false)
+                    echo "  Drive remote: pruned dumps are deleted permanently"
+                    ;;
+                mega)
+                    if [ "$MEGA_HARD_DELETE" = "yes" ]; then
+                        PRUNE_FLAGS=(--mega-hard-delete)
+                        echo "  Mega remote: pruned dumps are deleted permanently, not binned"
+                    fi
+                    ;;
+            esac
             ;;
     esac
 
-    # Make room first if this remote is short: the prune below deletes with
-    # 'rclone deletefile', which on Google Drive only moves the old dumps to
-    # the account's trash, where they keep consuming quota. Never fatal — if
-    # the space cannot be freed, the upload still gets its attempt.
+    # Make room first if this remote is short. Old Google Drive trash from
+    # earlier runs may still consume quota. If cleanup cannot free space,
+    # the upload still gets its attempt.
     local TRASH_CLEANUP="$(dirname "$0")/rclone_trash_cleanup.sh"
     if [ "$CLEAR_CLOUD_TRASH" = "yes" ] && [ -x "$TRASH_CLEANUP" ]; then
         echo "  Checking free space on $REMOTE..."

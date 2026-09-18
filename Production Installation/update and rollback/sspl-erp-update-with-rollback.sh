@@ -229,28 +229,21 @@ rclone_expand_targets() {
     esac
 }
 
-# The prune flag one remote needs, printed on stdout ('' for most backends).
-#
-# Mega bins its deletes and rclone can only empty that bin wholesale
-# ('cleanup'), never part of it — so on Mega snapshots are deleted permanently
-# and the bin never fills. Drive keeps its trash, where rclone_trash_cleanup.sh
-# can reclaim just what an upload needs. Snapshots are the biggest thing this
-# stack uploads, so a bin full of them is the fastest way to a wedged remote.
-#
+# Retention deletes Google Drive snapshots permanently; Mega does so when
+# MEGA_HARD_DELETE=yes. Other backends keep their native delete behavior.
 # stdin is closed: a password-protected rclone config would prompt for it.
-mega_prune_flag() {
+prune_flag() {
     case "$1" in
+        :*) return 0 ;;   # connection string, no named remote
         *:*) ;;
-        *) return 0 ;;    # not a remote
+        *) return 0 ;;
     esac
-    case "$1" in
-        :*) return 0 ;;   # ':backend:...' connection string, no named remote
+    case "$(rclone config show "${1%%:*}" </dev/null 2>/dev/null \
+            | grep -oP '^\s*type\s*=\s*\K\S+' | head -1)" in
+        drive) echo "--drive-use-trash=false" ;;
+        mega) [ "$MEGA_HARD_DELETE" = "yes" ] && echo "--mega-hard-delete" ;;
     esac
-    [ "$MEGA_HARD_DELETE" = "yes" ] || return 0
-    if [ "$(rclone config show "${1%%:*}" </dev/null 2>/dev/null \
-            | grep -oP '^\s*type\s*=\s*\K\S+' | head -1)" = "mega" ]; then
-        echo "--mega-hard-delete"
-    fi
+    return 0
 }
 
 RCLONE_TARGETS=()
@@ -259,9 +252,9 @@ if [ -n "$RCLONE_REMOTE" ]; then
     rclone_expand_targets "$RCLONE_REMOTE"
     # Worked out once per remote, not once per deleted snapshot below.
     for REMOTE in "${RCLONE_TARGETS[@]}"; do
-        PRUNE_FLAG_FOR["$REMOTE"]=$(mega_prune_flag "$REMOTE")
+        PRUNE_FLAG_FOR["$REMOTE"]=$(prune_flag "$REMOTE")
         if [ -n "${PRUNE_FLAG_FOR[$REMOTE]}" ]; then
-            echo "   Mega remote $REMOTE: pruned snapshots are deleted permanently, not binned"
+            echo "   Remote $REMOTE: pruned snapshots are deleted permanently"
         fi
     done
 fi
@@ -275,11 +268,9 @@ if [ ${#RCLONE_TARGETS[@]} -gt 0 ] && [ -f "$BACKUP_FILE" ]; then
     echo "→ Cloud destinations: ${RCLONE_TARGETS[*]}"
     for REMOTE in "${RCLONE_TARGETS[@]}"; do
         # Snapshots are multi-gigabyte, so this is the upload most likely to
-        # hit a full remote. The retention below deletes with 'rclone
-        # deletefile', which on Google Drive only moves old snapshots to the
-        # account's trash, where they keep consuming quota — reclaim just
-        # enough of it for this upload. Never fatal: the update has already
-        # succeeded by this point.
+        # hit a full remote. Old Drive trash from earlier runs may still
+        # consume quota; reclaim just enough for this upload. Never fatal:
+        # the update has already succeeded by this point.
         if [ "$CLEAR_CLOUD_TRASH" = "yes" ] && [ -x "$TRASH_CLEANUP" ]; then
             echo "→ Checking free space on $REMOTE..."
             "$TRASH_CLEANUP" --remote "$REMOTE" --need-path "$BACKUP_FILE" \
@@ -304,8 +295,7 @@ OLD_BACKUPS=$(ls -t "$BACKUP_DIR"/backup_*.tar 2>/dev/null | tail -n +4)
 if [ -n "$OLD_BACKUPS" ]; then
     echo "$OLD_BACKUPS" | while read backup; do
         rm -f "$backup"
-        # Unquoted on purpose: the flag is either empty (contributing no
-        # argument) or the single token --mega-hard-delete.
+        # Unquoted on purpose: the flag is empty or one rclone option.
         for REMOTE in "${RCLONE_TARGETS[@]}"; do
             rclone deletefile ${PRUNE_FLAG_FOR[$REMOTE]} \
                 "$REMOTE/image-snapshots/$(basename "$backup")" 2>/dev/null || true

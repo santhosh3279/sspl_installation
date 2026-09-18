@@ -183,36 +183,36 @@ rclone_expand_targets() {
 # today's backup would quietly turn keep-10 into keep-9.
 upload_and_prune() {
     local REMOTE="$1"
-    local PRUNE_FLAGS=() OLD_REMOTE
+    local PRUNE_FLAGS=() OLD_REMOTE REMOTE_TYPE
 
-    # How this remote's prune deletes.
-    #
-    # Mega deletes into the account's rubbish bin, where the files go on
-    # consuming quota — and unlike Drive there is no way to clear part of that
-    # bin: rclone has no trashed-only listing for Mega, only 'cleanup', which
-    # empties all of it. So on Mega the prune deletes permanently and the bin
-    # never fills. Drive keeps its trash, because there rclone_trash_cleanup.sh
-    # can reclaim exactly what an upload needs — the undo path costs nothing.
-    #
+    # Retention deletes Google Drive backups permanently so old copies free
+    # quota immediately. Mega also supports a permanent-delete flag. Other
+    # backends keep their native delete behavior.
     # stdin is closed: a password-protected rclone config would prompt for it.
     case "$REMOTE" in
         :*) ;;   # ':backend:...' connection string — no named remote to look up
         *:*)
-            if [ "$MEGA_HARD_DELETE" = "yes" ] && [ "$(rclone config show \
-                    "${REMOTE%%:*}" </dev/null 2>/dev/null \
-                    | grep -oP '^\s*type\s*=\s*\K\S+' | head -1)" = "mega" ]; then
-                PRUNE_FLAGS=(--mega-hard-delete)
-                echo "  Mega remote: pruned backups are deleted permanently, not binned"
-            fi
+            REMOTE_TYPE=$(rclone config show "${REMOTE%%:*}" </dev/null 2>/dev/null \
+                | grep -oP '^\s*type\s*=\s*\K\S+' | head -1) || true
+            case "$REMOTE_TYPE" in
+                drive)
+                    PRUNE_FLAGS=(--drive-use-trash=false)
+                    echo "  Drive remote: pruned backups are deleted permanently"
+                    ;;
+                mega)
+                    if [ "$MEGA_HARD_DELETE" = "yes" ]; then
+                        PRUNE_FLAGS=(--mega-hard-delete)
+                        echo "  Mega remote: pruned backups are deleted permanently, not binned"
+                    fi
+                    ;;
+            esac
             ;;
     esac
 
-    # Make room before uploading, if this remote is short. The prune below uses
-    # 'rclone purge', which on Google Drive only moves the old backups to the
-    # account's trash — where they go on consuming quota. This reclaims just
-    # enough of that trash for this upload, and never fails the backup: if it
-    # cannot free the space, the upload still gets its attempt. Backends differ,
-    # so this is asked per remote and each answer stands on its own.
+    # Make room before uploading if this remote is short. Old Google Drive
+    # trash may still consume quota from earlier runs. The cleanup reclaims
+    # just enough for this upload; a failure only warns. Backends
+    # differ, so this is checked per remote.
     local TRASH_CLEANUP="$(dirname "$0")/rclone_trash_cleanup.sh"
     if [ "$CLEAR_CLOUD_TRASH" = "yes" ] && [ -x "$TRASH_CLEANUP" ]; then
         echo "  Checking free space on $REMOTE..."
