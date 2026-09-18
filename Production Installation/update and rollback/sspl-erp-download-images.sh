@@ -27,8 +27,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mapfile -t images < <(docker compose -f "$COMPOSE_FILE" config --images | sort -u)
-[ "${#images[@]}" -gt 0 ] || { echo "No compose images found" >&2; exit 1; }
+if ! image_list=$(docker compose -f "$COMPOSE_FILE" config --images); then
+    echo "Could not read Docker Compose images" >&2
+    exit 1
+fi
+image_list=$(printf '%s\n' "$image_list" | awk 'NF' | sort -u)
+[ -n "$image_list" ] || { echo "No compose images found" >&2; exit 1; }
+mapfile -t images <<< "$image_list"
 for image in "${images[@]}"; do
     old_id=$(docker image inspect --format '{{.Id}}' "$image")
     originals+=("$image")

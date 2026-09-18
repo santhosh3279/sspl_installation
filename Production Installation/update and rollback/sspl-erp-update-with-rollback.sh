@@ -50,8 +50,14 @@ mkdir -p "$BACKUP_DIR"
 chmod 700 "$BACKUP_DIR"
 
 echo "→ Backing up current Docker images..."
-# Get list of images used by the compose file
-IMAGES=$(docker compose -f "$COMPOSE_FILE" config | grep 'image:' | awk '{print $2}' | sort -u)
+# Compose prints image references directly. Filtering empty lines also avoids
+# treating an unset `image:` field as an image name to pull.
+if ! IMAGES=$(docker compose -f "$COMPOSE_FILE" config --images); then
+    echo "❌ Could not read Docker Compose images." >&2
+    exit 1
+fi
+IMAGES=$(printf '%s\n' "$IMAGES" | awk 'NF' | sort -u)
+[ -n "$IMAGES" ] || { echo "❌ No Docker Compose images found." >&2; exit 1; }
 
 # Save current images to tar file
 if [ -n "$IMAGES" ]; then
