@@ -93,28 +93,45 @@ docker system prune -f || echo "   ⚠ Prune failed, continuing"
 # Guarded rather than left to the ERR trap: until 'down' runs below, nothing
 # has changed, so a registry failure here is not the partial state the trap
 # describes.
-echo "→ Pulling latest image (services stay up during the download)..."
-# --quiet, plus a heartbeat of our own. Compose's default progress writer only
-# collapses to a live-updating block when stdout is a terminal; the panel runs
-# this job with its output going to a log file, so that same progress arrives
-# as one line per layer per refresh — hundreds of them, burying the rest of the
-# update. A line every 30s says the same thing: it is still going, and for how
-# long. Backgrounded so the heartbeat can run while the pull does; the pull's
-# own exit status is still what decides below.
-docker compose -f "$COMPOSE_FILE" pull --quiet &
-PULL_PID=$!
-PULL_START=$SECONDS
-while kill -0 "$PULL_PID" 2>/dev/null; do
-    sleep 30
-    kill -0 "$PULL_PID" 2>/dev/null &&
-        echo "   … downloading, $((SECONDS - PULL_START))s elapsed"
-done
-if ! wait "$PULL_PID"; then
-    echo ""
-    echo "❌ Update stopped: the image pull failed."
-    echo "   Nothing was changed — the site is still up on the current images."
-    echo "   Check the network/registry and run the update again."
-    exit 1
+STAGE_FILE="$BACKUP_DIR/staged-images.tsv"
+USE_STAGED=no
+if [ -s "$STAGE_FILE" ]; then
+    USE_STAGED=yes
+    # Every compose image must have a matching staged copy, and its original
+    # tag must still point to the image that was current at download time.
+    while IFS=$'\t' read -r image old_id stage new_id; do
+        [ -n "$image" ] || { USE_STAGED=no; break; }
+        [ "$(docker image inspect --format '{{.Id}}' "$image" 2>/dev/null)" = "$old_id" ] || USE_STAGED=no
+        [ "$(docker image inspect --format '{{.Id}}' "$stage" 2>/dev/null)" = "$new_id" ] || USE_STAGED=no
+    done < "$STAGE_FILE"
+    diff -q <(printf '%s\n' "$IMAGES" | sort -u) \
+        <(cut -f1 "$STAGE_FILE" | sort -u) >/dev/null || USE_STAGED=no
+    [ "$(wc -l < "$STAGE_FILE")" -eq "$(printf '%s\n' "$IMAGES" | wc -l)" ] || USE_STAGED=no
+fi
+if [ "$USE_STAGED" = yes ]; then
+    echo "→ Using previously downloaded images..."
+    while IFS=$'\t' read -r image old_id stage new_id; do
+        docker tag "$stage" "$image"
+    done < "$STAGE_FILE"
+    rm -f "$STAGE_FILE"
+else
+    [ ! -e "$STAGE_FILE" ] || echo "   Staged images are stale or incomplete; downloading fresh images."
+    echo "→ Pulling latest images (services stay up during the download)..."
+    PULL_FAILED=no
+    while IFS= read -r image; do
+        echo "→ $image"
+        if ! python3 "$(dirname "$0")/sspl-erp-pull-progress.py" "$image"; then
+            PULL_FAILED=yes
+            break
+        fi
+    done <<< "$IMAGES"
+    if [ "$PULL_FAILED" = yes ]; then
+        echo "❌ Update stopped: the image pull failed."
+        echo "   Nothing was changed — the site is still up on the current images."
+        echo "   Check the network/registry and run the update again."
+        exit 1
+    fi
+
 fi
 
 echo "→ Stopping all services..."

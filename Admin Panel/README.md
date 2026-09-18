@@ -44,6 +44,10 @@ before a cron migration, which is not job output.
 - **Clear RAM caches** button (`sync` + drop_caches — safe, caches rebuild automatically)
 - **One-click actions** — full backup, DB-only backup, backup verification,
   system update, image rollback (with snapshot picker), run migrations
+- **Download images** beside **Update system** — pull the next Docker images
+  ahead of time while services run. The update still saves the current images
+  for rollback before switching to the downloaded copies. Install the latest
+  update scripts with `update_tooling.sh` to enable this button.
 - **Run migrations** — `bench migrate` on its own, the same step the update and
   the restore run internally. It exists as its own button because when that is
   the step that failed, the data is fine and a patch is not: the fix is to

@@ -20,7 +20,8 @@ SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 sudo mkdir -p "$ERP_DIR/v2" "$ERP_DIR/image-backups"
 sudo cp "$SRC_DIR/"sspl-erp-*.sh "$ERP_DIR/v2/"
+sudo cp "$SRC_DIR/sspl-erp-pull-progress.py" "$ERP_DIR/v2/"
 sudo sed -i "s/^SITE_NAME=.*/SITE_NAME=\"$SERVER_IP\"/" "$ERP_DIR/v2/sspl-erp-common.sh"
-sudo chown root:root "$ERP_DIR/v2/"sspl-erp-*.sh
-sudo chmod 755 "$ERP_DIR/v2/"sspl-erp-*.sh
+sudo chown root:root "$ERP_DIR/v2/"sspl-erp-*.sh "$ERP_DIR/v2/sspl-erp-pull-progress.py"
+sudo chmod 755 "$ERP_DIR/v2/"sspl-erp-*.sh "$ERP_DIR/v2/sspl-erp-pull-progress.py"
 echo "✓ Update/rollback scripts installed to $ERP_DIR/v2/ (site name: $SERVER_IP)"

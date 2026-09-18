@@ -34,7 +34,7 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-09-04.1"
+PANEL_VERSION = "2026-09-18.1"
 FEATURES = ("ERP Next Installation suite page with rclone cloud backup setup "
             "covering full and DB-only backups, console-style terminal whose log "
             "is downloadable and whose past runs are browsable, whole-folder "
@@ -72,6 +72,7 @@ ACTIONS = {
     "db_backup": {"label": "DB-only backup", "cmd": [f"{SCRIPTS_DIR}/frappe_db_backup.sh"]},
     "verify":    {"label": "Verify backups", "cmd": [f"{SCRIPTS_DIR}/frappe_backup_verify.sh"]},
     "update":    {"label": "System update",  "cmd": [f"{UPDATE_DIR}/sspl-erp-update-with-rollback.sh"]},
+    "download_image": {"label": "Download update images", "cmd": [f"{UPDATE_DIR}/sspl-erp-download-images.sh"]},
     "rollback":  {"label": "Rollback",       "cmd": [f"{UPDATE_DIR}/sspl-erp-rollback.sh"], "stdin": "yes\n"},
     # Restore takes a safety backup first (see restore_with_backup.sh) and is
     # the one interactive action: the MariaDB root password and the final
@@ -1041,7 +1042,8 @@ def index():
     # without update_panel.sh would render a button that fails with exit 127.
     return render_template_string(
         DASH_HTML, user=session["user"], version=PANEL_VERSION,
-        repo_ok=bool(UPDATE_PANEL_SCRIPT) and os.path.isfile(UPDATE_PANEL_SCRIPT))
+        repo_ok=bool(UPDATE_PANEL_SCRIPT) and os.path.isfile(UPDATE_PANEL_SCRIPT),
+        download_ok=os.path.isfile(os.path.join(UPDATE_DIR, "sspl-erp-download-images.sh")))
 
 
 @app.route("/install")
@@ -2390,6 +2392,8 @@ details{margin:2px 0} details summary{cursor:pointer}
     <span class="sep"></span>
     <button class="primary act" data-act="update"
       data-confirm="Update the ERP system now?&#10;&#10;The backup and the image download run with the site up — services only restart once the new images are on disk, so users are disconnected for a few minutes at the end, not for the whole job.">Update system</button>
+    {% if download_ok %}<button class="act" data-act="download_image"
+      title="Download the latest Docker images now; Update system will use them after taking its rollback snapshot.">Download images</button>{% endif %}
     <select id="rb-snap" title="Image snapshot to roll back to"></select>
     <button class="danger act" data-act="rollback"
       data-confirm="Roll back Docker images to the selected snapshot? Services will restart.">Rollback</button>
