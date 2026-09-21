@@ -211,6 +211,14 @@ sspl-admin` ends it: the script's next read hits end-of-file and it exits.
 Until it ends, the one-job-at-a-time rule blocks the panel's other buttons
 (cron backups are unaffected — they don't go through the panel).
 
+Use **Choose backup folder** to upload the supported files directly inside a local
+backup folder. The destination name is filled automatically and can be edited.
+Subfolders and unsupported files are skipped, with a count shown before upload.
+The **Choose files** picker remains available for selecting files individually.
+Each uploaded folder has a visible **Restore** button beside its name. It is
+disabled until the folder contains a `*-database.sql.gz` file; restoring still
+requires the matching public and private file archives.
+
 To restore an **uploaded** backup, upload it into its own named folder (the
 *Folder* box on the upload form) so its database and files stay together. A
 restore requires matching `*-files.tar`/`.tgz` and `*-private-files.tar`/`.tgz`
@@ -289,6 +297,7 @@ feature list on startup.
 
 | Version | Should show |
 |---|---|
+| `2026-09-21.2` | Upload a local backup folder; Restore is visible beside each uploaded folder |
 | `2026-09-21.1` | Uploads grouped by folder; upload confirmation shows the saved destination |
 | `2026-07-29.3` | Cron row flags pre-v2 jobs, with a button to switch them over |
 | `2026-07-29.2` | Terminal text at 1.25x (15.625px) |

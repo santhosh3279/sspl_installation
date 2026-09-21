@@ -34,7 +34,7 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-09-21.1"
+PANEL_VERSION = "2026-09-21.2"
 FEATURES = ("ERP Next Installation suite page with rclone cloud backup setup "
             "covering full and DB-only backups, console-style terminal whose log "
             "is downloadable and whose past runs are browsable, whole-folder "
@@ -2436,11 +2436,15 @@ details{margin:2px 0} details summary{cursor:pointer}
   <code id="updest">uploads/</code> inside the backup directory. Allowed:
   .sql.gz, .tar, .tgz, .json, .yml.</p>
   <div class="uprow">
-    <input type="file" id="upfiles" multiple>
-    <input type="text" id="upfolder" placeholder="Folder (optional)" size="14">
+    <label>Choose files <input type="file" id="upfiles" multiple></label>
+    <label>Choose backup folder <input type="file" id="updirectory" webkitdirectory multiple></label>
+    <input type="text" id="upfolder" aria-label="Destination folder" placeholder="Folder (optional)" size="14">
     <button class="primary" id="upbtn">Upload</button>
     <span id="upmsg"></span>
   </div>
+  <p style="font-size:13px;color:var(--ink-2)">Selecting a folder fills in its destination name.
+  Supported files directly inside it are uploaded together; subfolders and other file types are skipped.</p>
+  <p id="upselection" style="font-size:13px" aria-live="polite"></p>
 </div>
 
 <div class="card"><h2>Upload license file to sites volume</h2>
@@ -2643,9 +2647,13 @@ async function refreshBackups(){
     }
     const restorable = new Set(b.upload_folders || []);
     $('#tab-upl').innerHTML = [...uploadGroups].map(([folder, files]) =>
-      `<details class="upload-folder"><summary><strong>${esc(folder)}/</strong> — ${files.length} files</summary>` +
-      `<div class="row">${restoreBtn(restorable.has(folder), 'upload', folder)} ${delBtn(folder, 'folder')}</div>` +
-      simpleTable(files, 'upload', true) + '</details>'
+      `<div class="upload-folder"><div class="row"><strong>${esc(folder)}/</strong>` +
+      (restorable.has(folder)
+        ? restoreBtn(true, 'upload', folder)
+        : '<button class="danger" disabled title="Upload a matching *-database.sql.gz file into this folder first">Restore</button> <span>Database backup missing</span>') +
+      ` ${delBtn(folder, 'folder')}</div>` +
+      `<details><summary>${files.length} files</summary>` +
+      simpleTable(files, 'upload', true) + '</details></div>'
     ).join('') + (looseUploads.length
       ? '<p>Files uploaded without a folder:</p>' + simpleTable(looseUploads, 'upload', true)
       : '') + (!uploadGroups.size && !looseUploads.length
@@ -2721,12 +2729,36 @@ $('#clear-ram').onclick = async () => {
   refreshStats();
 };
 
+const backupUploadExtension = /\.(sql\.gz|gz|tar|tgz|json|ya?ml)$/i;
+function selectedBackupFiles() {
+  const directoryFiles = [...$('#updirectory').files];
+  if (!directoryFiles.length) return [...$('#upfiles').files];
+  return directoryFiles.filter(f => f.webkitRelativePath.split('/').length === 2 && backupUploadExtension.test(f.name));
+}
+$('#updirectory').onchange = () => {
+  const files = [...$('#updirectory').files];
+  if (!files.length) return;
+  $('#upfiles').value = '';
+  $('#upfolder').value = files[0].webkitRelativePath.split('/')[0];
+  const selected = selectedBackupFiles();
+  $('#upselection').textContent = `${selected.length} backup files selected; ${files.length - selected.length} unsupported or nested files skipped.`;
+};
+$('#upfiles').onchange = () => {
+  if (!$('#upfiles').files.length) return;
+  $('#updirectory').value = '';
+  $('#upselection').textContent = `${$('#upfiles').files.length} files selected.`;
+};
 $('#upbtn').onclick = () => {
-  const files = $('#upfiles').files;
-  if (!files.length) { $('#upmsg').textContent = 'Choose one or more files first.'; return; }
+  const files = selectedBackupFiles();
+  if (!files.length) { $('#upmsg').textContent = 'Choose backup files or a folder containing supported backup files first.'; return; }
+  const folder = $('#upfolder').value.trim();
+  if (($('#updirectory').files.length && !folder) || (folder && !/^[A-Za-z0-9_-]{1,40}$/.test(folder))) {
+    $('#upmsg').textContent = 'Enter a destination folder of 1–40 letters, digits, hyphens or underscores.';
+    return;
+  }
   const fd = new FormData();
-  for (const f of files) fd.append('files', f);
-  fd.append('folder', $('#upfolder').value.trim());
+  for (const f of files) fd.append('files', f, f.name);
+  fd.append('folder', folder);
   const xhr = new XMLHttpRequest();
   xhr.open('POST', '/upload');
   xhr.upload.onprogress = e => { if (e.lengthComputable)
