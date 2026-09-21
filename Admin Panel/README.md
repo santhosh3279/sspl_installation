@@ -213,6 +213,9 @@ Until it ends, the one-job-at-a-time rule blocks the panel's other buttons
 
 To restore an **uploaded** backup, upload it into its own named folder (the
 *Folder* box on the upload form) so its database and files stay together. A
+restore requires matching `*-files.tar`/`.tgz` and `*-private-files.tar`/`.tgz`
+archives with the same filename prefix as the database. Missing or damaged
+archives stop the restore before the site goes offline. A
 folder is what gets restored, not a loose file: pointing the restore at a
 directory of unrelated uploads would mix backups from different dates.
 

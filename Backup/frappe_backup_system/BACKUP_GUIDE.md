@@ -246,6 +246,11 @@ ls -lh /opt/backups/frappe/
 sudo /opt/scripts/v2/frappe_restore.sh /opt/backups/frappe/20250330_020000
 ```
 
+The restore requires database, public files, and private files from the same
+backup (identical filename prefixes). Both `.tar` and `.tgz` are supported.
+Missing or unreadable file archives stop the restore before any data is replaced.
+Database-only backups cannot restore photos; the matching file archives are needed.
+
 ### 3. If the restore fails at the migration step
 
 A restore is two things: loading the data, then running `bench migrate` so the

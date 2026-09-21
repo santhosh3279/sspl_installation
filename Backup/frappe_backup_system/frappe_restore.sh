@@ -65,15 +65,37 @@ if ! docker compose -f "$COMPOSE_FILE" exec -T backend \
     exit 1
 fi
 
-# Find backup files (newest of each type; archives are .tgz with --compress, .tar otherwise)
-DB_BACKUP=$(find "$BACKUP_DIR" -name "*-database.sql.gz" -type f | sort | tail -1)
-FILES_BACKUP=$(find "$BACKUP_DIR" \( -name "*-files.tar" -o -name "*-files.tgz" \) ! -name "*-private-files.*" -type f | sort | tail -1)
-PRIVATE_BACKUP=$(find "$BACKUP_DIR" \( -name "*-private-files.tar" -o -name "*-private-files.tgz" \) -type f | sort | tail -1)
-
+# Select one database, then require file archives from that exact backup set.
+# Selecting each archive independently can combine different backup dates.
+DB_BACKUP=$(find "$BACKUP_DIR" -maxdepth 1 -name "*-database.sql.gz" -type f | sort | tail -1)
 if [ -z "$DB_BACKUP" ]; then
     echo "Error: Database backup not found in $BACKUP_DIR"
     exit 1
 fi
+BACKUP_PREFIX="${DB_BACKUP%-database.sql.gz}"
+matching_archive() {
+    local suffix="$1" archive
+    for archive in "$BACKUP_PREFIX-$suffix.tgz" "$BACKUP_PREFIX-$suffix.tar"; do
+        if [ -s "$archive" ]; then
+            printf '%s\n' "$archive"
+            return 0
+        fi
+    done
+    echo "Error: Missing matching $suffix archive for $(basename "$DB_BACKUP")." >&2
+    echo "Put the database, public files and private files from the same backup in this folder." >&2
+    echo "Restore stopped: restoring only the database leaves photo links pointing to missing files." >&2
+    return 1
+}
+FILES_BACKUP=$(matching_archive files)
+PRIVATE_BACKUP=$(matching_archive private-files)
+
+# Fail before stopping services or replacing data if an archive is unreadable.
+for archive in "$FILES_BACKUP" "$PRIVATE_BACKUP"; do
+    if ! tar -tf "$archive" >/dev/null; then
+        echo "Error: Invalid or damaged files archive: $archive" >&2
+        exit 1
+    fi
+done
 
 # Written as 'if', not 'test && echo': under 'set -e' a false test is the exit
 # status of the whole line, so a backup without private files would abort the

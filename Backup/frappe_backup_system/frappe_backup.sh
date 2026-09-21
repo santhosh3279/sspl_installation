@@ -75,12 +75,20 @@ if ! copy_latest "" "*-database.sql.gz"; then
     exit 1
 fi
 
-# Files backups: .tgz when --compress is used, .tar otherwise.
-# The public-files glob also matches private-files, so exclude those explicitly.
-copy_latest "-private-files." "*-files.tar" "*-files.tgz" || \
-    echo "WARNING: No public files backup found"
-copy_latest "" "*-private-files.tar" "*-private-files.tgz" || \
-    echo "WARNING: No private files backup found"
+# Require the public/private archives belonging to the database we copied.
+# A full backup (also used as the restore safety backup) must include files.
+DB_COPY=$(find "$DATED_BACKUP_DIR" -maxdepth 1 -name '*-database.sql.gz' -type f | sort | tail -1)
+BACKUP_STEM=$(basename "${DB_COPY%-database.sql.gz}")
+for suffix in files private-files; do
+    archive=$(docker compose -f "$COMPOSE_FILE" exec -T backend \
+        bash -c 'for ext in tgz tar; do p="$1/$2-$3.$ext"; if [ -s "$p" ]; then printf "%s\n" "$p"; exit 0; fi; done; exit 1' \
+        bash "$CONTAINER_BACKUP_DIR" "$BACKUP_STEM" "$suffix") || {
+        echo "ERROR: Missing matching $suffix archive; full backup is incomplete"
+        exit 1
+    }
+    archive="${archive%$'\r'}"
+    docker compose -f "$COMPOSE_FILE" cp "backend:$archive" "$DATED_BACKUP_DIR/"
+done
 
 # Copy site_config.json
 docker compose -f "$COMPOSE_FILE" cp \
