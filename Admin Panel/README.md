@@ -289,6 +289,7 @@ feature list on startup.
 
 | Version | Should show |
 |---|---|
+| `2026-09-21.1` | Uploads grouped by folder; upload confirmation shows the saved destination |
 | `2026-07-29.3` | Cron row flags pre-v2 jobs, with a button to switch them over |
 | `2026-07-29.2` | Terminal text at 1.25x (15.625px) |
 | `2026-07-29.1` | **Update Admin Panel** button in the dashboard top bar |

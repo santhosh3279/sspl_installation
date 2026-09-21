@@ -34,7 +34,7 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-09-18.1"
+PANEL_VERSION = "2026-09-21.1"
 FEATURES = ("ERP Next Installation suite page with rclone cloud backup setup "
             "covering full and DB-only backups, console-style terminal whose log "
             "is downloadable and whose past runs are browsable, whole-folder "
@@ -2632,16 +2632,25 @@ async function refreshBackups(){
     // Only uploads are deletable — real backups and snapshots are not.
     $('#tab-db').innerHTML = simpleTable(b.db_only, 'db');
     $('#tab-img').innerHTML = simpleTable(b.images, 'image');
-    $('#tab-upl').innerHTML =
-      ((b.upload_folders || []).length ? `<table><thead><tr><th>Restorable folder</th><th></th>
-        </tr></thead><tbody>` + b.upload_folders.map(f =>
-        `<tr><td class="num">${esc(f)} <span class="badge ok">DB</span></td>
-         <td class="right">${restoreBtn(true, 'upload', f)} ${delBtn(f, 'folder')}</td></tr>`).join('') +
-        '</tbody></table>'
-        : '<p style="font-size:13px;color:var(--muted);margin-top:0">To restore an uploaded backup, ' +
-          'upload it into its own named folder (the Folder box below) so its database and files stay ' +
-          'together. Folders containing a <code>*-database.sql.gz</code> get a Restore button here.</p>') +
-      simpleTable(b.uploads, 'upload', true);
+    const uploadGroups = new Map();
+    const looseUploads = [];
+    for (const file of b.uploads) {
+      const slash = file.name.indexOf('/');
+      if (slash < 0) { looseUploads.push(file); continue; }
+      const folder = file.name.slice(0, slash);
+      if (!uploadGroups.has(folder)) uploadGroups.set(folder, []);
+      uploadGroups.get(folder).push(file);
+    }
+    const restorable = new Set(b.upload_folders || []);
+    $('#tab-upl').innerHTML = [...uploadGroups].map(([folder, files]) =>
+      `<details class="upload-folder"><summary><strong>${esc(folder)}/</strong> — ${files.length} files</summary>` +
+      `<div class="row">${restoreBtn(restorable.has(folder), 'upload', folder)} ${delBtn(folder, 'folder')}</div>` +
+      simpleTable(files, 'upload', true) + '</details>'
+    ).join('') + (looseUploads.length
+      ? '<p>Files uploaded without a folder:</p>' + simpleTable(looseUploads, 'upload', true)
+      : '') + (!uploadGroups.size && !looseUploads.length
+      ? '<p style="color:var(--muted)">No uploads yet. Enter a folder name below to keep a backup’s files together.</p>'
+      : '');
     const sel = $('#rb-snap'), cur = sel.value;
     sel.innerHTML = '<option value="">Latest snapshot</option>' +
       b.images.map(i => `<option value="${esc(i.name)}">${esc(i.name)} (${esc(i.size)})</option>`).join('');
@@ -2725,7 +2734,7 @@ $('#upbtn').onclick = () => {
   xhr.onload = () => {
     try{
       const j = JSON.parse(xhr.responseText);
-      $('#upmsg').textContent = j.error ? j.error : 'Uploaded: ' + j.saved.join(', ');
+      $('#upmsg').textContent = j.error ? j.error : 'Uploaded to ' + j.dest + ': ' + j.saved.join(', ');
     }catch(e){ $('#upmsg').textContent = 'Upload failed (' + xhr.status + ')'; }
     refreshBackups();
   };
