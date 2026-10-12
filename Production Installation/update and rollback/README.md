@@ -7,6 +7,7 @@ This system provides safe Docker image updates with automatic backup and rollbac
 - `sspl-erp-common.sh` - Shared configuration (site name, paths) and helpers, sourced by the other scripts
 - `sspl-erp-update-with-rollback.sh` - Main update script with automatic backup
 - `sspl-erp-rollback.sh` - Rollback to previous version
+- `sspl-erp-uninstall-app.sh` - Uninstall one app from the site before updating to an image without it
 - `sspl-erp-backup-manager.sh` - Manage backup files
 
 ## 🚀 Installation
@@ -51,6 +52,9 @@ cd /opt/sspl-erp/v2
 3. Prunes unused Docker resources and pulls the latest images **with the site still
    running** — the download is the longest step, so it is kept out of the downtime
    window. A failed pull changes nothing and leaves the site up on current images.
+   Then checks that no app installed on the site is missing from the new
+   image — the migration would fail on it. If one is, the update stops before
+   anything changes; uninstall the app first (see below).
 4. Stops all services
 5. Starts services and waits until the database and backend are actually ready
 6. Fixes DB grants
@@ -98,6 +102,28 @@ one, restore the data backup from step 1 with `frappe_restore.sh` — this is a
 genuine data change, unlike a failed migration, which restoring does not fix.
 Rehearse the
 first update after an image gains an app on a test server.
+
+### Removing an app from the image
+
+Uninstall the app from the site **first**, on the images running now —
+`uninstall-app` needs the app's code, which the new image will not have.
+Uninstalling **deletes the app's DocTypes and all their data**. To remove
+e.g. `frappe_whatsapp`:
+
+1. Export any of its data you want to keep.
+2. Admin Panel → pick the app next to **Uninstall app** and press it, or:
+   `sudo /opt/sspl-erp/v2/sspl-erp-uninstall-app.sh frappe_whatsapp`.
+   It takes a full backup (and stops if that fails), takes the site offline,
+   uninstalls the app, clears the cache and brings the site back.
+3. Publish the image without the app, then run the update.
+
+Until the image drops the app, the update does not reinstall it: the uninstall
+records it in `/opt/sspl-erp/image-backups/uninstalled-apps`, which the update
+honours and clears once the image has caught up. Adding the app back to the
+image later installs it again as normal.
+
+If the uninstall fails, the database may be half changed: fix the cause and run
+it again, or restore the backup it took with `frappe_restore.sh`.
 
 ### Rollback to Previous Version
 

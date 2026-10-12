@@ -96,6 +96,22 @@ echo "→ Cleaning up unused Docker resources..."
 # "partial state" message.
 docker system prune -f || echo "   ⚠ Prune failed, continuing"
 
+# What each tag points at now, so a stop before 'down' can put the tags back.
+# Without that, the next 'compose up' from anywhere would quietly start the
+# new images that this update refused to switch to.
+declare -A OLD_ID_FOR=()
+while IFS= read -r image; do
+    OLD_ID_FOR["$image"]=$(docker image inspect --format '{{.Id}}' "$image" 2>/dev/null || true)
+done <<< "$IMAGES"
+restore_tags() {
+    local image
+    for image in "${!OLD_ID_FOR[@]}"; do
+        if [ -n "${OLD_ID_FOR[$image]}" ]; then
+            docker tag "${OLD_ID_FOR[$image]}" "$image" || true
+        fi
+    done
+}
+
 # Guarded rather than left to the ERR trap: until 'down' runs below, nothing
 # has changed, so a registry failure here is not the partial state the trap
 # describes.
@@ -119,7 +135,8 @@ if [ "$USE_STAGED" = yes ]; then
     while IFS=$'\t' read -r image old_id stage new_id; do
         docker tag "$stage" "$image"
     done < "$STAGE_FILE"
-    rm -f "$STAGE_FILE"
+    # Removed only once the app check below passes: if it stops the update,
+    # the tags go back and the next update can still use this download.
 else
     [ ! -e "$STAGE_FILE" ] || echo "   Staged images are stale or incomplete; downloading fresh images."
     echo "→ Pulling latest images (services stay up during the download)..."
@@ -139,6 +156,17 @@ else
     fi
 
 fi
+
+# An app still installed but missing from the new image would fail the
+# migration — see find_dropped_apps. Nothing has changed yet, so stopping here
+# is clean, which the ERR trap's "partial state" message would not say.
+if ! find_dropped_apps; then
+    restore_tags
+    echo "❌ Update stopped before any change. The site is still up on the"
+    echo "   current images."
+    exit 1
+fi
+rm -f "$STAGE_FILE"
 
 echo "→ Stopping all services..."
 docker compose -f "$COMPOSE_FILE" down

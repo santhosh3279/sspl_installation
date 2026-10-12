@@ -34,13 +34,14 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-09-21.2"
+PANEL_VERSION = "2026-10-12.1"
 FEATURES = ("ERP Next Installation suite page with rclone cloud backup setup "
             "covering full and DB-only backups, console-style terminal whose log "
             "is downloadable and whose past runs are browsable, whole-folder "
             "backup download, guarded restore, delete uploads, cron jobs viewer "
             "on the dashboard, one-click panel update straight from git, license file "
-            "upload to and download from the sites volume")
+            "upload to and download from the sites volume, Uninstall app button "
+            "with a picker of the site's installed apps")
 
 CONFIG_FILE = os.environ.get("SSPL_ADMIN_CONFIG", "/opt/sspl-admin/config.json")
 with open(CONFIG_FILE) as f:
@@ -85,6 +86,10 @@ ACTIONS = {
     # data is fine, a patch is not — you can re-run just it, instead of
     # restoring a database that was never the problem.
     "migrate":   {"label": "Run migrations", "cmd": [f"{SCRIPTS_DIR}/frappe_migrate.sh"]},
+    # Takes the app name as its argument, checked by api_run against what the
+    # site has installed. Run before updating to an image without the app.
+    "uninstall_app": {"label": "Uninstall app",
+                      "cmd": [f"{UPDATE_DIR}/sspl-erp-uninstall-app.sh"]},
 }
 
 # Component installers, driven from the panel's Setup switches. Only wired
@@ -1092,6 +1097,68 @@ def api_cron():
     return jsonify({"jobs": crontab_entries()})
 
 
+# ------------------------------------------------------------ installed apps
+#
+# What the Uninstall app picker offers. Asked of the same site, with the same
+# probe, as sspl-erp-uninstall-app.sh uses, so it offers exactly what the
+# script will accept.
+DEPLOYED_COMMON_SCRIPT = os.path.join(UPDATE_DIR, "sspl-erp-common.sh")
+SITE_NAME_VALUE_RE = re.compile(r"""^SITE_NAME=(?:"([^"]*)"|'([^']*)'|([^\s#]*))""", re.M)
+APP_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,60}$")
+
+
+def _update_site():
+    """The site the update scripts act on, else the deployed one."""
+    try:
+        with open(DEPLOYED_COMMON_SCRIPT) as f:
+            m = SITE_NAME_VALUE_RE.search(f.read())
+    except OSError:
+        m = None
+    if m:
+        site = next((g for g in m.groups() if g is not None), "")
+        if site:
+            return site
+    return deployed_site_name()
+
+
+def installed_apps(site):
+    """Apps installed on the site, frappe excluded. Returns (apps, error).
+
+    Asks frappe for the site's installed_apps as JSON rather than parsing
+    'bench list-apps', whose layout differs between bench versions."""
+    try:
+        out = subprocess.run(
+            ["docker", "compose", "-f", COMPOSE_FILE, "exec", "-T", "backend",
+             "bench", "--site", site, "execute", "frappe.get_installed_apps"],
+            capture_output=True, text=True, timeout=90, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, str(e)[:300]
+    if out.returncode != 0:
+        return None, (out.stderr or "bench execute failed").strip()[-300:]
+    # Anything bench prints before the result is skipped.
+    for line in reversed(out.stdout.splitlines()):
+        try:
+            apps = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(apps, list):
+            return [a for a in apps if isinstance(a, str) and a != "frappe"], None
+    return None, "could not read the installed apps from bench's output"
+
+
+@app.route("/api/installed-apps")
+@login_required
+def api_installed_apps():
+    if not os.path.isfile(ACTIONS["uninstall_app"]["cmd"][0]):
+        return jsonify({"error": "the update scripts on this server predate Uninstall app — "
+                                 "run update_tooling.sh first"})
+    site = _update_site()
+    if not site:
+        return jsonify({"error": "no deployed site found"})
+    apps, err = installed_apps(site)
+    return jsonify({"site": site, "apps": apps or [], "error": err})
+
+
 @app.route("/api/run/<name>", methods=["POST"])
 @login_required
 def api_run(name):
@@ -1115,6 +1182,20 @@ def api_run(name):
         if not site:
             return jsonify({"error": "no deployed site found — nothing to migrate"}), 400
         extra_env = {"SSPL_SITE_NAME": site}
+
+    elif name == "uninstall_app":
+        app_name = str(data.get("app", "")).strip()
+        site = _update_site()
+        if not site:
+            return jsonify({"error": "no deployed site found"}), 400
+        if not APP_NAME_RE.match(app_name) or app_name == "frappe":
+            return jsonify({"error": "choose an app to uninstall"}), 400
+        apps, err = installed_apps(site)
+        if err:
+            return jsonify({"error": f"could not list the installed apps: {err}"}), 500
+        if app_name not in apps:
+            return jsonify({"error": f"'{app_name}' is not installed on {site}"}), 400
+        extra_args = [app_name]
 
     elif name == "rollback":
         snap = data.get("snapshot", "")
@@ -2399,6 +2480,8 @@ details{margin:2px 0} details summary{cursor:pointer}
       data-confirm="Roll back Docker images to the selected snapshot? Services will restart.">Rollback</button>
     <button class="act" data-act="migrate"
       data-confirm="Run database migrations now? Use this to retry after an update or restore failed at the migration step.">Run migrations</button>
+    <select id="un-app" title="App to uninstall from the site — the list is read when you open it"><option value="">App to uninstall…</option></select>
+    <button class="danger act" data-act="uninstall_app">Uninstall app</button>
     <span class="sep"></span>
     <button id="clear-ram"
       data-confirm="Clear RAM caches now? This is safe but may briefly slow the system while caches rebuild.">Clear RAM caches</button>
@@ -2694,6 +2777,15 @@ document.querySelectorAll('.act').forEach(btn => btn.onclick = async () => {
   if (btn.dataset.confirm && !confirm(btn.dataset.confirm)) return;
   const body = {};
   if (act === 'rollback' && $('#rb-snap').value) body.snapshot = $('#rb-snap').value;
+  if (act === 'uninstall_app'){
+    body.app = $('#un-app').value;
+    if (!body.app){ alert('Choose the app to uninstall first.'); return; }
+    if (!confirm(`Uninstall ${body.app} from the site now?\n\n`
+        + `This DELETES ${body.app}'s DocTypes and all their data. A full backup is taken first; `
+        + `export anything you need from the app before going on.\n\n`
+        + `Users are disconnected while it runs. Afterwards, publish the image without `
+        + `${body.app}, then run Update system.`)) return;
+  }
   const r = await fetch('/api/run/' + act, {method:'POST',
     headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   const j = await r.json();
@@ -2719,6 +2811,24 @@ $('#cron-show').onclick = async () => {
   }catch(e){ alert('could not read the crontab'); }
   btn.disabled = false;
 };
+
+// ---- Uninstall app picker: filled on first open, since asking bench is slow ----
+let unAppsLoaded = false;
+async function loadUnApps(){
+  if (unAppsLoaded) return;
+  unAppsLoaded = true;
+  const sel = $('#un-app');
+  sel.innerHTML = '<option value="">Reading installed apps…</option>';
+  try{
+    const j = await (await fetch('/api/installed-apps')).json();
+    if (j.error){ sel.innerHTML = `<option value="">${esc(j.error)}</option>`; unAppsLoaded = false; return; }
+    sel.innerHTML = '<option value="">App to uninstall…</option>' + (j.apps.length
+      ? j.apps.map(a => `<option value="${esc(a)}">${esc(a)}</option>`).join('')
+      : '<option value="" disabled>No apps besides frappe</option>');
+  }catch(e){ sel.innerHTML = '<option value="">Could not read the apps</option>'; unAppsLoaded = false; }
+}
+$('#un-app').onfocus = loadUnApps;
+$('#un-app').onmousedown = loadUnApps;
 
 $('#clear-ram').onclick = async () => {
   if (!confirm($('#clear-ram').dataset.confirm)) return;
@@ -2838,7 +2948,7 @@ document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => {
 
 // A backup, update or rollback that has just finished changes what is on disk
 // and how the box is doing — the reasons this page exists.
-onJobFinished = () => { refreshBackups(); refreshStats(); refreshSite(); };
+onJobFinished = () => { refreshBackups(); refreshStats(); refreshSite(); unAppsLoaded = false; };
 
 setInterval(() => $('#clock').textContent = new Date().toLocaleString(), 1000);
 refreshSite(); refreshStats(); refreshBackups();

@@ -53,6 +53,11 @@ before a cron migration, which is not job output.
   the step that failed, the data is fine and a patch is not: the fix is to
   re-run the migration, not to restore a database that was never the problem.
   Runs `frappe_migrate.sh` from the backup scripts directory.
+- **Uninstall app** — pick an app from the list beside it (read from the site
+  when you open it) and press: takes a full backup, then uninstalls the app,
+  which **deletes its data**. Do this before updating to an image without the
+  app — the update refuses to switch images while it is still installed. Runs
+  `sspl-erp-uninstall-app.sh`; install it with `update_tooling.sh` first.
 - **Guarded restore** — restore a full backup or an uploaded backup folder:
   re-enter your admin password, type the site name to confirm, and a safety
   backup is taken first. The MariaDB root password is typed into the live

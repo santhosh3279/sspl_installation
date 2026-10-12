@@ -507,6 +507,9 @@ so install Part 2 first.</div>
   <li>Prunes unused Docker resources and <b>pulls the latest images with the site still running</b> —
       the download is the longest step of an update, so it is kept out of the downtime window.
       If the pull fails nothing has been changed and the site stays up on the current images.</li>
+  <li><b>Checks that no installed app is missing from the new image</b> — the migration would
+      fail on it. If one is, the update stops before anything changes; uninstall the app first
+      (see below).</li>
   <li>Stops all services, then starts them on the new images and <b>waits until the database and
       backend are actually ready</b> (up to 3 minutes).</li>
   <li>Repairs MariaDB user grants.</li>
@@ -545,6 +548,15 @@ rollback only restores the Docker images (section 11) — it will not remove an 
 that installed. If an update fails while installing one, restore the data backup the
 update took at the start (section 7). When an image adds an app for the first time,
 rehearse the update on a test server restored from a production backup.</div>
+
+<div class="warn"><b>Removing an app from the image:</b> uninstall it from the site <b>first</b>,
+while the running image still has its code. Uninstalling <b>deletes the app's DocTypes and all their
+data</b>. To remove one (for example <code>frappe_whatsapp</code>): export any of its data you want
+to keep, pick it next to <b>Uninstall app</b> in the Admin Panel and press the button (or run
+<code>sudo /opt/sspl-erp/v2/sspl-erp-uninstall-app.sh frappe_whatsapp</code>). It takes a full backup
+first and stops if that fails. Then publish the image without the app and run the update. Until the
+image drops the app, updates do not reinstall it. If the uninstall fails, the database may be half
+changed: fix the cause and run it again, or restore the backup it took (section 7).</div>
 
 <h3>Verify after every update</h3>
 <pre>docker compose ps

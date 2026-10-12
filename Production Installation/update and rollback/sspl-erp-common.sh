@@ -9,6 +9,10 @@ SERVICE_WAIT_TIMEOUT=180
 # Installed by the backup setup, not by this one — same as TRASH_CLEANUP and
 # the frappe_backup.sh this update already calls, hence the absolute path.
 MIGRATE_SCRIPT="/opt/scripts/v2/frappe_migrate.sh"
+# Apps uninstalled with sspl-erp-uninstall-app.sh, one per line. Data, not
+# configuration, so it lives beside the image backups where update_tooling.sh
+# never rewrites it. See install_new_apps for why it exists.
+UNINSTALLED_APPS_FILE="$BACKUP_DIR/uninstalled-apps"
 
 # Read a value from .env; f2- keeps values that contain '='
 get_env_value() {
@@ -139,6 +143,13 @@ install_new_apps() {
 
     for app in $available; do
         [ "$app" = "frappe" ] && continue
+        # Uninstalled on purpose, and the image has not caught up yet:
+        # installing it again would undo that, with an empty app.
+        if grep -qx -- "$app" "$UNINSTALLED_APPS_FILE" 2>/dev/null; then
+            echo "   – $app was uninstalled from the panel; not reinstalling it"
+            echo "     (remove it from the image to stop seeing this)"
+            continue
+        fi
         # Matched against the whole of 'list-apps' rather than a parsed first
         # column, because its layout differs between bench versions (bare
         # names, or name + version + branch). -w keeps 'hrms' from matching
@@ -163,6 +174,90 @@ install_new_apps() {
             bench --site "$SITE_NAME" install-app "$app"
         echo "   ✓ $app installed"
     done
+}
+
+# ─────────────────────────────────────────────────── apps dropped from the image
+#
+# An app the new image no longer ships is still in the site's installed_apps,
+# so 'bench migrate' on the new image tries to import it and fails. It has to
+# be uninstalled first (sspl-erp-uninstall-app.sh, the panel's Uninstall app
+# button) — while the running image still has its code. The update only
+# checks, after the new images are tagged and before 'down', and refuses to
+# switch images while such an app is installed.
+
+# Print the image the compose 'backend' service runs.
+backend_image() {
+    docker compose -f "$COMPOSE_FILE" config --format json 2>/dev/null | python3 -c '
+import json, sys
+print(json.load(sys.stdin)["services"]["backend"]["image"])'
+}
+
+# Print the apps installed on the site, one per line; non-zero on failure.
+# JSON rather than 'list-apps', whose layout differs between bench versions
+# (see install_new_apps). Anything bench prints before the result is skipped
+# by taking the last line that parses as a list.
+site_installed_apps() {
+    docker compose -f "$COMPOSE_FILE" exec -T backend \
+        bench --site "$SITE_NAME" execute frappe.get_installed_apps 2>/dev/null \
+        | python3 -c '
+import json, sys
+for line in reversed(sys.stdin.read().splitlines()):
+    try:
+        apps = json.loads(line)
+    except ValueError:
+        continue
+    if isinstance(apps, list):
+        print("\n".join(apps))
+        break
+else:
+    sys.exit(1)'
+}
+
+# Returns non-zero, having said why, when the update must not go on: an
+# installed app is missing from the new image, or a probe failed (skipping
+# would reproduce the broken migrate this exists to prevent).
+find_dropped_apps() {
+    local image installed available app dropped=()
+    echo "→ Checking for apps removed from the image..."
+
+    if ! image=$(backend_image) || [ -z "$image" ]; then
+        echo "   ❌ Could not read the backend image from $COMPOSE_FILE"
+        return 1
+    fi
+    # The tag already points at the new image; the running containers do not.
+    if ! available=$(docker run --rm --entrypoint ls "$image" apps 2>/dev/null) \
+            || [ -z "$available" ]; then
+        echo "   ❌ Could not list the apps in the new image ($image)"
+        return 1
+    fi
+    if ! installed=$(site_installed_apps) || [ -z "$installed" ]; then
+        echo "   ❌ Could not list the apps installed on $SITE_NAME"
+        return 1
+    fi
+
+    for app in $installed; do
+        [ "$app" = "frappe" ] && continue
+        printf '%s\n' "$available" | grep -qx -- "$app" || dropped+=("$app")
+    done
+    if [ ${#dropped[@]} -gt 0 ]; then
+        echo "   ❌ Installed on $SITE_NAME but missing from the new image: ${dropped[*]}"
+        echo "      The migration would fail on it. Either put it back in the image,"
+        echo "      or uninstall it first — Admin Panel → Uninstall app, or"
+        echo "      $(dirname "$0")/sspl-erp-uninstall-app.sh <app> — then update again."
+        return 1
+    fi
+    echo "   ✓ No installed app is missing"
+
+    # The image has caught up with an uninstall: forget it, so adding the app
+    # back to the image later installs it as normal. Best effort.
+    if [ -s "$UNINSTALLED_APPS_FILE" ]; then
+        local keep
+        keep=$(grep -xF -f <(printf '%s\n' "$available") "$UNINSTALLED_APPS_FILE" || true)
+        if [ "$keep" != "$(cat "$UNINSTALLED_APPS_FILE")" ]; then
+            { [ -z "$keep" ] || printf '%s\n' "$keep"; } > "$UNINSTALLED_APPS_FILE" \
+                || echo "   ⚠ Could not update $UNINSTALLED_APPS_FILE"
+        fi
+    fi
 }
 
 # Re-create the site DB user with host '%' so grants survive container IP changes

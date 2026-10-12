@@ -108,6 +108,7 @@ if [ -f "$UPDATE_DST/sspl-erp-common.sh" ]; then
     update_script "$UPDATE_SRC" "$UPDATE_DST" sspl-erp-common.sh SITE_NAME SERVICE_WAIT_TIMEOUT
     update_script "$UPDATE_SRC" "$UPDATE_DST" sspl-erp-update-with-rollback.sh RCLONE_REMOTE CLEAR_CLOUD_TRASH MEGA_HARD_DELETE
     update_script "$UPDATE_SRC" "$UPDATE_DST" sspl-erp-download-images.sh
+    update_script "$UPDATE_SRC" "$UPDATE_DST" sspl-erp-uninstall-app.sh
     update_script "$UPDATE_SRC" "$UPDATE_DST" sspl-erp-pull-progress.py
     update_script "$UPDATE_SRC" "$UPDATE_DST" sspl-erp-rollback.sh
     update_script "$UPDATE_SRC" "$UPDATE_DST" sspl-erp-backup-manager.sh
