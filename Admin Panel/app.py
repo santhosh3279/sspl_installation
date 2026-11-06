@@ -34,14 +34,15 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-10-12.1"
+PANEL_VERSION = "2026-11-06.1"
 FEATURES = ("ERP Next Installation suite page with rclone cloud backup setup "
             "covering full and DB-only backups, console-style terminal whose log "
             "is downloadable and whose past runs are browsable, whole-folder "
             "backup download, guarded restore, delete uploads, cron jobs viewer "
             "on the dashboard, one-click panel update straight from git, license file "
             "upload to and download from the sites volume, Uninstall app button "
-            "with a picker of the site's installed apps")
+            "with a picker of the site's installed apps, Change port for the "
+            "ERPNext HTTP port with automatic site and socket.io update")
 
 CONFIG_FILE = os.environ.get("SSPL_ADMIN_CONFIG", "/opt/sspl-admin/config.json")
 with open(CONFIG_FILE) as f:
@@ -95,6 +96,7 @@ ACTIONS = {
 # Component installers, driven from the panel's Setup switches. Only wired
 # up when repo_dir is configured and the scripts are present on disk.
 ERP_STACK_SCRIPT = _repo("Production Installation/install_erp_stack.sh")
+CHANGE_PORT_SCRIPT = _repo("Production Installation/change_erp_port.sh")
 BACKUP_SETUP_SCRIPT = _repo("Backup/frappe_backup_system/setup_frappe_backups.sh")
 UPDATE_SETUP_SCRIPT = _repo("Production Installation/update and rollback/install_update_rollback.sh")
 RCLONE_SETUP_SCRIPT = _repo("Backup/frappe_backup_system/install_rclone.sh")
@@ -110,6 +112,9 @@ INSTALL_ACTIONS = {
     "install_update":  {"label": "Install update/rollback", "cmd": ["bash", UPDATE_SETUP_SCRIPT or ""]},
     "install_rclone":  {"label": "Install rclone",          "cmd": ["bash", RCLONE_SETUP_SCRIPT or ""]},
     "install_adguard": {"label": "Install AdGuard Home",    "cmd": ["bash", ADGUARD_SETUP_SCRIPT or ""]},
+    # Moves the running stack to another external HTTP port: compose file,
+    # .env, host_name, and the socket.io Origin check (see the script header).
+    "change_port":     {"label": "Change ERP HTTP port",    "cmd": ["bash", CHANGE_PORT_SCRIPT or ""]},
     "update_tooling":  {"label": "Update v2 scripts & panel",
                         "cmd": ["bash", UPDATE_TOOLING_SCRIPT or ""]},
     # Pulls the checkout first, then deploys only the panel from it. The
@@ -144,6 +149,24 @@ IP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.\-]{0,60}$")
 # CUSTOM_TAG=latest in the .env it writes.
 DEFAULT_ERP_IMAGE = "ghcr.io/santhosh3279/sspl-erpnext"
 ERP_IMAGE_RE = re.compile(r"^[a-z0-9][a-z0-9._\-]*(?::[0-9]{1,5})?(?:/[a-z0-9][a-z0-9._\-]*)+$")
+
+
+# The frontend's host port in the resolved compose file — the one place the
+# live port is recorded (the .env value only matters when it is regenerated).
+PUBLISHED_PORT_RE = re.compile(r'^\s*published:\s*"?(\d+)"?\s*$', re.M)
+# Ports this server already uses: SSH, AdGuard DNS + dashboard, this panel.
+# Kept in step with RESERVED in change_erp_port.sh.
+RESERVED_PORTS = {22, 53, 3000, 8090}
+
+
+def deployed_http_port():
+    """The ERPNext external HTTP port, or None if it cannot be read."""
+    try:
+        with open(COMPOSE_FILE) as f:
+            found = PUBLISHED_PORT_RE.findall(f.read())
+    except OSError:
+        return None
+    return int(found[0]) if len(found) == 1 else None
 
 
 def erp_image():
@@ -768,6 +791,7 @@ def setup_status():
                 "installed": os.path.isfile(COMPOSE_FILE),
                 "running": running,
                 "site": deployed_site_name(),
+                "http_port": deployed_http_port(),
             },
             "backups": {"installed": os.path.isfile(DEPLOYED_BACKUP_SCRIPT)},
             "update":  {"installed": os.path.isfile(os.path.join(UPDATE_DIR, "sspl-erp-common.sh"))},
@@ -1261,6 +1285,19 @@ def _install_env(name, data):
         return {"SERVER_IP": ip, "HTTP_PORT": port, "SSPL_IMAGE": image,
                 "DB_PASSWORD": db_pw, "ADMIN_PASSWORD": admin_pw,
                 "SSPL_ERP_DIR": ERP_DIR}, None
+
+    if name == "change_port":
+        port = str(data.get("http_port", "")).strip()
+        if not (port.isdigit() and 1 <= int(port) <= 65535):
+            return None, "HTTP port must be a number between 1 and 65535"
+        port = int(port)
+        if port in RESERVED_PORTS:
+            return None, f"port {port} is already used on this server (SSH, AdGuard or this panel)"
+        if not os.path.isfile(COMPOSE_FILE):
+            return None, "install the ERPNext stack first"
+        # The same port is allowed: it re-runs only the socket.io Origin check,
+        # which re-applies a hot-patch lost when the container was recreated.
+        return {"HTTP_PORT": str(port), "SSPL_ERP_DIR": ERP_DIR}, None
 
     # rclone is just a binary — it needs nothing from the ERP stack, and can be
     # installed before it (unlike the two below, which read the site name).
@@ -2236,6 +2273,17 @@ async function refreshSetup(){
         <input type="password" id="erp-admin" placeholder="Administrator password" size="20">
         <button class="primary setup-install" data-inst="install_erp"
           data-confirm="Install the ERPNext stack now? This pulls the image, starts the containers and creates the site — 10-20 minutes. Do not close the page.">Install ERPNext</button></div>`;
+    } else {
+      // Move the running stack to another port. The script rolls back to the
+      // old port by itself if the new one does not answer.
+      const cur = c.erp.http_port, host = c.erp.site || s.server_ip || location.hostname;
+      const url = cur ? 'http://' + host + (cur === 80 ? '' : ':' + cur) : '';
+      rows += `<div class="setup-form">
+        <span style="font-size:13px">HTTP port <b>${cur ? cur : '?'}</b>`
+        + (url ? ` — <a href="${esc(url)}" target="_blank">${esc(url)}</a>` : '') + `</span>
+        <input type="text" id="erp-newport" placeholder="New port" size="7">
+        <button class="setup-install" data-inst="change_port">Change port</button>
+        <span style="color:var(--muted);font-size:12px">updates the site and socket.io automatically; ERPNext is offline for about a minute</span></div>`;
     }
     rows += `</div>`;
     // Backup system
@@ -2355,6 +2403,13 @@ async function installComponent(btn){
     body.image = $('#erp-image').value.trim();
     body.db_password = $('#erp-db').value;
     body.admin_password = $('#erp-admin').value;
+  } else if(inst==='change_port'){
+    const p = $('#erp-newport').value.trim();
+    if(!/^\d+$/.test(p)){ alert('Enter the new HTTP port (a number)'); btn.disabled = false; return; }
+    if(!confirm('Move ERPNext to port ' + p + ' now? Users are disconnected for about a minute, '
+      + 'then open http://' + location.hostname + (p === '80' ? '' : ':' + p) + '. '
+      + 'If the new port does not answer, the old port is restored automatically.')) return;
+    body.http_port = p;
   } else if(inst==='install_backups' && $('#bk-cron')){
     body.schedule_cron = $('#bk-cron').checked;
   }

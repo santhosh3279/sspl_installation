@@ -133,6 +133,35 @@ installation suite has served its purpose, and the dashboard is the page you
 use day-to-day: run backups, run updates, roll back, clear RAM, and watch
 server health.
 
+### Changing the ERPNext HTTP port
+
+Once ERPNext is installed, its row shows the current HTTP port and a **Change
+port** box. Enter the new port and click *Change port*. The job
+(`Production Installation/change_erp_port.sh`) then:
+
+- rewrites the frontend's published port (and `FRAPPE_HOST_NAME`) in
+  `/opt/sspl-erp/docker-compose.yml`, and `HTTP_PUBLISH_PORT` in
+  `frappe_docker/.env`. Backups are saved as `*.bak.port.<timestamp>`.
+- recreates the changed containers with `--pull never`, so a port change never
+  pulls a new image.
+- waits for `/api/method/ping` on the new port. If it never answers, both
+  files are restored and the stack comes back on the old port.
+- updates `host_name` in `common_site_config.json` and the site's
+  `site_config.json` when it still carries the old port, then restarts the app
+  processes.
+- checks the socket.io `Origin` header. On any port other than 80, nginx must
+  send the port (`$http_host`) or realtime/live updates fail. Images built from
+  `sspl-erp-docker` from 2026-11-06 on include the fix. For an older image the
+  running frontend container is hot-patched, and the job warns that the patch
+  is lost when that container is recreated (e.g. by a System update). Rebuild
+  the image to make it permanent, or re-run *Change port* with the same port
+  after the update — a same-port run only re-applies this check.
+
+`socketio_port` is never changed: it stays 9000 (the websocket container's
+internal port) whatever the external port is. Ports 22, 53, 3000 and 8090 are
+refused because this server already uses them. ERPNext is offline for about a
+minute while the containers restart. If `ufw` is active, allow the new port.
+
 ## Cloud backup
 
 By default a backup stays on the server: `frappe_backup.sh`,
