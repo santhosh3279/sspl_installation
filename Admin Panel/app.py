@@ -34,7 +34,7 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-11-06.1"
+PANEL_VERSION = "2026-11-06.2"
 FEATURES = ("ERP Next Installation suite page with rclone cloud backup setup "
             "covering full and DB-only backups, console-style terminal whose log "
             "is downloadable and whose past runs are browsable, whole-folder "
@@ -42,7 +42,8 @@ FEATURES = ("ERP Next Installation suite page with rclone cloud backup setup "
             "on the dashboard, one-click panel update straight from git, license file "
             "upload to and download from the sites volume, Uninstall app button "
             "with a picker of the site's installed apps, Change port for the "
-            "ERPNext HTTP port with automatic site and socket.io update")
+            "ERPNext HTTP port with automatic site and socket.io update, OpenWA "
+            "WhatsApp API install in Docker with Show API key")
 
 CONFIG_FILE = os.environ.get("SSPL_ADMIN_CONFIG", "/opt/sspl-admin/config.json")
 with open(CONFIG_FILE) as f:
@@ -101,6 +102,7 @@ BACKUP_SETUP_SCRIPT = _repo("Backup/frappe_backup_system/setup_frappe_backups.sh
 UPDATE_SETUP_SCRIPT = _repo("Production Installation/update and rollback/install_update_rollback.sh")
 RCLONE_SETUP_SCRIPT = _repo("Backup/frappe_backup_system/install_rclone.sh")
 ADGUARD_SETUP_SCRIPT = _repo("Production Installation/install_adguard.sh")
+OPENWA_SETUP_SCRIPT = _repo("Production Installation/install_openwa.sh")
 RCLONE_GUIDE = _repo("Backup/Rclone_Configuration_Guide.docx")
 UPDATE_TOOLING_SCRIPT = _repo("update_tooling.sh")
 UPDATE_PANEL_SCRIPT = _repo("update_panel.sh")
@@ -112,6 +114,9 @@ INSTALL_ACTIONS = {
     "install_update":  {"label": "Install update/rollback", "cmd": ["bash", UPDATE_SETUP_SCRIPT or ""]},
     "install_rclone":  {"label": "Install rclone",          "cmd": ["bash", RCLONE_SETUP_SCRIPT or ""]},
     "install_adguard": {"label": "Install AdGuard Home",    "cmd": ["bash", ADGUARD_SETUP_SCRIPT or ""]},
+    # OpenWA WhatsApp API gateway in Docker. Its admin API key never goes
+    # through the job log: /api/openwa/key reads it from the container.
+    "install_openwa":  {"label": "Install OpenWA",          "cmd": ["bash", OPENWA_SETUP_SCRIPT or ""]},
     # Moves the running stack to another external HTTP port: compose file,
     # .env, host_name, and the socket.io Origin check (see the script header).
     "change_port":     {"label": "Change ERP HTTP port",    "cmd": ["bash", CHANGE_PORT_SCRIPT or ""]},
@@ -154,9 +159,15 @@ ERP_IMAGE_RE = re.compile(r"^[a-z0-9][a-z0-9._\-]*(?::[0-9]{1,5})?(?:/[a-z0-9][a
 # The frontend's host port in the resolved compose file — the one place the
 # live port is recorded (the .env value only matters when it is regenerated).
 PUBLISHED_PORT_RE = re.compile(r'^\s*published:\s*"?(\d+)"?\s*$', re.M)
-# Ports this server already uses: SSH, AdGuard DNS + dashboard, this panel.
-# Kept in step with RESERVED in change_erp_port.sh.
-RESERVED_PORTS = {22, 53, 3000, 8090}
+# Ports this server already uses: SSH, AdGuard DNS + dashboard, OpenWA, this
+# panel. Kept in step with RESERVED in change_erp_port.sh.
+RESERVED_PORTS = {22, 53, 2785, 3000, 8090}
+
+# OpenWA (WhatsApp API). Its compose file pins the container name, so the
+# container is how the panel finds it, wherever it was installed from.
+OPENWA_DIR = CONFIG.get("openwa_dir", "/opt/openwa")
+OPENWA_PORT = int(CONFIG.get("openwa_port", 2785))
+OPENWA_CONTAINER = "openwa-api"
 
 
 def deployed_http_port():
@@ -502,6 +513,44 @@ def is_adguard_running():
         return False
 
 
+def openwa_status():
+    """Is the openwa-api container there / running, and on which host port."""
+    st = {"installed": False, "running": False, "port": OPENWA_PORT}
+    try:
+        out = subprocess.run(
+            ["docker", "inspect", OPENWA_CONTAINER, "--format",
+             "{{.State.Running}} {{range $p, $b := .NetworkSettings.Ports}}"
+             "{{if eq $p \"2785/tcp\"}}{{range $b}}{{.HostPort}} {{end}}{{end}}{{end}}"],
+            capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return st
+    if out.returncode != 0:
+        return st
+    parts = out.stdout.split()
+    st["installed"] = True
+    st["running"] = bool(parts) and parts[0] == "true"
+    ports = [p for p in parts[1:] if p.isdigit()]
+    if ports:
+        st["port"] = int(ports[0])
+    return st
+
+
+def openwa_api_key():
+    """Read the admin API key OpenWA generated on first boot.
+    Returns (key, None) or (None, reason)."""
+    try:
+        out = subprocess.run(
+            ["docker", "exec", OPENWA_CONTAINER, "cat", "/app/data/.api-key"],
+            capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, f"docker exec failed: {e}"
+    key = out.stdout.strip()
+    if out.returncode != 0 or not key:
+        return None, ("the API key has not been generated yet — wait for OpenWA "
+                      "to finish starting, or check docker logs openwa-api")
+    return key, None
+
+
 def rclone_remotes():
     """Cloud remotes rclone can see, as root — the user the backup job runs as.
 
@@ -800,6 +849,7 @@ def setup_status():
                 "installed": os.path.isfile("/opt/AdGuardHome/AdGuardHome"),
                 "running": is_adguard_running(),
             },
+            "openwa": openwa_status(),
         },
         "cron": cron_status(),
         "panel_version": PANEL_VERSION,
@@ -1112,6 +1162,17 @@ def api_setup_status():
     return jsonify(setup_status())
 
 
+@app.route("/api/openwa/key", methods=["POST"])
+@login_required
+def api_openwa_key():
+    # POST, and never part of /api/setup-status: the key is only fetched when
+    # someone presses Show API key, and is not cached by the browser.
+    key, err = openwa_api_key()
+    resp = jsonify({"error": err}) if err else jsonify({"key": key})
+    resp.headers["Cache-Control"] = "no-store"
+    return resp, (500 if err else 200)
+
+
 @app.route("/api/cron")
 @login_required
 def api_cron():
@@ -1292,7 +1353,7 @@ def _install_env(name, data):
             return None, "HTTP port must be a number between 1 and 65535"
         port = int(port)
         if port in RESERVED_PORTS:
-            return None, f"port {port} is already used on this server (SSH, AdGuard or this panel)"
+            return None, f"port {port} is already used on this server (SSH, AdGuard, OpenWA or this panel)"
         if not os.path.isfile(COMPOSE_FILE):
             return None, "install the ERPNext stack first"
         # The same port is allowed: it re-runs only the socket.io Origin check,
@@ -1303,6 +1364,8 @@ def _install_env(name, data):
     # installed before it (unlike the two below, which read the site name).
     if name in ("install_rclone", "install_adguard"):
         return {}, None
+    if name == "install_openwa":
+        return {"OPENWA_DIR": OPENWA_DIR, "OPENWA_PORT": str(OPENWA_PORT)}, None
 
     # Both updaters restart the panel service at the end, which would kill
     # their own job — the flag tells them to defer that restart until after
@@ -2316,6 +2379,26 @@ async function refreshSetup(){
       rows += `<div class="note">AdGuard Home is running. Access the dashboard to configure DNS blocking: <a href="http://${esc(s.server_ip || location.hostname)}:3000" target="_blank">http://${esc(s.server_ip || location.hostname)}:3000</a></div>`;
     }
     rows += `</div>`;
+    // OpenWA WhatsApp API (Docker)
+    const ow = c.openwa, owUrl = 'http://' + (s.server_ip || location.hostname) + ':' + ow.port;
+    rows += `<div class="setup-row"><div class="setup-h"><b>OpenWA WhatsApp API</b> ${pill(ow.installed)}`
+      + (ow.installed ? (ow.running ? ' <span class="badge ok">running</span>'
+                                     : ' <span class="badge miss">stopped</span>') : '') + `</div>`;
+    if(!ow.installed){
+      rows += `<div class="setup-form">
+        <button class="primary setup-install" data-inst="install_openwa"
+          data-confirm="Install OpenWA now? This clones OpenWA, pulls its Docker image and starts it on port ${ow.port}. A few minutes.">Install OpenWA</button></div>`;
+    } else {
+      rows += `<div class="setup-form">
+        <span style="font-size:13px">Dashboard &amp; API: <a href="${esc(owUrl)}" target="_blank">${esc(owUrl)}</a>
+          · <a href="${esc(owUrl)}/api/docs" target="_blank">Swagger</a></span>
+        <button id="ow-show" onclick="showOpenwaKey()" ${ow.running?'':'disabled'}>Show API key</button>
+        <input type="text" id="ow-key" readonly size="40" style="display:none;font-family:monospace">
+        <button id="ow-copy" onclick="copyOpenwaKey()" style="display:none">Copy</button>
+        <span id="ow-msg" style="color:var(--muted);font-size:12px"></span></div>
+        <div class="note">Use the key to sign in to the dashboard and as the <code>X-API-Key</code> header on API calls.</div>`;
+    }
+    rows += `</div>`;
     rows += rcloneRow(s);
     // Scheduled backups: what root's crontab will actually run, and when
     const cj = (s.cron && s.cron.jobs) || [];
@@ -2391,6 +2474,25 @@ async function refreshSetup(){
     // panel: re-disable the buttons the render above has just recreated.
     if (jobWasActive) document.querySelectorAll('.setup-install').forEach(b => b.disabled = true);
   }catch(e){}
+}
+
+// The key is fetched on demand only, and the setup refresh every 30s
+// rebuilds this row — which hides it again, so it is not left on screen.
+async function showOpenwaKey(){
+  const msg = $('#ow-msg'); msg.textContent = 'reading…';
+  try{
+    const r = await fetch('/api/openwa/key', {method:'POST'});
+    if(r.status===401){location='/login';return;}
+    const j = await r.json();
+    if(j.error){ msg.textContent = j.error; return; }
+    const k = $('#ow-key'); k.value = j.key; k.style.display = ''; $('#ow-copy').style.display = '';
+    k.select(); msg.textContent = '';
+  }catch(e){ msg.textContent = 'request failed'; }
+}
+async function copyOpenwaKey(){
+  const k = $('#ow-key');
+  try{ await navigator.clipboard.writeText(k.value); $('#ow-msg').textContent = 'copied'; }
+  catch(e){ k.select(); document.execCommand('copy'); $('#ow-msg').textContent = 'copied'; }
 }
 
 async function installComponent(btn){

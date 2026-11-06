@@ -39,6 +39,16 @@ before a cron migration, which is not job output.
 - **Cloud backup (rclone)** — install rclone and point backups at a cloud
   remote from the suite, with the three stages reported separately so a
   half-finished setup can't look finished. See [Cloud backup](#cloud-backup).
+- **OpenWA WhatsApp API** — *Install OpenWA* in the suite clones
+  [OpenWA](https://github.com/rmyndharis/OpenWA) into `/opt/openwa`
+  (`openwa_dir` in config.json) and runs the published
+  `ghcr.io/rmyndharis/openwa` image with docker compose on port 2785
+  (`openwa_port`). Once it is up the row links the dashboard and Swagger, and
+  **Show API key** reads the admin key OpenWA generated on first boot
+  (`/app/data/.api-key` in the `openwa-api` container), with a Copy button.
+  The key is read only when you press the button. It never goes into the job
+  log or the 30-second status poll. Port 2785 is reserved, so *Change port*
+  refuses it for ERPNext. Runs `Production Installation/install_openwa.sh`.
 - **Server health** — CPU usage, load average, memory/swap/disk meters, uptime,
   live ERP container status
 - **Clear RAM caches** button (`sync` + drop_caches — safe, caches rebuild automatically)

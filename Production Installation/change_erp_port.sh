@@ -42,8 +42,8 @@ FD_DIR="$ERP_DIR/frappe_docker"
 COMPOSE_FILE="$ERP_DIR/docker-compose.yml"
 ENV_FILE="$FD_DIR/.env"
 NEW="${HTTP_PORT:-}"
-# Ports already used on this server: SSH, AdGuard DNS + dashboard, admin panel
-RESERVED="22 53 3000 8090"
+# Ports already used on this server: SSH, AdGuard DNS + dashboard, OpenWA, admin panel
+RESERVED="22 53 2785 3000 8090"
 
 err()  { echo "❌ $*" >&2; exit 1; }
 step() { echo ""; echo "──────── $* ────────"; }
