@@ -94,10 +94,20 @@ fi
 # ─────────────────────────────────────────────── 1. working dir + frappe_docker
 step "Working directory and frappe_docker"
 mkdir -p "$ERP_DIR"
-if [ -d "$FD_DIR/.git" ]; then
-    ok "frappe_docker already cloned — keeping it"
+# Pin frappe_docker to the exact commit the sspl-erpnext image is built from
+# (sspl-erp-docker .github/workflows/build.yml), so compose files match the image
+# — e.g. upstream's configurator sets chromium_path for that image's layout.
+FD_REPO="https://github.com/santhosh3279/frappe_docker"
+FD_REF="9fd1f48ad4eb10d201cec68d00139302e8ca37b4"
+[ -d "$FD_DIR/.git" ] || git clone -q "$FD_REPO" "$FD_DIR"
+if [ "$(git -C "$FD_DIR" rev-parse HEAD 2>/dev/null)" = "$FD_REF" ]; then
+    ok "frappe_docker already at ${FD_REF:0:7}"
 else
-    git clone --depth 1 https://github.com/frappe/frappe_docker "$FD_DIR"
+    git -C "$FD_DIR" fetch -q --depth 1 "$FD_REPO" "$FD_REF" \
+        || err "Could not fetch frappe_docker $FD_REF from $FD_REPO"
+    git -C "$FD_DIR" checkout -q --detach FETCH_HEAD \
+        || err "Could not check out frappe_docker $FD_REF — local edits in $FD_DIR? (git -C $FD_DIR status)"
+    ok "frappe_docker pinned to ${FD_REF:0:7}"
 fi
 
 # ─────────────────────────────────────────────────────── 2. .env + overrides
