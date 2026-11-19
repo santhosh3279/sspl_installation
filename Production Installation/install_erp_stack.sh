@@ -44,10 +44,19 @@ dc()   { sudo docker compose -f "$COMPOSE_FILE" "$@"; }
 step "Working directory and frappe_docker"
 sudo mkdir -p "$ERP_DIR"
 sudo chown "$OWNER:$OWNER" "$ERP_DIR"
-if [ -d "$FD_DIR/.git" ]; then
-    echo "✓ frappe_docker already cloned — keeping it"
+# Pin frappe_docker to the exact commit the sspl-erpnext image is built from
+# (sspl-erp-docker .github/workflows/build.yml), so compose files match the image.
+FD_REPO="https://github.com/santhosh3279/frappe_docker"
+FD_REF="9fd1f48ad4eb10d201cec68d00139302e8ca37b4"
+[ -d "$FD_DIR/.git" ] || git clone -q "$FD_REPO" "$FD_DIR"
+if [ "$(git -C "$FD_DIR" rev-parse HEAD 2>/dev/null)" = "$FD_REF" ]; then
+    echo "✓ frappe_docker already at ${FD_REF:0:7}"
 else
-    git clone https://github.com/frappe/frappe_docker "$FD_DIR"
+    git -C "$FD_DIR" fetch -q --depth 1 "$FD_REPO" "$FD_REF" \
+        || err "Could not fetch frappe_docker $FD_REF from $FD_REPO"
+    git -C "$FD_DIR" checkout -q --detach FETCH_HEAD \
+        || err "Could not check out frappe_docker $FD_REF — local edits in $FD_DIR? (git -C $FD_DIR status)"
+    echo "✓ frappe_docker pinned to ${FD_REF:0:7}"
 fi
 
 # ──────────────────────────────────────────────────── 2. .env + override
@@ -118,6 +127,7 @@ services:
         bench set-config -g redis_socketio "redis://$$REDIS_QUEUE"
         bench set-config -gp socketio_port $$SOCKETIO_PORT
         bench set-config -g host_name "$$FRAPPE_HOST_NAME"
+        bench set-config -g chromium_path /usr/lib/chromium/chromium-headless-shell
 EOF
 echo "✓ Wrote overrides/compose.pdf-fix.yaml"
 
