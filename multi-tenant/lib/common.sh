@@ -18,6 +18,13 @@ ERP_DIR=/opt/sspl-erp
 COMPOSE_PROJECT=sspl-erp
 HTTP_PORT=80          # public port: the host nginx (domain → site router)
 FRONTEND_PORT=18080   # the stack's own nginx, published on 127.0.0.1 only
+HTTPS_PORT=443        # host nginx HTTPS; "" = HTTP only
+HTTPS_REDIRECT=yes    # domains with a Let's Encrypt certificate: HTTP → HTTPS
+LETSENCRYPT_EMAIL=""  # expiry notices from Let's Encrypt; "" = none
+SERVER_IP=""          # address for http://<ip>:<port> site links; "" = first of hostname -I
+SSL_DIR=/etc/sspl-erp/ssl                # default (self-signed) certificate
+LE_LIVE=/etc/letsencrypt/live            # certbot's certificates
+ACME_WEBROOT=/var/www/sspl-acme          # Let's Encrypt HTTP-01 challenges
 IMAGE=ghcr.io/santhosh3279/sspl-erpnext
 IMAGE_TAG=latest
 BACKUP_ROOT=/opt/backups/frappe
@@ -45,6 +52,7 @@ ENV_FILE="$ERP_DIR/.env"                       # MARIADB_ROOT_PASSWORD, 0600
 IMAGE_BACKUP_DIR="$ERP_DIR/image-backups"
 SKIP_APPS_DIR="$ERP_DIR/site-skip-apps"        # per-site "never auto-install"
 DOMAINS_FILE="$ERP_DIR/site-domains"           # "<domain> <site>" per line
+PORTS_FILE="$ERP_DIR/site-ports"               # "<port> <site>" per line
 PROXY_CONF=/etc/nginx/conf.d/sspl-erp.conf     # generated from DOMAINS_FILE
 TOOLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SITES_BACKUP_DIR="$BACKUP_ROOT/sites"
@@ -307,6 +315,43 @@ all_domains()  { domain_lines | awk '{print $1}'; }
 site_domains() { domain_lines | awk -v s="$1" '$2 == s {print $1}'; }
 domain_site()  { domain_lines | awk -v d="$1" '$1 == d && !f {print $2; f = 1}'; }   # no 'exit': SIGPIPE + pipefail
 
+# ───── per-site ports: "<port> <site>" per line in PORTS_FILE. nginx listens
+# on each port and sends everything on it to that one site, so a site is
+# reachable as http://<server-ip>:<port>/ without any DNS.
+valid_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+
+port_lines() {
+    [ -r "$PORTS_FILE" ] || return 0
+    local p s _
+    while read -r p s _; do
+        case "$p" in ''|'#'*) continue ;; esac
+        valid_port "$p" && valid_site_name "$s" && printf '%s %s\n' "$p" "$s"
+    done < "$PORTS_FILE" | awk '!seen[$1]++'
+}
+site_ports() { port_lines | awk -v s="$1" '$2 == s {print $1}'; }
+port_site()  { port_lines | awk -v p="$1" '$1 == p && !f {print $2; f = 1}'; }
+
+_edit_ports() {
+    local tmp
+    mkdir -p "$(dirname "$PORTS_FILE")"
+    tmp=$(mktemp "$PORTS_FILE.XXXXXX")
+    if [ -r "$PORTS_FILE" ]; then "$@" < "$PORTS_FILE"; else "$@" < /dev/null; fi > "$tmp" \
+        || { rm -f "$tmp"; err "could not update $PORTS_FILE"; }
+    chmod 644 "$tmp"
+    mv -f "$tmp" "$PORTS_FILE"
+}
+# shellcheck disable=SC2016
+add_port()          { _edit_ports sh -c 'cat; printf "%s %s\n" "$1" "$2"' _ "$1" "$2"; }
+remove_port()       { _edit_ports awk -v p="$1" '$1 != p'; }
+remove_site_ports() { _edit_ports awk -v s="$1" '$2 != s'; }
+
+# The address this server is reached on, for http://<ip>:<port> links and
+# host_name. SERVER_IP in the config wins; else the first address.
+server_ip() {
+    if [ -n "${SERVER_IP:-}" ]; then printf '%s' "$SERVER_IP"; return; fi
+    hostname -I 2>/dev/null | awk '{print $1}'
+}
+
 # Rewrite DOMAINS_FILE through a filter command (old file on stdin, new file
 # on stdout), atomically.
 _edit_domains() {
@@ -334,17 +379,108 @@ remove_site_domains() { _edit_domains awk -v s="$1" '$2 != s'; }   # $1 site
 
 proxy_installed() { command -v nginx >/dev/null 2>&1 && [ -d /etc/nginx/conf.d ]; }
 
+# Is TCP port $1 held by something other than the host nginx?
+port_busy_by_other() {
+    local l
+    l=$(ss -ltnpH "sport = :$1" 2>/dev/null) || return 1
+    [ -n "$l" ] && ! printf '%s' "$l" | grep -q '"nginx"'
+}
+
+# Does the host nginx listen on port $1?
+nginx_listens() { ss -ltnpH "sport = :$1" 2>/dev/null | grep -q '"nginx"'; }
+
+# ─────────────────────────────────────────────────────────── HTTPS
+#
+# Every domain gets HTTPS on HTTPS_PORT:
+#   - with a self-signed default certificate (install-proxy.sh makes it), so
+#     LAN names like acme.erp.lan work at once — browsers show a warning;
+#   - with a Let's Encrypt certificate once 'domains.sh cert <domain>' got
+#     one (public domains only: Let's Encrypt must reach it on port 80).
+#     Those domains are redirected from HTTP to HTTPS (HTTPS_REDIRECT=yes),
+#     and a primary one becomes the site's https:// host_name.
+# HTTPS_PORT="" turns HTTPS off. Without the default certificate (a stack
+# updated from before HTTPS, until install-proxy.sh runs) the config stays
+# plain HTTP, so nginx -t never fails on a missing file.
+
+domain_has_cert() { [ -s "$LE_LIVE/$1/fullchain.pem" ] && [ -s "$LE_LIVE/$1/privkey.pem" ]; }
+default_cert_ok() { [ -s "$SSL_DIR/default.crt" ] && [ -s "$SSL_DIR/default.key" ]; }
+https_on()        { [ -n "$HTTPS_PORT" ] && default_cert_ok; }
+
+# The URL users type for a domain: https when it has a real certificate.
+domain_url() {   # $1 domain
+    if https_on && domain_has_cert "$1"; then
+        printf 'https://%s' "$1"; [ "$HTTPS_PORT" = 443 ] || printf ':%s' "$HTTPS_PORT"
+    else
+        printf 'http://%s' "$1"; [ "$HTTP_PORT" = 80 ] || printf ':%s' "$HTTP_PORT"
+    fi
+}
+
+# Delete a domain's Let's Encrypt certificate (and its renewal). Call after
+# apply_proxy has stopped referencing it.
+remove_cert() {   # $1 domain
+    [ -d "$LE_LIVE/$1" ] || return 0
+    command -v certbot >/dev/null 2>&1 || return 0
+    certbot delete --cert-name "$1" --non-interactive >/dev/null 2>&1 \
+        && ok "Let's Encrypt certificate for $1 deleted" \
+        || warn "could not delete the certificate for $1 (certbot delete --cert-name $1)"
+}
+
+# Body of every proxy 'location /' (same for HTTP and HTTPS servers).
+# $1 = a fixed site (a per-site port server); default: the domain map.
+_proxy_location() {
+    local S='$sspl_site'
+    if [ -n "${1:-}" ]; then
+        S="$1"
+    else
+        cat <<'EOF'
+        # A domain that is not in the table: close the connection, no page.
+        if ($sspl_site = "") { return 444; }
+EOF
+    fi
+    cat <<EOF
+        proxy_pass http://127.0.0.1:$FRONTEND_PORT;
+        proxy_http_version 1.1;
+        # The stack's nginx and Frappe route on Host: give them the site name.
+        proxy_set_header Host $S;
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$sspl_connection_upgrade;
+        # Absolute redirects (to the site name, or to an http:// host_name)
+        # would leave the user's domain or drop HTTPS: make them relative.
+        proxy_redirect http://$S/ /;
+        proxy_redirect http://$S:$HTTP_PORT/ /;
+        proxy_redirect https://$S/ /;
+        proxy_redirect http://\$host/ /;
+        proxy_redirect http://\$host:$HTTP_PORT/ /;
+        proxy_redirect http://\$http_host/ /;
+EOF
+}
+
+_proxy_server_common() {
+    cat <<'EOF'
+    client_max_body_size 0;      # the stack's own nginx enforces the limit
+    proxy_read_timeout 300s;
+    proxy_send_timeout 300s;
+EOF
+}
+
 # The host nginx config, from DOMAINS_FILE.
 render_proxy_conf() {
-    local d s
-    printf '%s\n' \
-        "# Generated by the SSPL multi-tenant tools from $DOMAINS_FILE — do not edit." \
-        "# Change domains with: ${SSPL_TOOLS_DIR:-$TOOLS_DIR}/sites/domains.sh" \
-        "" \
-        'map $host $sspl_site {' \
-        '    default "";'
+    local d s https=no redirect=no
+    https_on && https=yes
+    [ "$https" = yes ] && [ "$HTTPS_REDIRECT" = yes ] && redirect=yes
+
+    cat <<EOF
+# Generated by the SSPL multi-tenant tools from $DOMAINS_FILE — do not edit.
+# Change domains with: ${SSPL_TOOLS_DIR:-$TOOLS_DIR}/sites/domains.sh
+
+map \$host \$sspl_site {
+    default "";
+EOF
     domain_lines | while read -r d s; do printf '    %-40s %s;\n' "$d" "$s"; done
-    sed -e "s/@HTTP_PORT@/$HTTP_PORT/g" -e "s/@FRONTEND_PORT@/$FRONTEND_PORT/g" <<'NGINX'
+    cat <<'EOF'
 }
 
 map $http_upgrade $sspl_connection_upgrade {
@@ -352,34 +488,94 @@ map $http_upgrade $sspl_connection_upgrade {
     ''      close;
 }
 
+# Domains with a real certificate: plain HTTP is redirected to HTTPS.
+map $host $sspl_https_only {
+    default 0;
+EOF
+    if [ "$redirect" = yes ]; then
+        all_domains | while read -r d; do
+            if ! is_ip "$d" && domain_has_cert "$d"; then printf '    %-40s 1;\n' "$d"; fi
+        done
+    fi
+    local hp=""
+    [ "$HTTPS_PORT" = 443 ] || hp=":$HTTPS_PORT"
+    cat <<EOF
+}
+
 server {
-    listen @HTTP_PORT@ default_server;
-    listen [::]:@HTTP_PORT@ default_server;
+    listen $HTTP_PORT default_server;
+    listen [::]:$HTTP_PORT default_server;
     server_name _;
+$(_proxy_server_common)
 
-    # A domain that is not in the table: close the connection, no page.
-    if ($sspl_site = "") { return 444; }
-
-    client_max_body_size 0;      # the stack's own nginx enforces the limit
-    proxy_read_timeout 300s;
-    proxy_send_timeout 300s;
+    # Let's Encrypt HTTP-01 challenges (domains.sh cert), for any host.
+    location ^~ /.well-known/acme-challenge/ {
+        root $ACME_WEBROOT;
+        default_type text/plain;
+    }
 
     location / {
-        proxy_pass http://127.0.0.1:@FRONTEND_PORT@;
-        proxy_http_version 1.1;
-        # The stack's nginx and Frappe route on Host: give them the site name.
-        proxy_set_header Host $sspl_site;
-        proxy_set_header X-Forwarded-Host $host;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection $sspl_connection_upgrade;
-        # Absolute redirects to the site name would leave the user's domain.
-        proxy_redirect http://$sspl_site/ /;
-        proxy_redirect http://$sspl_site:@HTTP_PORT@/ /;
+        if (\$sspl_https_only) { return 301 https://\$host$hp\$request_uri; }
+$(_proxy_location)
     }
 }
-NGINX
+EOF
+    # Per-site ports: http://<server-ip>:<port>/ is that site, whatever the
+    # Host header says (sites/domains.sh port).
+    local p
+    port_lines | while read -r p s; do
+        cat <<EOF
+
+server {
+    listen $p;
+    listen [::]:$p;
+    server_name _;
+$(_proxy_server_common)
+
+    location / {
+$(_proxy_location "$s")
+    }
+}
+EOF
+    done
+    [ "$https" = yes ] || return 0
+
+    # Default HTTPS server: every domain, self-signed certificate.
+    cat <<EOF
+
+server {
+    listen $HTTPS_PORT ssl default_server;
+    listen [::]:$HTTPS_PORT ssl default_server;
+    server_name _;
+    ssl_certificate     $SSL_DIR/default.crt;
+    ssl_certificate_key $SSL_DIR/default.key;
+$(_proxy_server_common)
+
+    location / {
+$(_proxy_location)
+    }
+}
+EOF
+    # One server per domain that has a Let's Encrypt certificate.
+    all_domains | while read -r d; do
+        is_ip "$d" && continue
+        domain_has_cert "$d" || continue
+        cat <<EOF
+
+server {
+    listen $HTTPS_PORT ssl;
+    listen [::]:$HTTPS_PORT ssl;
+    server_name $d;
+    ssl_certificate     $LE_LIVE/$d/fullchain.pem;
+    ssl_certificate_key $LE_LIVE/$d/privkey.pem;
+$(_proxy_server_common)
+
+    location / {
+$(_proxy_location)
+    }
+}
+EOF
+    done
 }
 
 # Write the config, test it, reload. A config nginx rejects is rolled back,
@@ -390,6 +586,13 @@ apply_proxy() {
     # 'listen HTTP_PORT' file here would race it for the port at every boot.
     grep -q '^HTTP_PUBLISH_PORT=127\.0\.0\.1:' "$FD_DIR/.env" 2>/dev/null \
         || { warn "the frontend still holds port $HTTP_PORT — run install/install-proxy.sh from the checkout"; return 1; }
+    # Another program on HTTPS_PORT: nginx -t would pass (it does not bind),
+    # but the reload would silently keep the old config. Render HTTP only.
+    local HTTPS_PORT="$HTTPS_PORT"
+    if [ -n "$HTTPS_PORT" ] && port_busy_by_other "$HTTPS_PORT"; then
+        warn "port $HTTPS_PORT is held by another program — HTTPS is off until it is free: $(ss -ltnpH "sport = :$HTTPS_PORT" | head -1)"
+        HTTPS_PORT=""
+    fi
     local tmp bak=""
     tmp=$(mktemp)
     render_proxy_conf > "$tmp"
@@ -410,6 +613,13 @@ apply_proxy() {
         systemctl enable --now nginx >/dev/null 2>&1 \
             || { warn "nginx did not start — systemctl status nginx"; return 1; }
     fi
+    # A reload that could not bind a port reports success and keeps the old
+    # config: check nginx really listens.
+    local p
+    sleep 1
+    for p in $HTTP_PORT $(https_on && echo "$HTTPS_PORT") $(port_lines | awk '{print $1}'); do
+        nginx_listens "$p" || { warn "nginx is not listening on port $p — journalctl -u nginx"; return 1; }
+    done
 }
 
 # ─────────────────────────────────────────────── per-site maintenance window

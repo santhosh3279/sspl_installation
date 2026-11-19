@@ -104,8 +104,7 @@ fix_db_grants "$SITE"
 
 # The site's own URL: links in emails, and the address wkhtmltopdf fetches
 # images/CSS from when rendering PDFs.
-URL="http://$SITE"
-[ "$HTTP_PORT" = 80 ] || URL="$URL:$HTTP_PORT"
+URL=$(domain_url "$SITE")
 dc exec -T backend bench --site "$SITE" set-config host_name "$URL" >/dev/null
 ok "host_name set to $URL"
 

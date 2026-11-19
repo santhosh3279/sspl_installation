@@ -41,9 +41,21 @@ ok "$SITE dropped (folder moved to sites/archived_sites/)"
 rm -f "$(skip_apps_file "$SITE")"
 
 DOMAINS=$(site_domains "$SITE" | tr '\n' ' ')
+PORTS=$(site_ports "$SITE" | tr '\n' ' ')
 remove_site_domains "$SITE"
-apply_proxy && ok "nginx no longer routes: $DOMAINS" \
-    || warn "nginx not reloaded — run install/install-proxy.sh from the checkout"
+remove_site_ports "$SITE"
+if [ -n "$PORTS" ]; then
+    echo "   Ports freed: $PORTS"
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+        for p in $PORTS; do ufw delete allow "$p/tcp" >/dev/null 2>&1 || true; done
+    fi
+fi
+if apply_proxy; then
+    ok "nginx no longer routes: $DOMAINS"
+    for d in $DOMAINS; do remove_cert "$d"; done
+else
+    warn "nginx not reloaded — run install/install-proxy.sh from the checkout"
+fi
 
 # The containers had an entry for the site's name and every other domain of it
 NEED_HOSTS=no

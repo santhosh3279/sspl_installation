@@ -41,7 +41,7 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-11-19.mt2"
+PANEL_VERSION = "2026-11-19.mt4"
 FEATURES = ("Multi-tenant panel: sites list with per-site backup, DB backup, "
             "migrate, uninstall app and drop; Create site with app picker; "
             "per-site backup browser and guarded per-site restore (also from "
@@ -49,7 +49,9 @@ FEATURES = ("Multi-tenant panel: sites list with per-site backup, DB backup, "
             "and rollback; stack + tools installer; rclone destinations in "
             "sspl-mt.conf; multi-tenant cron schedule; one-click panel and "
             "tools update from git; nginx domain → site routing with per-site "
-            "Domains… (add, remove, primary); AdGuard removed")
+            "Domains… (add, remove, primary); AdGuard removed; HTTPS: self-signed "
+            "default + Let's Encrypt per domain (Get certificate); per-site "
+            "IP + port (Add IP + port)")
 
 CONFIG_FILE = os.environ.get("SSPL_ADMIN_CONFIG", "/opt/sspl-admin/config.json")
 with open(CONFIG_FILE) as f:
@@ -82,6 +84,9 @@ MT_DEFAULTS = {
     "COMPOSE_PROJECT": "sspl-erp",
     "HTTP_PORT": "80",
     "FRONTEND_PORT": "18080",
+    "HTTPS_PORT": "443",
+    "SSL_DIR": "/etc/sspl-erp/ssl",
+    "LE_LIVE": "/etc/letsencrypt/live",
     "IMAGE": "ghcr.io/santhosh3279/sspl-erpnext",
     "IMAGE_TAG": "latest",
     "BACKUP_ROOT": "/opt/backups/frappe",
@@ -173,6 +178,82 @@ def site_domains(site):
     return sorted(d for d, s in domain_map().items() if s == site)
 
 
+# HTTPS — the same rules as lib/common.sh (https_on, domain_has_cert,
+# domain_url): self-signed default certificate for every domain, Let's
+# Encrypt certificates per domain (sites/domains.sh cert).
+def https_port():
+    p = str(mt_conf().get("HTTPS_PORT", "443")).strip()
+    return int(p) if p.isdigit() else None
+
+
+def default_cert_ok():
+    d = mt_conf()["SSL_DIR"]
+    return all(os.path.isfile(os.path.join(d, f)) and os.path.getsize(os.path.join(d, f)) > 0
+               for f in ("default.crt", "default.key"))
+
+
+def https_on():
+    """HTTPS is live: configured, default certificate there, and the
+    generated nginx config really has the TLS server (apply_proxy leaves it
+    out while another program holds HTTPS_PORT)."""
+    p = https_port()
+    if p is None or not default_cert_ok():
+        return False
+    try:
+        with open(PROXY_CONF) as f:
+            return f"listen {p} ssl" in f.read()
+    except OSError:
+        return False
+
+
+def domain_has_cert(domain):
+    d = os.path.join(mt_conf()["LE_LIVE"], domain)
+    return all(os.path.isfile(os.path.join(d, f)) and os.path.getsize(os.path.join(d, f)) > 0
+               for f in ("fullchain.pem", "privkey.pem"))
+
+
+def domain_url(domain):
+    if https_on() and domain_has_cert(domain):
+        p = https_port()
+        return f"https://{domain}" + ("" if p == 443 else f":{p}")
+    return site_url(domain)
+
+
+def port_map():
+    """{port: site} from the per-site port table (sites/domains.sh port)."""
+    out = {}
+    try:
+        with open(Path(erp_dir()) / "site-ports") as f:
+            for line in f:
+                parts = line.split()
+                if (len(parts) >= 2 and parts[0].isdigit() and 1 <= int(parts[0]) <= 65535
+                        and valid_site_name(parts[1])):
+                    out.setdefault(int(parts[0]), parts[1])
+    except OSError:
+        pass
+    return out
+
+
+def server_ip():
+    return (str(mt_conf().get("SERVER_IP", "")).strip() or CONFIG.get("server_ip")
+            or first_ip() or "127.0.0.1")
+
+
+def domain_info(site):
+    """The site's own name first, then its other domains, each with the URL
+    users type and whether it has a Let's Encrypt certificate; then the
+    site's own ports (http://<server-ip>:<port>)."""
+    names = [site] + [d for d in site_domains(site) if d != site]
+    out = [{"name": d, "url": domain_url(d), "cert": domain_has_cert(d),
+            "is_ip": bool(IPV4_RE.match(d))} for d in names]
+    ip = server_ip()
+    for p, s in sorted(port_map().items()):
+        if s == site:
+            out.append({"name": f"{ip}:{p}", "url": f"http://{ip}:{p}", "cert": False,
+                        "is_ip": True, "port": p})
+    return out
+
+
 def _tool(rel):
     return os.path.join(TOOLS_DIR, rel)
 
@@ -187,6 +268,7 @@ SITE_RE = re.compile(
 RESERVED_SITES = {"assets", "archived_sites", "logs", "apps.txt"}
 IPV4_RE = re.compile(r"^\d+\.\d+\.\d+\.\d+$")
 APP_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,60}$")
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9.\-]{1,190}\.[A-Za-z]{2,24}$")
 
 
 def valid_site_name(s):
@@ -218,6 +300,9 @@ ACTIONS = {
     "domain_add":     {"label": "Add domain",             "cmd": [_tool("sites/domains.sh"), "add"]},
     "domain_remove":  {"label": "Remove domain",          "cmd": [_tool("sites/domains.sh"), "remove"]},
     "domain_primary": {"label": "Set primary domain",     "cmd": [_tool("sites/domains.sh"), "primary"]},
+    "domain_cert":    {"label": "Get HTTPS certificate",  "cmd": [_tool("sites/domains.sh"), "cert"]},
+    "port_add":       {"label": "Add site port",          "cmd": [_tool("sites/domains.sh"), "port"]},
+    "port_remove":    {"label": "Remove site port",       "cmd": [_tool("sites/domains.sh"), "unport"]},
 }
 
 # Component installers, run from the repo checkout. Only wired up when
@@ -262,7 +347,7 @@ ERP_IMAGE_RE = re.compile(r"^[a-z0-9][a-z0-9._\-]*(?::[0-9]{1,5})?(?:/[a-z0-9][a
 
 # Ports this server already uses: SSH, OpenWA, this panel, and the stack's
 # own nginx behind the host nginx (FRONTEND_PORT, 127.0.0.1).
-RESERVED_PORTS = {22, 2785, 8090, int(MT_DEFAULTS["FRONTEND_PORT"])}
+RESERVED_PORTS = {22, 443, 2785, 8090, int(MT_DEFAULTS["FRONTEND_PORT"])}
 
 # OpenWA (WhatsApp API). Its compose file pins the container name, so the
 # container is how the panel finds it, wherever it was installed from.
@@ -726,6 +811,7 @@ def sites_overview():
                     "is_ip": bool(IPV4_RE.match(s)),
                     "host_name": cfg.get("host_name"),
                     "domains": [d for d in site_domains(s) if d != s],
+                    "domain_info": domain_info(s),
                     "maintenance": cfg.get("maintenance_mode", False),
                     "paused": cfg.get("pause_scheduler", False),
                     "latest_backup": latest, "backups": count,
@@ -757,7 +843,9 @@ def proxy_status():
     """The host nginx that routes domains to sites (install-proxy.sh)."""
     st = {"installed": bool(shutil.which("nginx")), "running": False,
           "configured": os.path.isfile(PROXY_CONF), "frontend_local": False,
-          "domains": len(domain_map())}
+          "domains": len(domain_map()), "https_port": https_port(),
+          "default_cert": default_cert_ok(), "https_live": https_on(),
+          "certs": sum(1 for d in domain_map() if domain_has_cert(d))}
     try:
         out = subprocess.run(["systemctl", "is-active", "nginx"], capture_output=True, text=True, timeout=5)
         st["running"] = out.stdout.strip() == "active"
@@ -1316,6 +1404,7 @@ def api_sites():
                     # Shared by every site: each uploads to <target>/sites/<host>/
                     "cloud": wired.split() if wired else [],
                     "http_port": http_port(),
+                    "https": https_on(),
                     "stack": os.path.isfile(compose_file()),
                     "tools": os.path.isfile(_tool("lib/common.sh"))})
 
@@ -1417,6 +1506,30 @@ def _new_site_request(data):
     return args, {"ADMIN_PASSWORD": pw}, None
 
 
+def _port_request(name, data):
+    """Arguments for 'domains.sh port|unport'. (args, label, None) or error."""
+    p = str(data.get("port", "")).strip()
+    if not (p.isdigit() and 1 <= int(p) <= 65535):
+        return None, None, "port must be a number between 1 and 65535"
+    port = int(p)
+    pmap = port_map()
+    if name == "port_remove":
+        if port not in pmap:
+            return None, None, f"port {port} is not assigned to a site"
+        return [str(port)], f"Remove port {port} from {pmap[port]}", None
+    site = str(data.get("site", "")).strip().lower()
+    if site not in list_sites():
+        return None, None, "no such site"
+    owner = pmap.get(port)
+    if owner and owner != site:
+        return None, None, f"port {port} already belongs to {owner}"
+    reserved = RESERVED_PORTS | {http_port()} | ({https_port()} if https_port() else set())
+    if port in reserved:
+        return None, None, f"port {port} is reserved (HTTP/HTTPS, SSH, OpenWA, this panel or the stack's nginx)"
+    args = [site, str(port)] + (["--primary"] if data.get("primary") else [])
+    return args, f"Port {port} for {site}", None
+
+
 def _domain_request(name, data):
     """Arguments for sites/domains.sh. Returns (args, label, None) or
     (None, None, error). Both names pass the tools' own site-name check."""
@@ -1425,6 +1538,17 @@ def _domain_request(name, data):
     if not valid_site_name(domain):
         return None, None, "domain must be a lowercase hostname or IPv4 address, e.g. erp.acme.com"
     dmap = domain_map()
+    if name == "domain_cert":
+        owner = dmap.get(domain)
+        if not owner:
+            return None, None, f"{domain} is not in the domain table — add it first"
+        if IPV4_RE.match(domain):
+            return None, None, "Let's Encrypt does not issue certificates for IP addresses"
+        if http_port() != 80:
+            return None, None, f"Let's Encrypt checks domains on port 80, but this stack's HTTP port is {http_port()}"
+        if not https_on():
+            return None, None, "HTTPS is not set up yet — run Repair nginx routing on the installation page"
+        return [domain], f"HTTPS certificate for {domain}", None
     if name == "domain_remove":
         owner = dmap.get(domain)
         if not owner:
@@ -1435,6 +1559,10 @@ def _domain_request(name, data):
     if site not in list_sites():
         return None, None, "no such site"
     if name == "domain_primary":
+        if domain.isdigit():
+            if port_map().get(int(domain)) != site:
+                return None, None, f"port {domain} does not point at {site}"
+            return [site, domain], f"Primary address of {site}: port {domain}", None
         if dmap.get(domain) != site:
             return None, None, f"{domain} does not point at {site}"
         return [site, domain], f"Primary domain of {site}: {domain}", None
@@ -1517,10 +1645,25 @@ def api_run(name):
         if not os.path.isfile(ACTIONS[name]["cmd"][0]):
             return jsonify({"error": "install the tools first"}), 400
 
-    elif name in ("domain_add", "domain_remove", "domain_primary"):
+    elif name in ("port_add", "port_remove"):
+        extra_args, label, err = _port_request(name, data)
+        if err:
+            return jsonify({"error": err}), 400
+        # The same address the Domains… dialog shows, for host_name.
+        extra_env = {"SERVER_IP": server_ip()}
+
+    elif name in ("domain_add", "domain_remove", "domain_primary", "domain_cert"):
         extra_args, label, err = _domain_request(name, data)
         if err:
             return jsonify({"error": err}), 400
+        if name in ("domain_primary", "domain_remove"):
+            extra_env = {"SERVER_IP": server_ip()}
+        if name == "domain_cert":
+            email = str(data.get("email", "")).strip()
+            if email:
+                if not EMAIL_RE.match(email):
+                    return jsonify({"error": "that e-mail address does not look right"}), 400
+                extra_env = {"LETSENCRYPT_EMAIL": email}
 
     elif name in INSTALL_ACTIONS:
         if not REPO_DIR:
@@ -2471,11 +2614,15 @@ async function refreshSetup(){
     rows += `</div>`;
     // Host nginx: routes each domain to its site
     const px = c.proxy;
-    const pxOk = px.installed && px.running && px.configured && px.frontend_local;
+    const pxOk = px.installed && px.running && px.configured && px.frontend_local
+      && (px.https_port === null || px.default_cert);
     rows += `<div class="setup-row"><div class="setup-h"><b>nginx domain routing</b> ${pill(pxOk)}`
       + (px.installed ? (px.running ? ' <span class="badge ok">running</span>'
                                     : ' <span class="badge miss">stopped</span>') : '')
-      + (px.configured ? ` <span class="badge">${px.domains} domain(s)</span>` : '') + `</div>`;
+      + (px.configured ? ` <span class="badge">${px.domains} domain(s)</span>` : '')
+      + (px.https_live ? ` <span class="badge ok">HTTPS :${px.https_port}</span>`
+         : (px.https_port !== null && px.default_cert ? ` <span class="badge miss" title="port ${px.https_port} is held by another program">HTTPS off</span>` : ''))
+      + (px.certs ? ` <span class="badge">${px.certs} Let's Encrypt</span>` : '') + `</div>`;
     if(erpDone && s.scripts.proxy && !pxOk){
       rows += `<div class="setup-form">
         <button class="primary setup-install" data-inst="install_proxy"
@@ -2483,7 +2630,12 @@ async function refreshSetup(){
     }
     rows += `<div class="note">nginx on the HTTP port maps each domain to its site, so one site can answer on
       several domains. Manage them per site with <b>Domains…</b> on the <a href="/">dashboard</a>. Each domain
-      must still resolve to this server: a DNS A record (public DNS or the router) or a hosts-file line per PC.</div>`;
+      must still resolve to this server: a DNS A record (public DNS or the router) or a hosts-file line per PC.
+      HTTPS works on every domain with a self-signed certificate (browsers warn); a public domain gets a trusted
+      Let's Encrypt one with <b>Get certificate</b> in its Domains… dialog.</div>`;
+    if(erpDone && px.installed && px.frontend_local && px.https_port !== null && !px.default_cert){
+      rows += `<div class="note" style="color:var(--warn)">HTTPS is not set up on this stack yet: <b>Repair nginx routing</b> adds it.</div>`;
+    }
     if(erpDone && px.installed && !px.frontend_local){
       rows += `<div class="note" style="color:var(--warn)">This stack was installed before nginx routing: its frontend
         still holds the public port. <b>Repair nginx routing</b> moves it.</div>`;
@@ -2838,8 +2990,16 @@ details{margin:2px 0} details summary{cursor:pointer}
     <input type="text" id="dm-new" placeholder="domain, e.g. erp.acme.com" size="28"
       autocomplete="off" autocapitalize="off" spellcheck="false">
     <label style="font-size:13px"><input type="checkbox" id="dm-primary"> primary</label>
-    <button class="primary" id="dm-add">Add</button>
+    <button class="primary" id="dm-add">Add domain</button>
   </div>
+  <div class="newsite" style="margin-top:8px">
+    <input type="number" id="dm-port" placeholder="port, e.g. 8001" min="1" max="65535" style="width:140px">
+    <label style="font-size:13px"><input type="checkbox" id="dm-port-primary"> primary</label>
+    <button class="primary" id="dm-port-add">Add IP + port</button>
+  </div>
+  <p style="font-size:12.5px;color:var(--muted)"><b>IP + port</b>: everything on
+    <code>http://&lt;server-ip&gt;:&lt;port&gt;</code> goes to this site, no DNS needed (HTTP only). Browsers share
+    login cookies across ports of one IP, so one browser stays logged in to only one IP + port site at a time.</p>
   <p style="font-size:12.5px;color:var(--muted)">nginx sends every request for these domains to this site.
     The <b>primary</b> domain becomes the site's <code>host_name</code>: the URL in emails and the one PDFs
     load images from. Adding or removing a domain briefly restarts the backend and workers (a few
@@ -2856,7 +3016,7 @@ details{margin:2px 0} details summary{cursor:pointer}
 </div></div>
 <script>
 """ + TERM_JS + r"""
-let SITES = [], IMAGE_APPS = [], SITE_INFO = {}, HTTP_PORT = 80;
+let SITES = [], IMAGE_APPS = [], SITE_INFO = {}, HTTP_PORT = 80, PROXY_HTTPS = false;
 
 async function runAction(act, body){
   try{
@@ -2881,8 +3041,9 @@ function siteRow(s){
   const skip = s.skip_apps.length
     ? `<div class="apps">never auto-installed: ${s.skip_apps.map(esc).join(', ')}</div>` : '';
   const n = esc(s.name);
-  const doms = (s.domains || []).length
-    ? `<div class="apps">also: ${s.domains.map(d => `<a href="http://${esc(d)}${HTTP_PORT===80?'':':'+HTTP_PORT}" target="_blank">${esc(d)}</a>`).join(', ')}</div>` : '';
+  const extra = (s.domain_info || []).slice(1);
+  const doms = extra.length
+    ? `<div class="apps">also: ${extra.map(d => `<a href="${esc(d.url)}" target="_blank">${esc(d.name)}</a>${d.cert ? ' 🔒' : ''}`).join(', ')}</div>` : '';
   return `<tr><td><a href="${esc(s.url)}" target="_blank"><b>${n}</b></a> ${state}${doms}${skip}</td>
     <td>${bk}</td>
     <td><div class="acts">
@@ -2904,6 +3065,7 @@ async function refreshSites(){
     SITES = j.sites.map(s => s.name);
     SITE_INFO = Object.fromEntries(j.sites.map(s => [s.name, s]));
     HTTP_PORT = j.http_port || 80;
+    PROXY_HTTPS = !!j.https;
     IMAGE_APPS = j.image_apps || [];
     $('#t-sites').textContent = SITES.length;
     let h;
@@ -3046,15 +3208,25 @@ function closeDomains(){ $('#dm-modal').classList.remove('on'); dmSite = null; }
 $('#dm-close').onclick = closeDomains;
 $('#dm-modal').onclick = e => { if (e.target === $('#dm-modal')) closeDomains(); };
 function renderDomains(){
-  const s = SITE_INFO[dmSite] || {name: dmSite, domains: []};
-  const port = HTTP_PORT === 80 ? '' : ':' + HTTP_PORT;
-  const primary = d => s.host_name === 'http://' + d + port;
-  const row = (d, own) => `<tr><td><a href="http://${esc(d)}${port}" target="_blank">${esc(d)}</a>
-      ${primary(d) ? '<span class="badge ok">primary</span>' : ''} ${own ? '<span class="badge">site name</span>' : ''}</td>
-    <td class="right">${primary(d) ? '' : `<button class="dm-pri" data-d="${esc(d)}">Make primary</button>`}
-      ${own ? '' : `<button class="danger dm-del" data-d="${esc(d)}">Remove</button>`}</td></tr>`;
+  const s = SITE_INFO[dmSite] || {name: dmSite, domain_info: [{name: dmSite, url: 'http://' + dmSite, cert: false}]};
+  const hn = (s.host_name || '').replace(/\/$/, '');
+  const hostOnly = hn.replace(/^https?:\/\//, '').replace(/[:\/].*$/, '');
+  const portUrls = (s.domain_info || []).filter(d => d.port).map(d => d.url);
+  const isPrimary = d => d.port ? hn === d.url : (hostOnly === d.name && !portUrls.includes(hn));
+  const canCert = d => !d.cert && !d.is_ip && HTTP_PORT === 80 && PROXY_HTTPS;
+  const row = (d, own) => `<tr><td><a href="${esc(d.url)}" target="_blank">${esc(d.name)}</a>
+      ${isPrimary(d) ? '<span class="badge ok">primary</span>' : ''}
+      ${d.port ? '<span class="badge" title="HTTP on this port goes to this site; no DNS needed">IP + port</span>' : ''}
+      ${own ? '<span class="badge">site name</span>' : ''}
+      ${d.port ? '' : d.cert ? '<span class="badge ok" title="Let\'s Encrypt, renewed automatically">HTTPS ✓</span>'
+               : (PROXY_HTTPS ? '<span class="badge" title="self-signed: browsers warn">HTTPS self-signed</span>' : '')}</td>
+    <td class="right">${isPrimary(d) ? '' : `<button class="dm-pri" data-d="${esc(d.port ? String(d.port) : d.name)}">Make primary</button>`}
+      ${canCert(d) ? `<button class="dm-cert" data-d="${esc(d.name)}" title="Let's Encrypt: public domains only">Get certificate</button>` : ''}
+      ${own ? '' : d.port ? `<button class="danger dm-unport" data-p="${d.port}">Remove</button>`
+                          : `<button class="danger dm-del" data-d="${esc(d.name)}">Remove</button>`}</td></tr>`;
+  const info = s.domain_info || [];
   $('#dm-body').innerHTML = `<table><thead><tr><th>Domain</th><th></th></tr></thead><tbody>`
-    + row(s.name, true) + (s.domains || []).map(d => row(d, false)).join('') + '</tbody></table>';
+    + info.map((d, i) => row(d, i === 0)).join('') + '</tbody></table>';
 }
 document.addEventListener('click', e => {
   const b = e.target.closest('.site-doms');
@@ -3062,8 +3234,25 @@ document.addEventListener('click', e => {
   dmSite = b.dataset.site;
   $('#dm-site').textContent = dmSite;
   $('#dm-new').value = ''; $('#dm-primary').checked = false;
+  $('#dm-port').value = ''; $('#dm-port-primary').checked = false;
   renderDomains();
   $('#dm-modal').classList.add('on');
+});
+$('#dm-port-add').onclick = async () => {
+  if (!dmSite) return;
+  const port = $('#dm-port').value.trim();
+  if (!port) return;
+  const site = dmSite;
+  closeDomains();
+  await runAction('port_add', {site, port, primary: $('#dm-port-primary').checked});
+};
+document.addEventListener('click', async e => {
+  const b = e.target.closest('.dm-unport');
+  if (!b || !dmSite) return;
+  const site = dmSite, port = b.dataset.p;
+  if (!confirm(`Remove port ${port} from ${site}?\n\nhttp://<server-ip>:${port} will stop working.`)) return;
+  closeDomains();
+  await runAction('port_remove', {port});
 });
 $('#dm-add').onclick = async () => {
   if (!dmSite) return;
@@ -3074,10 +3263,18 @@ $('#dm-add').onclick = async () => {
   await runAction('domain_add', {site, domain, primary: $('#dm-primary').checked});
 };
 document.addEventListener('click', async e => {
-  const del = e.target.closest('.dm-del'), pri = e.target.closest('.dm-pri');
-  if ((!del && !pri) || !dmSite) return;
-  const site = dmSite, domain = (del || pri).dataset.d;
+  const del = e.target.closest('.dm-del'), pri = e.target.closest('.dm-pri'), crt = e.target.closest('.dm-cert');
+  if ((!del && !pri && !crt) || !dmSite) return;
+  const site = dmSite, domain = (del || pri || crt).dataset.d;
   if (del && !confirm(`Remove ${domain} from ${site}?\n\nRequests for ${domain} will no longer reach ${site}.`)) return;
+  if (crt){
+    const email = prompt(`Get a Let's Encrypt certificate for ${domain}?\n\n${domain} must be a public domain whose DNS points at `
+      + `this server, with port 80 open from the internet. Renewal is automatic.\n\nE-mail for expiry notices (optional):`, '');
+    if (email === null) return;
+    closeDomains();
+    await runAction('domain_cert', {site, domain, email: email.trim()});
+    return;
+  }
   closeDomains();
   await runAction(del ? 'domain_remove' : 'domain_primary', {site, domain});
 });

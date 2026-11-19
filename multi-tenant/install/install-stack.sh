@@ -11,6 +11,7 @@
 #                   from the values below if it does not exist yet
 #   HTTP_PORT       public HTTP port, where the host nginx listens (default 80)
 #   FRONTEND_PORT   the stack's own nginx, on 127.0.0.1 only (default 18080)
+#   HTTPS_PORT      host nginx HTTPS port (default 443; "" = HTTP only)
 #   ERP_DIR, COMPOSE_PROJECT, IMAGE, IMAGE_TAG, BACKUP_ROOT — see the config
 #
 # Routing: a host nginx on HTTP_PORT maps each domain to its site and passes
@@ -39,6 +40,11 @@ HTTP_PORT=${HTTP_PORT:-80}
 # The stack's own nginx, on 127.0.0.1 only; the host nginx (HTTP_PORT)
 # proxies to it. Domains → sites: \$ERP_DIR/site-domains (sites/domains.sh)
 FRONTEND_PORT=${FRONTEND_PORT:-18080}
+# HTTPS on the host nginx. HTTPS_PORT="" = HTTP only. Domains with a Let's
+# Encrypt certificate (sites/domains.sh cert) are redirected to HTTPS.
+HTTPS_PORT=${HTTPS_PORT-443}
+HTTPS_REDIRECT=yes
+LETSENCRYPT_EMAIL=""
 IMAGE=${IMAGE:-ghcr.io/santhosh3279/sspl-erpnext}
 IMAGE_TAG=${IMAGE_TAG:-latest}
 
@@ -76,6 +82,9 @@ source "$(cd "$(dirname "$0")/.." && pwd)/lib/common.sh"
 if [ ! -f "$COMPOSE_FILE" ]; then
     if ss -ltnH "sport = :$HTTP_PORT" 2>/dev/null | grep -q .; then
         err "Port $HTTP_PORT is already in use: $(ss -ltnpH "sport = :$HTTP_PORT" | head -1). Pick another HTTP port."
+    fi
+    if [ -n "$HTTPS_PORT" ] && ss -ltnH "sport = :$HTTPS_PORT" 2>/dev/null | grep -q .; then
+        warn "Port $HTTPS_PORT is already in use — the stack installs with HTTP only. Free it, then run install/install-proxy.sh"
     fi
     if ss -ltnH "sport = :$FRONTEND_PORT" 2>/dev/null | grep -q .; then
         err "Port $FRONTEND_PORT (FRONTEND_PORT, the stack's internal nginx) is in use. Set FRONTEND_PORT in $SSPL_CONF."

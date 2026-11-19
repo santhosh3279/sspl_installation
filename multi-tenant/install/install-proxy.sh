@@ -2,8 +2,12 @@
 # Install the host nginx that routes each domain to its tenant site, and move
 # the stack's own nginx (the 'frontend' container) off the public port.
 #
-#   browser ──▶ host nginx :HTTP_PORT ──(Host: <site>)──▶ 127.0.0.1:FRONTEND_PORT
-#               map: domain → site                         frontend → backend
+#   browser ──▶ host nginx :HTTP_PORT / :HTTPS_PORT ──(Host: <site>)──▶ 127.0.0.1:FRONTEND_PORT
+#               map: domain → site                                      frontend → backend
+#
+# HTTPS: a self-signed default certificate is created here, so every domain
+# answers on HTTPS_PORT at once (browsers warn). Public domains get a trusted
+# certificate with: sites/domains.sh cert <domain>
 #
 # install-stack.sh runs this. Run it by hand (as root) on a stack installed
 # before the proxy existed: it publishes the frontend on 127.0.0.1 only,
@@ -27,9 +31,23 @@ if ! grep -q '^FRONTEND_PORT=' "$SSPL_CONF"; then
         "$DOMAINS_FILE" "$FRONTEND_PORT" >> "$SSPL_CONF"
     ok "Added FRONTEND_PORT=$FRONTEND_PORT to $SSPL_CONF"
 fi
+if ! grep -q '^HTTPS_PORT=' "$SSPL_CONF"; then
+    cat >> "$SSPL_CONF" <<EOF
+
+# HTTPS on the host nginx. HTTPS_PORT="" = HTTP only. Domains with a Let's
+# Encrypt certificate (sites/domains.sh cert) are redirected to HTTPS.
+HTTPS_PORT=$HTTPS_PORT
+HTTPS_REDIRECT=$HTTPS_REDIRECT
+LETSENCRYPT_EMAIL="$LETSENCRYPT_EMAIL"
+EOF
+    ok "Added HTTPS_PORT=$HTTPS_PORT to $SSPL_CONF"
+fi
 [[ "$HTTP_PORT" =~ ^[0-9]+$ && "$FRONTEND_PORT" =~ ^[0-9]+$ ]] || err "HTTP_PORT and FRONTEND_PORT must be numbers"
+[ -z "$HTTPS_PORT" ] || [[ "$HTTPS_PORT" =~ ^[0-9]+$ ]] || err "HTTPS_PORT must be a number or empty"
 [ "$HTTP_PORT" != "$FRONTEND_PORT" ] || err "HTTP_PORT and FRONTEND_PORT are both $HTTP_PORT — change FRONTEND_PORT in $SSPL_CONF"
-ok "Public port $HTTP_PORT (host nginx) → 127.0.0.1:$FRONTEND_PORT (stack frontend)"
+[ "$HTTPS_PORT" != "$HTTP_PORT" ] && [ "$HTTPS_PORT" != "$FRONTEND_PORT" ] \
+    || err "HTTPS_PORT ($HTTPS_PORT) clashes with HTTP_PORT or FRONTEND_PORT"
+ok "Public port $HTTP_PORT${HTTPS_PORT:+ + $HTTPS_PORT (HTTPS)} (host nginx) → 127.0.0.1:$FRONTEND_PORT (stack frontend)"
 
 # ─────────────────────────────────────────────── 2. nginx (installed, not started yet)
 step "Host nginx"
@@ -82,8 +100,34 @@ if [ -f "$COMPOSE_FILE" ]; then
 fi
 ok "Frontend published on $WANT"
 
-if ss -ltnH "sport = :$HTTP_PORT" 2>/dev/null | grep -q . && ! systemctl is-active --quiet nginx; then
+# Owners other than the host nginx (which may already be running here).
+if port_busy_by_other "$HTTP_PORT"; then
     err "Port $HTTP_PORT is in use by something else: $(ss -ltnpH "sport = :$HTTP_PORT" | head -1)"
+fi
+HTTPS_FREE=yes
+if [ -n "$HTTPS_PORT" ] && port_busy_by_other "$HTTPS_PORT"; then
+    warn "Port $HTTPS_PORT is in use by something else — HTTPS stays off: $(ss -ltnpH "sport = :$HTTPS_PORT" | head -1)"
+    warn "Free it (or set HTTPS_PORT in $SSPL_CONF) and re-run this script."
+    HTTPS_FREE=no
+fi
+
+# ─────────────────────────────────────────────── HTTPS default certificate
+if [ -n "$HTTPS_PORT" ] && [ "$HTTPS_FREE" = yes ]; then
+    step "HTTPS default certificate"
+    mkdir -p "$SSL_DIR" "$ACME_WEBROOT"
+    chmod 700 "$SSL_DIR"
+    if default_cert_ok; then
+        ok "Already there: $SSL_DIR/default.crt"
+    else
+        # Self-signed, 10 years: serves every domain until it has a Let's
+        # Encrypt certificate. Browsers warn; traffic is still encrypted.
+        ( umask 077
+          openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+              -subj "/CN=$(hostname -f 2>/dev/null || hostname)" \
+              -keyout "$SSL_DIR/default.key" -out "$SSL_DIR/default.crt" >/dev/null 2>&1 ) \
+            || err "openssl could not create the default certificate"
+        ok "Self-signed default certificate: $SSL_DIR/default.crt"
+    fi
 fi
 
 # ─────────────────────────────────────────────── 4. domain table
@@ -105,12 +149,27 @@ ok "nginx routing on port $HTTP_PORT"
 # Docker-published ports bypass ufw; the host nginx does not. Without this an
 # active ufw would refuse every tenant (and the containers' own PDF fetches).
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
-    ufw allow "$HTTP_PORT/tcp" >/dev/null && ok "ufw: allowed $HTTP_PORT/tcp"
+    for p in $HTTP_PORT $HTTPS_PORT; do
+        ufw allow "$p/tcp" >/dev/null && ok "ufw: allowed $p/tcp"
+    done
+fi
+
+# Realtime: the websocket server checks each browser connection by calling
+# Frappe back. Without webserver_host it calls the browser's own URL — a
+# tenant domain the container cannot resolve, maybe behind a self-signed
+# certificate. Point it at the backend directly; the site travels in the
+# X-Frappe-Site-Name header.
+if [ -f "$COMPOSE_FILE" ] && dc exec -T backend true >/dev/null 2>&1; then
+    dc exec -T backend bench set-config -g webserver_host http://backend >/dev/null
+    dc exec -T backend bench set-config -gp webserver_port 8000 >/dev/null
+    dc restart websocket >/dev/null 2>&1 || warn "could not restart websocket"
+    ok "Realtime (websocket) authenticates against the backend directly"
 fi
 # The containers already resolve every site name (compose.sspl-tenants.yaml);
 # only extra domains, added later with domains.sh, change that list.
 
 echo ""
-echo "✅ Host nginx routes domains to sites on port $HTTP_PORT."
+echo "✅ Host nginx routes domains to sites on port $HTTP_PORT${HTTPS_PORT:+ and $HTTPS_PORT (HTTPS, self-signed until a domain gets a certificate)}."
 echo "   Add a domain:  $TOOLS_DIR/sites/domains.sh add <site> <domain> [--primary]"
+echo "   Trusted HTTPS: $TOOLS_DIR/sites/domains.sh cert <domain>   (public domains, port 80 open)"
 echo "   Each domain must resolve to this server (public DNS, router, or hosts file)."

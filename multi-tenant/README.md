@@ -134,14 +134,76 @@ sudo $T/sites/domains.sh remove acme.lan
   every site.
 - `new-site.sh` adds the site's own name. `drop-site.sh` removes every domain
   of the site.
-- HTTPS is not set up. Put certificates in front of the host nginx, or add a
-  `listen 443 ssl` server to it by hand, outside the generated file.
 
-**Stacks installed before nginx routing** still publish the frontend on the
-public port. Run `sudo SSPL_CONF=/opt/sspl-erp/sspl-mt.conf
+### IP + port per site
+
+A site can also get its own port on the server's IP address, with no DNS at
+all. nginx listens on that port and sends everything that arrives there to
+that one site:
+
+```bash
+sudo $T/sites/domains.sh port acme.erp.lan 8001 --primary   # http://<server-ip>:8001
+sudo $T/sites/domains.sh port beta.erp.lan 8002
+sudo $T/sites/domains.sh primary beta.erp.lan 8002           # a number = a port
+sudo $T/sites/domains.sh unport 8002
+```
+
+The panel does the same with **Add IP + port** in the site's Domains… dialog.
+
+- One site can have domains *and* ports, and each works on its own:
+  `erp.acme.com` on 80/443 and `http://192.168.1.50:8001` both reach
+  `acme.erp.lan`.
+- The table is `/opt/sspl-erp/site-ports` (`<port> <site>` per line). Ports
+  used by HTTP/HTTPS, the stack's nginx, SSH, OpenWA or the panel are refused,
+  and so is a port another program holds. If nginx can't bind a port, the
+  change is undone. With ufw active, the port is opened (and closed again on
+  `unport`).
+- `--primary` sets `host_name` to `http://<server-ip>:<port>`. The IP is
+  `SERVER_IP` in `sspl-mt.conf`, or the first address from `hostname -I`.
+  Set `SERVER_IP` if that isn't the address users type.
+- Ports are HTTP only.
+- **Cookies:** browsers keep cookies per IP address, not per port. If one
+  browser logs in to two sites on the same IP (`:8001` and `:8002`), logging
+  in to one logs it out of the other. Give each site a domain name, or use a
+  separate browser or profile per site.
+
+### HTTPS
+
+The host nginx also listens on `HTTPS_PORT` (default 443; set it to `""` in
+`sspl-mt.conf` for HTTP only).
+
+- **Every domain** works on HTTPS at once, with a self-signed default
+  certificate (`/etc/sspl-erp/ssl/default.crt`, made by `install-proxy.sh`).
+  Browsers warn about it, but the traffic is encrypted. That is what LAN names
+  like `acme.erp.lan` get.
+- **Public domains** get a trusted Let's Encrypt certificate:
+
+  ```bash
+  sudo $T/sites/domains.sh cert erp.acme.com
+  ```
+
+  You can also use **Get certificate** in the site's Domains… dialog. The
+  domain must be in the table, its DNS must point at this server's public IP,
+  and port 80 must be open from the internet (`HTTP_PORT` must be 80). certbot
+  uses the webroot method (`/var/www/sspl-acme`) and never edits the nginx
+  config. `certbot.timer` renews the certificate and reloads nginx.
+  `LETSENCRYPT_EMAIL` in `sspl-mt.conf` gets expiry notices.
+- After that, `http://` for that domain redirects to HTTPS
+  (`HTTPS_REDIRECT=yes`). If the domain is a site's primary, its `host_name`
+  becomes `https://…`. Removing the domain, or dropping its site, deletes the
+  certificate.
+- Realtime: `install-proxy.sh` sets `webserver_host=http://backend` and
+  `webserver_port=8000` in `common_site_config.json`. The websocket server then
+  checks browser sessions against the backend directly, so it doesn't need to
+  resolve tenant domains or trust the self-signed certificate.
+
+**Stacks installed before nginx routing, or before HTTPS,** need one
+`install-proxy.sh` run. Before routing, the frontend still holds the public
+port. Before HTTPS, there's no default certificate. Run `sudo SSPL_CONF=/opt/sspl-erp/sspl-mt.conf
 install/install-proxy.sh` from the checkout, or **Repair nginx routing** on
 the panel's installation suite. It moves the frontend to `127.0.0.1`, adds
-every existing site to the domain table, and starts nginx. Every site is down
+every existing site to the domain table, creates the default certificate, and
+starts nginx. It is safe to re-run. Every site is down
 for a few seconds while the frontend moves.
 
 ## Backups
