@@ -1,7 +1,7 @@
 #!/bin/bash
 # SSPL ERP multi-tenant — one-time installer for a FRESH server.
 #
-#   git clone -b multi-tenant https://github.com/santhosh3279/sspl_installation.git
+#   git clone -b Multi-Site https://github.com/santhosh3279/sspl_installation.git
 #   cd sspl_installation/multi-tenant/install
 #   ./install.sh
 #

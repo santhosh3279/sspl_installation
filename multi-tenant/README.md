@@ -4,13 +4,12 @@ One server, one Docker stack, one image, **many ERPNext sites**: one site per
 tenant, each with its own database, files, users and apps. nginx picks the
 site from the hostname in the browser's address bar.
 
-> This is the `multi-tenant` branch. The single-site tooling on `main`
+> This is the `Multi-Site` branch. The single-site tooling on `main`
 > (`Admin Panel/`, `Backup/`, `Production Installation/`) is untouched and
 > keeps serving existing servers. Use this folder on **fresh servers only**.
 >
-> **Not yet multi-tenant:** the web admin panel. Its current version assumes
-> one site and the old backup paths. Do not install it on a server set up
-> from this folder. It is the next phase.
+> The web admin panel for these servers is **`multi-tenant/admin-panel/`**,
+> not `Admin Panel/` (that one assumes one site and the v2 script layout).
 
 ## How it works
 
@@ -33,10 +32,40 @@ site from the hostname in the browser's address bar.
 - **One image** means an update upgrades every tenant at once. If a tenant
   needs different app *versions*, it needs its own stack.
 
-## Install (fresh server)
+## Install from the web panel (fresh server)
 
 ```bash
-git clone -b multi-tenant https://github.com/santhosh3279/sspl_installation.git
+git clone -b Multi-Site https://github.com/santhosh3279/sspl_installation.git
+cd sspl_installation/multi-tenant/admin-panel
+./setup_admin_panel.sh
+```
+
+Then open `https://<server-ip>:8090`:
+
+1. **ERP Next Installation suite → Install stack**: port, image, MariaDB root
+   password, and whether to schedule backups. Runs `install/panel-install.sh`
+   (`install-stack.sh` then `install-tools.sh`). No site is created.
+2. Optional, same page: rclone (cloud backups for every site, stored as
+   `RCLONE_REMOTE` in `sspl-mt.conf`), AdGuard Home (DNS rewrites for the
+   tenant hostnames), OpenWA.
+3. **Dashboard → Create site**, once per tenant: hostname, Administrator
+   password, which apps.
+
+The dashboard lists every site with per-site Backup, DB backup, Migrate,
+Apps… (uninstall) and Drop; all-site backup, verify, migrate, **Update all
+sites**, image download and rollback; a per-site backup browser with Restore
+(into the same site, another site with `--allow-other-site`, or from an upload
+folder); uploads; and license files per site. Restore and Drop ask for the
+site name and the panel password, then run the tool with `--yes`.
+**Update panel & tools** (top bar) runs `admin-panel/update_panel.sh`: `git
+pull`, `install-tools.sh` (cron and `sspl-mt.conf` untouched), redeploy the
+panel. Changing the HTTP port of a running multi-tenant stack is not in the
+panel yet.
+
+## Install from the terminal (fresh server)
+
+```bash
+git clone -b Multi-Site https://github.com/santhosh3279/sspl_installation.git
 cd sspl_installation/multi-tenant/install
 ./install.sh
 ```
@@ -142,7 +171,9 @@ restore those sites from the backups the update took.
 
 ```
 multi-tenant/
-  install/   install.sh (fresh server), install-stack.sh, install-tools.sh
+  admin-panel/  the web panel: app.py, setup_admin_panel.sh, update_panel.sh
+  install/   install.sh (fresh server), panel-install.sh (the panel's),
+             install-stack.sh, install-tools.sh
   lib/       common.sh — config, site validation, maintenance helpers, rclone
   sites/     new-site, drop-site, list-sites, apply-hosts
   backup/    backup, db-backup, verify, restore, restore-with-backup, migrate,
