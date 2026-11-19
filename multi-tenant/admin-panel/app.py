@@ -41,14 +41,15 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-11-19.mt1"
+PANEL_VERSION = "2026-11-19.mt2"
 FEATURES = ("Multi-tenant panel: sites list with per-site backup, DB backup, "
             "migrate, uninstall app and drop; Create site with app picker; "
             "per-site backup browser and guarded per-site restore (also from "
             "uploads and other sites); all-site backup, verify, migrate, update "
             "and rollback; stack + tools installer; rclone destinations in "
             "sspl-mt.conf; multi-tenant cron schedule; one-click panel and "
-            "tools update from git")
+            "tools update from git; nginx domain → site routing with per-site "
+            "Domains… (add, remove, primary); AdGuard removed")
 
 CONFIG_FILE = os.environ.get("SSPL_ADMIN_CONFIG", "/opt/sspl-admin/config.json")
 with open(CONFIG_FILE) as f:
@@ -80,6 +81,7 @@ MT_DEFAULTS = {
     "ERP_DIR": "/opt/sspl-erp",
     "COMPOSE_PROJECT": "sspl-erp",
     "HTTP_PORT": "80",
+    "FRONTEND_PORT": "18080",
     "IMAGE": "ghcr.io/santhosh3279/sspl-erpnext",
     "IMAGE_TAG": "latest",
     "BACKUP_ROOT": "/opt/backups/frappe",
@@ -142,6 +144,35 @@ def site_url(site):
     return f"http://{site}" + ("" if port == 80 else f":{port}")
 
 
+# The host nginx routes each domain to its site from this table, one
+# "<domain> <site>" per line (lib/common.sh domain_lines; sites/domains.sh
+# edits it). Read directly: it is a plain 0644 file, no container needed.
+PROXY_CONF = "/etc/nginx/conf.d/sspl-erp.conf"
+
+
+def domains_file():
+    return Path(erp_dir()) / "site-domains"
+
+
+def domain_map():
+    """{domain: site} for every valid line of the domain table."""
+    out = {}
+    try:
+        with open(domains_file()) as f:
+            for line in f:
+                parts = line.split()
+                if (len(parts) >= 2 and not parts[0].startswith("#")
+                        and valid_site_name(parts[0]) and valid_site_name(parts[1])):
+                    out.setdefault(parts[0], parts[1])
+    except OSError:
+        pass
+    return out
+
+
+def site_domains(site):
+    return sorted(d for d, s in domain_map().items() if s == site)
+
+
 def _tool(rel):
     return os.path.join(TOOLS_DIR, rel)
 
@@ -184,6 +215,9 @@ ACTIONS = {
     "new_site":       {"label": "Create site",            "cmd": [_tool("sites/new-site.sh")]},
     "drop_site":      {"label": "Drop site",              "cmd": [_tool("sites/drop-site.sh")]},
     "apply_hosts":    {"label": "Apply tenant hostnames", "cmd": [_tool("sites/apply-hosts.sh")]},
+    "domain_add":     {"label": "Add domain",             "cmd": [_tool("sites/domains.sh"), "add"]},
+    "domain_remove":  {"label": "Remove domain",          "cmd": [_tool("sites/domains.sh"), "remove"]},
+    "domain_primary": {"label": "Set primary domain",     "cmd": [_tool("sites/domains.sh"), "primary"]},
 }
 
 # Component installers, run from the repo checkout. Only wired up when
@@ -191,7 +225,7 @@ ACTIONS = {
 STACK_SETUP_SCRIPT = _repo("multi-tenant/install/panel-install.sh")
 TOOLS_SETUP_SCRIPT = _repo("multi-tenant/install/install-tools.sh")
 RCLONE_SETUP_SCRIPT = _repo("Backup/frappe_backup_system/install_rclone.sh")
-ADGUARD_SETUP_SCRIPT = _repo("Production Installation/install_adguard.sh")
+PROXY_SETUP_SCRIPT = _repo("multi-tenant/install/install-proxy.sh")
 OPENWA_SETUP_SCRIPT = _repo("Production Installation/install_openwa.sh")
 RCLONE_GUIDE = _repo("Backup/Rclone_Configuration_Guide.docx")
 # The multi-tenant updater. NOT the repo-root update_panel.sh/update_tooling.sh:
@@ -204,7 +238,9 @@ INSTALL_ACTIONS = {
     "install_stack":   {"label": "Install ERPNext stack + tools", "cmd": ["bash", STACK_SETUP_SCRIPT or ""]},
     "install_tools":   {"label": "Install / refresh tools",       "cmd": ["bash", TOOLS_SETUP_SCRIPT or ""]},
     "install_rclone":  {"label": "Install rclone",                "cmd": ["bash", RCLONE_SETUP_SCRIPT or ""]},
-    "install_adguard": {"label": "Install AdGuard Home",          "cmd": ["bash", ADGUARD_SETUP_SCRIPT or ""]},
+    # Host nginx: domain → site routing. Also moves an older stack's frontend
+    # off the public port.
+    "install_proxy":   {"label": "Install / repair nginx proxy",  "cmd": ["bash", PROXY_SETUP_SCRIPT or ""]},
     # OpenWA WhatsApp API gateway in Docker. Its admin API key never goes
     # through the job log: /api/openwa/key reads it from the container.
     "install_openwa":  {"label": "Install OpenWA",                "cmd": ["bash", OPENWA_SETUP_SCRIPT or ""]},
@@ -224,9 +260,9 @@ RCLONE_PATH_RE = re.compile(r"^[A-Za-z0-9_.\-][A-Za-z0-9_.\-/]{0,120}$")
 DEFAULT_ERP_IMAGE = MT_DEFAULTS["IMAGE"]
 ERP_IMAGE_RE = re.compile(r"^[a-z0-9][a-z0-9._\-]*(?::[0-9]{1,5})?(?:/[a-z0-9][a-z0-9._\-]*)+$")
 
-# Ports this server already uses: SSH, AdGuard DNS + dashboard, OpenWA, this
-# panel.
-RESERVED_PORTS = {22, 53, 2785, 3000, 8090}
+# Ports this server already uses: SSH, OpenWA, this panel, and the stack's
+# own nginx behind the host nginx (FRONTEND_PORT, 127.0.0.1).
+RESERVED_PORTS = {22, 2785, 8090, int(MT_DEFAULTS["FRONTEND_PORT"])}
 
 # OpenWA (WhatsApp API). Its compose file pins the container name, so the
 # container is how the panel finds it, wherever it was installed from.
@@ -686,8 +722,10 @@ def sites_overview():
     for s in list_sites():
         latest, count = latest_full_backup(s)
         cfg = site_public_config(s)
-        out.append({"name": s, "url": site_url(s), "is_ip": bool(IPV4_RE.match(s)),
+        out.append({"name": s, "url": cfg.get("host_name") or site_url(s),
+                    "is_ip": bool(IPV4_RE.match(s)),
                     "host_name": cfg.get("host_name"),
+                    "domains": [d for d in site_domains(s) if d != s],
                     "maintenance": cfg.get("maintenance_mode", False),
                     "paused": cfg.get("pause_scheduler", False),
                     "latest_backup": latest, "backups": count,
@@ -715,12 +753,23 @@ def first_ip():
         return ""
 
 
-def is_adguard_running():
+def proxy_status():
+    """The host nginx that routes domains to sites (install-proxy.sh)."""
+    st = {"installed": bool(shutil.which("nginx")), "running": False,
+          "configured": os.path.isfile(PROXY_CONF), "frontend_local": False,
+          "domains": len(domain_map())}
     try:
-        out = subprocess.run(["systemctl", "is-active", "AdGuardHome"], capture_output=True, text=True, timeout=5)
-        return out.stdout.strip() == "active"
+        out = subprocess.run(["systemctl", "is-active", "nginx"], capture_output=True, text=True, timeout=5)
+        st["running"] = out.stdout.strip() == "active"
     except (OSError, subprocess.SubprocessError):
-        return False
+        pass
+    # A stack from before the proxy publishes its frontend on 0.0.0.0.
+    try:
+        with open(os.path.join(erp_dir(), "frappe_docker", ".env")) as f:
+            st["frontend_local"] = any(l.startswith("HTTP_PUBLISH_PORT=127.0.0.1:") for l in f)
+    except OSError:
+        pass
+    return st
 
 
 def openwa_status():
@@ -920,15 +969,12 @@ def setup_status():
             "tools": {"installed": os.path.isfile(_tool("lib/common.sh")),
                       "conf": os.path.isfile(MT_CONF)},
             "rclone":  rclone_status(),
-            "adguard": {
-                "installed": os.path.isfile("/opt/AdGuardHome/AdGuardHome"),
-                "running": is_adguard_running(),
-            },
+            "proxy": proxy_status(),
             "openwa": openwa_status(),
         },
         "scripts": {
             "rclone": _script_ok(RCLONE_SETUP_SCRIPT),
-            "adguard": _script_ok(ADGUARD_SETUP_SCRIPT),
+            "proxy": _script_ok(PROXY_SETUP_SCRIPT),
             "openwa": _script_ok(OPENWA_SETUP_SCRIPT),
             "update_panel": _script_ok(UPDATE_PANEL_SCRIPT),
         },
@@ -1347,6 +1393,9 @@ def _new_site_request(data):
                             "e.g. acme.erp.lan")
     if host in list_sites():
         return None, None, f"{host} already exists"
+    owner = domain_map().get(host)
+    if owner:
+        return None, None, f"{host} is already a domain of {owner} — remove it there first"
     if len(pw) < 4:
         return None, None, "set an Administrator password for the new site"
     apps = data.get("apps")
@@ -1366,6 +1415,36 @@ def _new_site_request(data):
         if set(apps) != set(avail):
             args += ["--apps", ",".join(apps)]
     return args, {"ADMIN_PASSWORD": pw}, None
+
+
+def _domain_request(name, data):
+    """Arguments for sites/domains.sh. Returns (args, label, None) or
+    (None, None, error). Both names pass the tools' own site-name check."""
+    site = str(data.get("site", "")).strip().lower()
+    domain = str(data.get("domain", "")).strip().lower()
+    if not valid_site_name(domain):
+        return None, None, "domain must be a lowercase hostname or IPv4 address, e.g. erp.acme.com"
+    dmap = domain_map()
+    if name == "domain_remove":
+        owner = dmap.get(domain)
+        if not owner:
+            return None, None, f"{domain} is not in the domain table"
+        if owner == domain:
+            return None, None, f"{domain} is the site's own name — drop the site to remove it"
+        return [domain], f"Remove domain {domain} from {owner}", None
+    if site not in list_sites():
+        return None, None, "no such site"
+    if name == "domain_primary":
+        if dmap.get(domain) != site:
+            return None, None, f"{domain} does not point at {site}"
+        return [site, domain], f"Primary domain of {site}: {domain}", None
+    owner = dmap.get(domain)
+    if owner and owner != site:
+        return None, None, f"{domain} already points at {owner}"
+    if domain != site and domain in list_sites():
+        return None, None, f"{domain} is the name of another site"
+    args = [site, domain] + (["--primary"] if data.get("primary") else [])
+    return args, f"Add domain {domain} to {site}", None
 
 
 @app.route("/api/run/<name>", methods=["POST"])
@@ -1438,6 +1517,11 @@ def api_run(name):
         if not os.path.isfile(ACTIONS[name]["cmd"][0]):
             return jsonify({"error": "install the tools first"}), 400
 
+    elif name in ("domain_add", "domain_remove", "domain_primary"):
+        extra_args, label, err = _domain_request(name, data)
+        if err:
+            return jsonify({"error": err}), 400
+
     elif name in INSTALL_ACTIONS:
         if not REPO_DIR:
             return jsonify({"error": "repo_dir is not configured on this server"}), 400
@@ -1482,7 +1566,7 @@ def _install_env(name, data):
         if not (port.isdigit() and 1 <= int(port) <= 65535):
             return None, None, "HTTP port must be a number between 1 and 65535"
         if int(port) in RESERVED_PORTS:
-            return None, None, f"port {port} is already used on this server (SSH, AdGuard, OpenWA or this panel)"
+            return None, None, f"port {port} is already used on this server (SSH, OpenWA, this panel or the stack's internal nginx)"
         if len(image) > 200 or not ERP_IMAGE_RE.match(image):
             return None, None, ("Docker image must look like registry/owner/name "
                                 "(lowercase, no tag — e.g. ghcr.io/santhosh3279/sspl-erpnext)")
@@ -1503,7 +1587,7 @@ def _install_env(name, data):
     if name == "install_tools":
         return {}, ["--cron" if data.get("schedule_cron", True) else "--no-cron"], None
 
-    if name in ("install_rclone", "install_adguard"):
+    if name in ("install_rclone", "install_proxy"):
         return {}, None, None
     if name == "install_openwa":
         return {"OPENWA_DIR": OPENWA_DIR, "OPENWA_PORT": str(OPENWA_PORT)}, None, None
@@ -2385,19 +2469,24 @@ async function refreshSetup(){
           data-confirm="Copy the checkout's multi-tenant tools to ${esc(s.tools_dir)}? Settings and cron are not changed.">${toolsOk ? 'Refresh tools from checkout' : 'Install tools'}</button></div>`;
     }
     rows += `</div>`;
-    // AdGuard Home DNS — handy here: every tenant hostname needs a DNS rewrite
-    rows += `<div class="setup-row"><div class="setup-h"><b>AdGuard Home DNS</b> ${pill(c.adguard.installed)}`
-      + (c.adguard.installed && c.adguard.running ? ' <span class="badge ok">running</span>' : '') + `</div>`;
-    if(!c.adguard.installed){
-      rows += s.scripts.adguard ? `<div class="setup-form">
-        <button class="primary setup-install" data-inst="install_adguard"
-          data-confirm="Install AdGuard Home DNS service now? This will configure systemd-resolved to disable port 53 conflicts and install AdGuard Home.">Install AdGuard Home</button></div>` : '';
-      rows += `<div class="note">Every site's hostname must resolve to this server. AdGuard Home can do
-        that for the whole LAN with one DNS rewrite per site.</div>`;
-    } else {
-      const ag = 'http://' + (s.server_ip || location.hostname) + ':3000';
-      rows += `<div class="note">Add a DNS rewrite per site (<i>Filters → DNS rewrites</i>: site → this server's IP):
-        <a href="${esc(ag)}" target="_blank">${esc(ag)}</a></div>`;
+    // Host nginx: routes each domain to its site
+    const px = c.proxy;
+    const pxOk = px.installed && px.running && px.configured && px.frontend_local;
+    rows += `<div class="setup-row"><div class="setup-h"><b>nginx domain routing</b> ${pill(pxOk)}`
+      + (px.installed ? (px.running ? ' <span class="badge ok">running</span>'
+                                    : ' <span class="badge miss">stopped</span>') : '')
+      + (px.configured ? ` <span class="badge">${px.domains} domain(s)</span>` : '') + `</div>`;
+    if(erpDone && s.scripts.proxy && !pxOk){
+      rows += `<div class="setup-form">
+        <button class="primary setup-install" data-inst="install_proxy"
+          data-confirm="Install nginx on port ${esc(String(c.erp.http_port||80))} and route every site's domain through it? The stack's own nginx moves to 127.0.0.1 — every site is down for a few seconds.">${px.installed ? 'Repair nginx routing' : 'Install nginx routing'}</button></div>`;
+    }
+    rows += `<div class="note">nginx on the HTTP port maps each domain to its site, so one site can answer on
+      several domains. Manage them per site with <b>Domains…</b> on the <a href="/">dashboard</a>. Each domain
+      must still resolve to this server: a DNS A record (public DNS or the router) or a hosts-file line per PC.</div>`;
+    if(erpDone && px.installed && !px.frontend_local){
+      rows += `<div class="note" style="color:var(--warn)">This stack was installed before nginx routing: its frontend
+        still holds the public port. <b>Repair nginx routing</b> moves it.</div>`;
     }
     rows += `</div>`;
     // OpenWA WhatsApp API (Docker)
@@ -2598,7 +2687,8 @@ details{margin:2px 0} details summary{cursor:pointer}
     <p style="font-size:12.5px;color:var(--muted)">Takes 5–10 minutes. Apps left unticked are recorded,
     so later updates never install them on this site. Adding a hostname briefly restarts the
     backend and workers (a few seconds, all sites). Afterwards make the hostname resolve to this
-    server: a DNS rewrite in AdGuard Home / the router, or a hosts-file line on each PC.</p>
+    server: a DNS record (public DNS or the router) or a hosts-file line on each PC. More domains
+    for a site: <b>Domains…</b> in its row.</p>
   </details>
 </div>
 
@@ -2741,6 +2831,22 @@ details{margin:2px 0} details summary{cursor:pointer}
   </div>
 </div></div>
 
+<div class="modal" id="dm-modal"><div class="card">
+  <h1 style="font-size:17px;margin-bottom:10px">Domains of <span id="dm-site"></span></h1>
+  <div id="dm-body" style="font-size:13px"></div>
+  <div class="newsite" style="margin-top:10px">
+    <input type="text" id="dm-new" placeholder="domain, e.g. erp.acme.com" size="28"
+      autocomplete="off" autocapitalize="off" spellcheck="false">
+    <label style="font-size:13px"><input type="checkbox" id="dm-primary"> primary</label>
+    <button class="primary" id="dm-add">Add</button>
+  </div>
+  <p style="font-size:12.5px;color:var(--muted)">nginx sends every request for these domains to this site.
+    The <b>primary</b> domain becomes the site's <code>host_name</code>: the URL in emails and the one PDFs
+    load images from. Adding or removing a domain briefly restarts the backend and workers (a few
+    seconds, all sites). Point each domain at this server too: a DNS A record, or a hosts-file line.</p>
+  <div class="row"><button id="dm-close">Close</button></div>
+</div></div>
+
 <div class="modal" id="ap-modal"><div class="card">
   <h1 style="font-size:17px;margin-bottom:10px">Apps on <span id="ap-site"></span></h1>
   <div id="ap-body" style="font-size:13px">Reading installed apps…</div>
@@ -2750,7 +2856,7 @@ details{margin:2px 0} details summary{cursor:pointer}
 </div></div>
 <script>
 """ + TERM_JS + r"""
-let SITES = [], IMAGE_APPS = [];
+let SITES = [], IMAGE_APPS = [], SITE_INFO = {}, HTTP_PORT = 80;
 
 async function runAction(act, body){
   try{
@@ -2775,7 +2881,9 @@ function siteRow(s){
   const skip = s.skip_apps.length
     ? `<div class="apps">never auto-installed: ${s.skip_apps.map(esc).join(', ')}</div>` : '';
   const n = esc(s.name);
-  return `<tr><td><a href="${esc(s.url)}" target="_blank"><b>${n}</b></a> ${state}${skip}</td>
+  const doms = (s.domains || []).length
+    ? `<div class="apps">also: ${s.domains.map(d => `<a href="http://${esc(d)}${HTTP_PORT===80?'':':'+HTTP_PORT}" target="_blank">${esc(d)}</a>`).join(', ')}</div>` : '';
+  return `<tr><td><a href="${esc(s.url)}" target="_blank"><b>${n}</b></a> ${state}${doms}${skip}</td>
     <td>${bk}</td>
     <td><div class="acts">
       <button class="act" data-act="backup" data-site="${n}">Backup</button>
@@ -2783,6 +2891,7 @@ function siteRow(s){
       <button class="act" data-act="migrate" data-site="${n}"
         data-confirm="Run database migrations on ${n}?">Migrate</button>
       <button class="site-apps" data-site="${n}">Apps…</button>
+      <button class="site-doms" data-site="${n}">Domains…</button>
       <button class="site-bk" data-site="${n}" title="Show this site's backups below">Backups</button>
       <button class="danger act-drop" data-site="${n}">Drop</button>
     </div></td></tr>`;
@@ -2793,6 +2902,8 @@ async function refreshSites(){
     const r = await fetch('/api/sites'); if(r.status===401){location='/login';return;}
     const j = await r.json();
     SITES = j.sites.map(s => s.name);
+    SITE_INFO = Object.fromEntries(j.sites.map(s => [s.name, s]));
+    HTTP_PORT = j.http_port || 80;
     IMAGE_APPS = j.image_apps || [];
     $('#t-sites').textContent = SITES.length;
     let h;
@@ -2929,6 +3040,48 @@ document.addEventListener('click', async e => {
   await runAction('uninstall_app', {site, app});
 });
 
+// ---- domains of a site: the host nginx's domain → site table ----
+let dmSite = null;
+function closeDomains(){ $('#dm-modal').classList.remove('on'); dmSite = null; }
+$('#dm-close').onclick = closeDomains;
+$('#dm-modal').onclick = e => { if (e.target === $('#dm-modal')) closeDomains(); };
+function renderDomains(){
+  const s = SITE_INFO[dmSite] || {name: dmSite, domains: []};
+  const port = HTTP_PORT === 80 ? '' : ':' + HTTP_PORT;
+  const primary = d => s.host_name === 'http://' + d + port;
+  const row = (d, own) => `<tr><td><a href="http://${esc(d)}${port}" target="_blank">${esc(d)}</a>
+      ${primary(d) ? '<span class="badge ok">primary</span>' : ''} ${own ? '<span class="badge">site name</span>' : ''}</td>
+    <td class="right">${primary(d) ? '' : `<button class="dm-pri" data-d="${esc(d)}">Make primary</button>`}
+      ${own ? '' : `<button class="danger dm-del" data-d="${esc(d)}">Remove</button>`}</td></tr>`;
+  $('#dm-body').innerHTML = `<table><thead><tr><th>Domain</th><th></th></tr></thead><tbody>`
+    + row(s.name, true) + (s.domains || []).map(d => row(d, false)).join('') + '</tbody></table>';
+}
+document.addEventListener('click', e => {
+  const b = e.target.closest('.site-doms');
+  if (!b) return;
+  dmSite = b.dataset.site;
+  $('#dm-site').textContent = dmSite;
+  $('#dm-new').value = ''; $('#dm-primary').checked = false;
+  renderDomains();
+  $('#dm-modal').classList.add('on');
+});
+$('#dm-add').onclick = async () => {
+  if (!dmSite) return;
+  const domain = $('#dm-new').value.trim().toLowerCase();
+  if (!domain) return;
+  const site = dmSite;
+  closeDomains();
+  await runAction('domain_add', {site, domain, primary: $('#dm-primary').checked});
+};
+document.addEventListener('click', async e => {
+  const del = e.target.closest('.dm-del'), pri = e.target.closest('.dm-pri');
+  if ((!del && !pri) || !dmSite) return;
+  const site = dmSite, domain = (del || pri).dataset.d;
+  if (del && !confirm(`Remove ${domain} from ${site}?\n\nRequests for ${domain} will no longer reach ${site}.`)) return;
+  closeDomains();
+  await runAction(del ? 'domain_remove' : 'domain_primary', {site, domain});
+});
+
 document.addEventListener('click', e => {
   const b = e.target.closest('.site-bk');
   if (!b) return;
@@ -3008,6 +3161,7 @@ document.addEventListener('keydown', e => {
   if ($('#rs-modal').classList.contains('on')) closeRestore();
   if ($('#dr-modal').classList.contains('on')) closeDrop();
   if ($('#ap-modal').classList.contains('on')) closeApps();
+  if ($('#dm-modal').classList.contains('on')) closeDomains();
 });
 
 $('#rs-go').onclick = async () => {

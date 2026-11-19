@@ -4,7 +4,8 @@
 # questions on a terminal, neither of which a panel job has.
 #
 # Runs, as root:
-#   1. install-stack.sh   the Docker stack, no site yet
+#   1. install-stack.sh   the Docker stack, no site yet, and the host nginx
+#                         that routes domains to sites (install-proxy.sh)
 #   2. install-tools.sh   the tools to $SSPL_TOOLS_DIR (+ cron if asked)
 # Sites are created afterwards, one per tenant (sites/new-site.sh, or the
 # panel's Create site).

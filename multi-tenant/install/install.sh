@@ -6,7 +6,8 @@
 #   ./install.sh
 #
 # Asks everything up front, then runs unattended:
-#   1. the Docker stack (no site yet)       — install-stack.sh
+#   1. the Docker stack (no site yet) and   — install-stack.sh
+#      the host nginx that routes domains     (install-proxy.sh)
 #   2. the tools + backup cron              — install-tools.sh
 #   3. the first tenant site                — sites/new-site.sh
 #
@@ -53,8 +54,8 @@ read -rp "Proceed? [Y/n]: " GO
 
 echo ""
 echo "══ 1/3 Docker stack ══"
-sudo env SSPL_CONF="$SSPL_CONF" HTTP_PORT="$HTTP_PORT" DB_PASSWORD="$DB_PASSWORD" \
-    bash "$HERE/install-stack.sh"
+sudo env SSPL_CONF="$SSPL_CONF" SSPL_TOOLS_DIR="$TOOLS_DEST" HTTP_PORT="$HTTP_PORT" \
+    DB_PASSWORD="$DB_PASSWORD" bash "$HERE/install-stack.sh"
 sudo systemctl enable docker >/dev/null 2>&1 || true
 
 echo ""
@@ -75,6 +76,7 @@ cat <<EOF
 ✅ Done.
    Add a tenant:      sudo $TOOLS_DEST/sites/new-site.sh <host>
    List tenants:      sudo $TOOLS_DEST/sites/list-sites.sh --apps
+   Domains → sites:   sudo $TOOLS_DEST/sites/domains.sh add <site> <domain> [--primary]
    Backup now:        sudo $TOOLS_DEST/backup/backup.sh --all
    Update ERP:        sudo $TOOLS_DEST/update/update.sh
    Config:            $SSPL_CONF

@@ -39,6 +39,8 @@ echo "=============================="
 
 dc exec -T backend true >/dev/null 2>&1 || err "The backend is not running — start the stack first."
 site_exists "$SITE" && err "Site $SITE already exists."
+OWNER=$(domain_site "$SITE")
+[ -z "$OWNER" ] || err "$SITE is already a domain of site $OWNER (sites/domains.sh remove $SITE first)"
 
 # ─────────────────────────────────────────────────────── which apps
 mapfile -t AVAILABLE < <(image_apps)
@@ -107,6 +109,11 @@ URL="http://$SITE"
 dc exec -T backend bench --site "$SITE" set-config host_name "$URL" >/dev/null
 ok "host_name set to $URL"
 
+# The host nginx routes the site's own name to it; more domains: domains.sh
+add_domain "$SITE" "$SITE"
+apply_proxy && ok "nginx routes $SITE" \
+    || warn "$SITE is not reachable until nginx is fixed: run install/install-proxy.sh from the checkout"
+
 if ! is_ip "$SITE"; then
     echo "→ Letting the containers resolve $SITE (backend and workers restart for a few seconds)..."
     apply_tenant_hosts || warn "PDFs may miss images until this is fixed: re-run $TOOLS_DIR/sites/apply-hosts.sh"
@@ -117,6 +124,7 @@ echo "✅ $SITE is ready: $URL  (login: Administrator)"
 if ! is_ip "$SITE"; then
     echo ""
     echo "   Users' computers must resolve $SITE to this server. Either:"
-    echo "   - add a DNS rewrite in AdGuard Home / your router: $SITE → <server-ip>"
-    echo "   - or, per computer, a hosts-file line:            <server-ip>  $SITE"
+    echo "   - a DNS record (public DNS or your router):  $SITE → <server-ip>"
+    echo "   - or, per computer, a hosts-file line:        <server-ip>  $SITE"
 fi
+echo "   More domains for this site: $TOOLS_DIR/sites/domains.sh add $SITE <domain> [--primary]"

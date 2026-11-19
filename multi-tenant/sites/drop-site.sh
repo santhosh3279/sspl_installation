@@ -40,11 +40,19 @@ ok "$SITE dropped (folder moved to sites/archived_sites/)"
 
 rm -f "$(skip_apps_file "$SITE")"
 
-if ! is_ip "$SITE"; then
+DOMAINS=$(site_domains "$SITE" | tr '\n' ' ')
+remove_site_domains "$SITE"
+apply_proxy && ok "nginx no longer routes: $DOMAINS" \
+    || warn "nginx not reloaded — run install/install-proxy.sh from the checkout"
+
+# The containers had an entry for the site's name and every other domain of it
+NEED_HOSTS=no
+for d in $SITE $DOMAINS; do is_ip "$d" || NEED_HOSTS=yes; done
+if [ "$NEED_HOSTS" = yes ]; then
     echo "→ Removing $SITE from the containers' host list..."
     apply_tenant_hosts || warn "Host list not refreshed; harmless — re-run $TOOLS_DIR/sites/apply-hosts.sh"
 fi
 
 echo ""
 echo "✅ $SITE removed. Its backups remain in $(site_backup_dir "$SITE")/"
-echo "   Remove its DNS entry too."
+echo "   Remove its DNS entries too: $DOMAINS"

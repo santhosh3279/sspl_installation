@@ -9,12 +9,14 @@
 # Optional env:
 #   SSPL_CONF       config file (default /opt/sspl-erp/sspl-mt.conf); written
 #                   from the values below if it does not exist yet
-#   HTTP_PORT       external HTTP port (default 80)
+#   HTTP_PORT       public HTTP port, where the host nginx listens (default 80)
+#   FRONTEND_PORT   the stack's own nginx, on 127.0.0.1 only (default 18080)
 #   ERP_DIR, COMPOSE_PROJECT, IMAGE, IMAGE_TAG, BACKUP_ROOT — see the config
 #
-# Routing: nginx picks the site from the Host header, so FRAPPE_SITE_NAME_HEADER
-# is deliberately NOT set — frappe_docker then defaults to $host. Every tenant
-# needs its own hostname (DNS rewrite / hosts file) pointing at this server.
+# Routing: a host nginx on HTTP_PORT maps each domain to its site and passes
+# the site name on as the Host header (install-proxy.sh, sites/domains.sh).
+# FRAPPE_SITE_NAME_HEADER is deliberately NOT set — frappe_docker then routes
+# on $host. Every domain must resolve to this server (DNS / hosts file).
 #
 # SECURITY: never echoes DB_PASSWORD. Do not add 'set -x'.
 set -euo pipefail
@@ -34,6 +36,9 @@ if [ ! -f "$SSPL_CONF" ]; then
 ERP_DIR=${ERP_DIR:-/opt/sspl-erp}
 COMPOSE_PROJECT=${COMPOSE_PROJECT:-sspl-erp}
 HTTP_PORT=${HTTP_PORT:-80}
+# The stack's own nginx, on 127.0.0.1 only; the host nginx (HTTP_PORT)
+# proxies to it. Domains → sites: \$ERP_DIR/site-domains (sites/domains.sh)
+FRONTEND_PORT=${FRONTEND_PORT:-18080}
 IMAGE=${IMAGE:-ghcr.io/santhosh3279/sspl-erpnext}
 IMAGE_TAG=${IMAGE_TAG:-latest}
 
@@ -65,6 +70,18 @@ fi
 
 source "$(cd "$(dirname "$0")/.." && pwd)/lib/common.sh"
 
+# The host nginx takes HTTP_PORT at the end; find a clash before anything is
+# installed, not after the stack is half up. (A re-run finds our own nginx
+# and frontend on them: skip.)
+if [ ! -f "$COMPOSE_FILE" ]; then
+    if ss -ltnH "sport = :$HTTP_PORT" 2>/dev/null | grep -q .; then
+        err "Port $HTTP_PORT is already in use: $(ss -ltnpH "sport = :$HTTP_PORT" | head -1). Pick another HTTP port."
+    fi
+    if ss -ltnH "sport = :$FRONTEND_PORT" 2>/dev/null | grep -q .; then
+        err "Port $FRONTEND_PORT (FRONTEND_PORT, the stack's internal nginx) is in use. Set FRONTEND_PORT in $SSPL_CONF."
+    fi
+fi
+
 # ─────────────────────────────────────────────── 1. working dir + frappe_docker
 step "Working directory and frappe_docker"
 mkdir -p "$ERP_DIR"
@@ -85,7 +102,9 @@ CUSTOM_TAG=$IMAGE_TAG
 PULL_POLICY=missing
 DB_PASSWORD=$DB_PASSWORD
 WORKER_REPLICAS=2
-HTTP_PUBLISH_PORT=$HTTP_PORT
+# Only the host nginx reaches the frontend (install-proxy.sh)
+HTTP_PUBLISH_PORT=127.0.0.1:$FRONTEND_PORT
+UPSTREAM_REAL_IP_ADDRESS=0.0.0.0/0
 # FRAPPE_SITE_NAME_HEADER is intentionally unset: route by Host header.
 EOF
 )
@@ -124,6 +143,9 @@ dc up -d
 wait_for_services || err "Stack did not come up — check: docker compose -f $COMPOSE_FILE logs"
 # No global host_name on purpose: each site gets its own (new-site.sh), which
 # is what PDFs and email links use.
+
+step "Host nginx (domain → site routing)"
+bash "$(dirname "$0")/install-proxy.sh" || err "Host nginx setup failed — fix it, then re-run install/install-proxy.sh"
 
 echo ""
 echo "✅ Stack is up on port $HTTP_PORT. Create the first tenant:"

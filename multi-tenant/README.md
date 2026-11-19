@@ -1,8 +1,9 @@
 # SSPL ERP — multi-tenant
 
 One server, one Docker stack, one image, **many ERPNext sites**: one site per
-tenant, each with its own database, files, users and apps. nginx picks the
-site from the hostname in the browser's address bar.
+tenant, each with its own database, files, users and apps. A host nginx
+picks the site from the domain in the browser's address bar, and one site can
+answer on several domains.
 
 > This is the `Multi-Site` branch. The single-site tooling on `main`
 > (`Admin Panel/`, `Backup/`, `Production Installation/`) is untouched and
@@ -17,13 +18,19 @@ site from the hostname in the browser's address bar.
 |---|---|
 | Image, containers (backend, workers, scheduler, nginx) | `sites/<host>/` folder, `site_config.json`, encryption key |
 | MariaDB and Redis | Its own database and DB user |
-| Port (default 80) | Hostname, e.g. `acme.erp.lan` |
+| Port (default 80), host nginx | Site name, e.g. `acme.erp.lan`, plus any extra domains |
 | App **versions** | Which apps are installed |
 
-- **Routing.** `FRAPPE_SITE_NAME_HEADER` is not set, so frappe_docker routes
-  on `$host`. Every tenant hostname must resolve to the server, either through
-  a DNS rewrite (AdGuard Home, router) or a hosts-file line on each PC. An IP
-  works as a site name too, but only one site can use it.
+- **Routing.** A host nginx listens on `HTTP_PORT` and looks the request's
+  domain up in `/opt/sspl-erp/site-domains` (`<domain> <site>` per line). It
+  passes the site name on as the `Host` header to the stack's own nginx,
+  which is published on `127.0.0.1:FRONTEND_PORT` (default 18080) only.
+  `FRAPPE_SITE_NAME_HEADER` is not set, so frappe_docker routes on `$host`.
+  A domain that isn't in the table gets its connection closed. See
+  [Domains](#domains).
+- **DNS is still yours.** nginx only routes. Every domain must resolve to the
+  server: a public DNS A record, the router's DNS, or a hosts-file line on
+  each PC. An IP works as a site name too, but only one site can use it.
 - **PDFs.** Each site gets `host_name = http://<host>[:port]`. The containers
   resolve every tenant hostname to the host (a generated
   `compose.sspl-tenants.yaml`), so wkhtmltopdf can fetch images and letterheads
@@ -45,9 +52,10 @@ Then open `https://<server-ip>:8090`:
 1. **ERP Next Installation suite → Install stack**: port, image, MariaDB root
    password, and whether to schedule backups. Runs `install/panel-install.sh`
    (`install-stack.sh` then `install-tools.sh`). No site is created.
+   The stack install also sets up the host nginx (`install/install-proxy.sh`).
 2. Optional, same page: rclone (cloud backups for every site, stored as
-   `RCLONE_REMOTE` in `sspl-mt.conf`), AdGuard Home (DNS rewrites for the
-   tenant hostnames), OpenWA.
+   `RCLONE_REMOTE` in `sspl-mt.conf`) and OpenWA. The **nginx domain
+   routing** row shows whether the proxy is running, and repairs it.
 3. **Dashboard → Create site**, once per tenant: hostname, Administrator
    password, which apps.
 
@@ -73,7 +81,8 @@ cd sspl_installation/multi-tenant/install
 It asks for the port, the MariaDB root password, the first tenant's hostname
 and Administrator password, and whether to schedule backups. Then it:
 
-1. starts the stack: `/opt/sspl-erp/` (compose project `sspl-erp`)
+1. starts the stack: `/opt/sspl-erp/` (compose project `sspl-erp`), and the
+   host nginx that routes domains to sites
 2. installs the tools to `/opt/sspl-erp/tools/` and sets up cron
 3. creates the first site
 
@@ -100,6 +109,40 @@ sudo $T/sites/drop-site.sh beta.erp.lan                    # backup first, then 
 Apps you leave out with `--apps` are recorded in
 `/opt/sspl-erp/site-skip-apps/<host>`, so updates never install them on that
 site.
+
+## Domains
+
+Each site answers on its own name. Add more domains with `sites/domains.sh`,
+or with **Domains…** in the site's row on the dashboard:
+
+```bash
+sudo $T/sites/domains.sh add acme.erp.lan erp.acme.com --primary
+sudo $T/sites/domains.sh add acme.erp.lan acme.lan
+sudo $T/sites/domains.sh list
+sudo $T/sites/domains.sh primary acme.erp.lan acme.lan
+sudo $T/sites/domains.sh remove acme.lan
+```
+
+- The table is `/opt/sspl-erp/site-domains`. The tools generate
+  `/etc/nginx/conf.d/sspl-erp.conf` from it, run `nginx -t`, and reload. If
+  nginx rejects a config, the previous one stays.
+- `--primary` (or `primary`) sets the site's `host_name` to that domain. Emails
+  link to that URL, and PDFs load images from it. Removing the primary domain
+  sets `host_name` back to the site name.
+- Adding or removing a domain also adds it to the containers' host list, so
+  PDFs can fetch it. That restarts backend and workers for a few seconds, for
+  every site.
+- `new-site.sh` adds the site's own name. `drop-site.sh` removes every domain
+  of the site.
+- HTTPS is not set up. Put certificates in front of the host nginx, or add a
+  `listen 443 ssl` server to it by hand, outside the generated file.
+
+**Stacks installed before nginx routing** still publish the frontend on the
+public port. Run `sudo SSPL_CONF=/opt/sspl-erp/sspl-mt.conf
+install/install-proxy.sh` from the checkout, or **Repair nginx routing** on
+the panel's installation suite. It moves the frontend to `127.0.0.1`, adds
+every existing site to the domain table, and starts nginx. Every site is down
+for a few seconds while the frontend moves.
 
 ## Backups
 
@@ -173,14 +216,15 @@ restore those sites from the backups the update took.
 multi-tenant/
   admin-panel/  the web panel: app.py, setup_admin_panel.sh, update_panel.sh
   install/   install.sh (fresh server), panel-install.sh (the panel's),
-             install-stack.sh, install-tools.sh
-  lib/       common.sh — config, site validation, maintenance helpers, rclone
-  sites/     new-site, drop-site, list-sites, apply-hosts
+             install-stack.sh, install-proxy.sh (host nginx), install-tools.sh
+  lib/       common.sh — config, site validation, domain table + nginx config,
+             maintenance helpers, rclone
+  sites/     new-site, drop-site, list-sites, domains, apply-hosts
   backup/    backup, db-backup, verify, restore, restore-with-backup, migrate,
              rclone_trash_cleanup (from main, unchanged)
   update/    update, rollback, download-images, uninstall-app,
              pull-progress.py, image-backup-manager.sh (from main)
 ```
 
-Mutating tools (update, restore, new/drop site, uninstall) take one lock
+Mutating tools (update, restore, new/drop site, domains, uninstall) take one lock
 (`LOCK_FILE`), so they can never interleave.
