@@ -34,7 +34,7 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-11-06.2"
+PANEL_VERSION = "2026-11-22.1"
 FEATURES = ("ERP Next Installation suite page with rclone cloud backup setup "
             "covering full and DB-only backups, console-style terminal whose log "
             "is downloadable and whose past runs are browsable, whole-folder "
@@ -43,7 +43,9 @@ FEATURES = ("ERP Next Installation suite page with rclone cloud backup setup "
             "upload to and download from the sites volume, Uninstall app button "
             "with a picker of the site's installed apps, Change port for the "
             "ERPNext HTTP port with automatic site and socket.io update, OpenWA "
-            "WhatsApp API install in Docker with Show API key")
+            "WhatsApp API install in Docker with Show API key, "
+            "RAM monitor page with alerts, per-container and per-process memory, "
+            "and the MariaDB buffer pool size applied live from the panel")
 
 CONFIG_FILE = os.environ.get("SSPL_ADMIN_CONFIG", "/opt/sspl-admin/config.json")
 with open(CONFIG_FILE) as f:
@@ -1092,6 +1094,451 @@ def _zip_stream(folder):
 
 
 # ---------------------------------------------------------------- routes
+
+# ---------------------------------------------------------------- RAM monitor + database memory
+# MariaDB ships with a 128M InnoDB buffer pool. An ERPNext database of a GB or more then reads
+# most pages from disk, and every bill save (20+ queries per item row) waits on it. The pool size
+# lives in <erp_dir>/mariadb/99-sspl.cnf; overrides/compose.sspl-db.yaml mounts that folder on the
+# db container's /etc/mysql/conf.d. MariaDB 11.8 resizes the pool live, so a new size applies at
+# once and the file keeps it across restarts. A stack installed before the mount existed gets it
+# from "Make permanent", which recreates the db container.
+
+DBM_CNF = "99-sspl.cnf"
+DBM_TARGET = "/etc/mysql/conf.d"
+DBM_OVERRIDE = "compose.sspl-db.yaml"
+DBM_STEP = 128 << 20
+DBM_MIN = 128 << 20
+DBM_HOST_RESERVE = 2 << 30   # never handed to the pool: OS, Redis, workers, OpenWA
+DBM_SIZE_RE = re.compile(r"^\s*(\d{1,7})\s*([MG])\s*$", re.I)
+
+
+def _dbm_erp_dir():
+    return ERP_DIR
+
+
+def _dbm_compose():
+    return COMPOSE_FILE
+
+
+def _dbm_cnf_dir():
+    return Path(_dbm_erp_dir()) / "mariadb"
+
+
+def _dbm_override_path():
+    return Path(_dbm_erp_dir()) / "frappe_docker" / "overrides" / DBM_OVERRIDE
+
+
+def _fmt_pool(n):
+    mb = int(n) // (1 << 20)
+    return f"{mb // 1024}G" if mb and mb % 1024 == 0 else f"{mb}M"
+
+
+def _parse_pool(text):
+    m = DBM_SIZE_RE.match(str(text or ""))
+    if not m:
+        return None
+    return int(m.group(1)) << (30 if m.group(2).upper() == "G" else 20)
+
+
+def _round_pool(n, up=False):
+    q, r = divmod(int(n), DBM_STEP)
+    return (q + (1 if up and r else 0)) * DBM_STEP
+
+
+def _db_exec(sql, timeout=30):
+    """Run SQL as root inside the db container -> (ok, stdout or error text).
+
+    The SQL travels as $1, never through shell interpolation, and the password is
+    the container's own, the one MariaDB was initialised with.
+    """
+    cmd = ["docker", "compose", "-f", _dbm_compose(), "exec", "-T", "db", "sh", "-c",
+           'MYSQL_PWD="${MARIADB_ROOT_PASSWORD:-$MYSQL_ROOT_PASSWORD}" '
+           'exec mariadb -uroot -N -B -e "$1"', "sh", sql]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, str(e)[:300]
+    if out.returncode != 0:
+        return False, (out.stderr or "mariadb failed").strip()[:300]
+    return True, out.stdout
+
+
+def _db_container():
+    """{'mounted': conf.d mount present, 'mem_limit': bytes or 0} for the db container."""
+    info = {"mounted": False, "mem_limit": 0}
+    try:
+        ps = subprocess.run(["docker", "compose", "-f", _dbm_compose(), "ps", "-q", "db"],
+                            capture_output=True, text=True, timeout=20)
+        cid = (ps.stdout.split() or [""])[0]
+        if not cid:
+            return info
+        out = subprocess.run(["docker", "inspect", cid], capture_output=True, text=True, timeout=20)
+        data = json.loads(out.stdout)[0]
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return info
+    info["mounted"] = any(m.get("Destination") == DBM_TARGET for m in data.get("Mounts") or [])
+    info["mem_limit"] = int((data.get("HostConfig") or {}).get("Memory") or 0)
+    return info
+
+
+def _dbm_configured():
+    try:
+        text = (_dbm_cnf_dir() / DBM_CNF).read_text()
+    except OSError:
+        return None
+    m = re.search(r"^\s*innodb_buffer_pool_size\s*=\s*(\S+)", text, re.M)
+    if not m:
+        return None
+    return int(m.group(1)) if m.group(1).isdigit() else _parse_pool(m.group(1))
+
+
+def _dbm_write_cnf(size):
+    d = _dbm_cnf_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / DBM_CNF
+    # Written in place: MariaDB skips world-writable files, hence the explicit 0644.
+    with open(path, "w") as f:
+        f.write("# InnoDB buffer pool for the ERPNext database. Set from the admin panel's\n"
+                "# RAM monitor page, which also applies it live.\n"
+                f"[mysqld]\ninnodb_buffer_pool_size = {_fmt_pool(size)}\n")
+    os.chmod(path, 0o644)
+
+
+def _dbm_write_override():
+    ov = _dbm_override_path()
+    if not ov.parent.is_dir():
+        raise OSError(f"{ov.parent} not found")
+    ov.write_text(
+        f"# SSPL: MariaDB settings from {_dbm_cnf_dir()} (InnoDB buffer pool, see {DBM_CNF}).\n"
+        "services:\n  db:\n    volumes:\n      - type: bind\n"
+        f"        source: {_dbm_cnf_dir()}\n        target: {DBM_TARGET}\n"
+        "        read_only: true\n")
+    return ov
+
+
+_dbm_cache = {"ts": 0.0, "data": None}
+_dbm_raw = {}   # last (reads, read_requests) sample, for the recent miss rate
+
+
+def dbm_state(force=False):
+    now = time.time()
+    if not force and _dbm_cache["data"] is not None and now - _dbm_cache["ts"] < 30:
+        return _dbm_cache["data"]
+    mem = meminfo()
+    ram = mem.get("MemTotal", 0)
+    st = {"error": None, "live": None, "data": None, "miss_pct": None, "recent_miss_pct": None,
+          "configured": _dbm_configured()}
+    ok, out = _db_exec(
+        "SELECT @@innodb_buffer_pool_size;"
+        " SELECT COALESCE(SUM(data_length + index_length), 0) FROM information_schema.tables"
+        " WHERE engine = 'InnoDB';"
+        " SELECT variable_value FROM information_schema.global_status"
+        " WHERE variable_name = 'INNODB_BUFFER_POOL_READS';"
+        " SELECT variable_value FROM information_schema.global_status"
+        " WHERE variable_name = 'INNODB_BUFFER_POOL_READ_REQUESTS';", timeout=60)
+    if ok:
+        try:
+            live, data, reads, reqs = (int(float(v)) for v in out.split()[:4])
+            # Too few requests (a fresh or idle DB) make the ratio meaningless
+            st.update(live=live, data=data,
+                      miss_pct=round(min(100.0, 100.0 * reads / reqs), 2) if reqs >= 10000 else None)
+            # The total counts since the DB started, so it barely moves after a resize;
+            # the rate between two samples shows what the current pool is doing.
+            prev = _dbm_raw.get("v")
+            if prev and reqs - prev[1] > 1000:
+                st["recent_miss_pct"] = round(
+                    min(100.0, 100.0 * max(0, reads - prev[0]) / (reqs - prev[1])), 2)
+            elif prev and "recent" in _dbm_raw:
+                st["recent_miss_pct"] = _dbm_raw["recent"]
+            if prev is None or reqs - prev[1] > 1000 or reqs < prev[1]:
+                _dbm_raw["v"] = (reads, reqs)
+                if "recent_miss_pct" in st:
+                    _dbm_raw["recent"] = st["recent_miss_pct"]
+        except ValueError:
+            st["error"] = "unexpected answer from MariaDB"
+    else:
+        st["error"] = out
+    st.update(_db_container())
+
+    upper = ram - DBM_HOST_RESERVE
+    if st["mem_limit"]:
+        upper = min(upper, st["mem_limit"] - (512 << 20))
+    upper = max(DBM_MIN, _round_pool(upper))
+    # The whole database plus a quarter for growth, but never more than a quarter of RAM
+    want = max(256 << 20, (st["data"] or 0) * 5 // 4)
+    rec = min(max(DBM_MIN, _round_pool(min(ram // 4, want), up=True)), upper)
+    st.update(ram=ram, available=mem.get("MemAvailable", 0), min=DBM_MIN, max=upper, recommended=rec,
+              h={"live": _fmt_pool(st["live"]) if st["live"] else "–",
+                 "configured": _fmt_pool(st["configured"]) if st["configured"] else "not set",
+                 "data": human(st["data"]) if st["data"] is not None else "–",
+                 "recommended": _fmt_pool(rec), "max": _fmt_pool(upper), "min": _fmt_pool(DBM_MIN),
+                 "mem_limit": human(st["mem_limit"]) if st["mem_limit"] else "none",
+                 "available": human(mem.get("MemAvailable", 0))})
+    _dbm_cache.update(ts=now, data=st)
+    return st
+
+
+def _dbm_job_busy():
+    with _job_lock:
+        return bool(_job and _job["proc"].poll() is None)
+
+
+def _parse_docker_bytes(text):
+    m = re.match(r"\s*([\d.]+)\s*([KMGT]?i?B)", text or "")
+    if not m:
+        return 0
+    mult = {"B": 1, "KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12,
+            "KIB": 1 << 10, "MIB": 1 << 20, "GIB": 1 << 30, "TIB": 1 << 40}
+    return int(float(m.group(1)) * mult.get(m.group(2).upper(), 1))
+
+
+_dstats_cache = {"ts": 0.0, "data": None}
+
+
+def docker_mem_stats():
+    """Every running container's memory against its limit (docker stats takes ~2s: cached)."""
+    now = time.time()
+    if _dstats_cache["data"] is not None and now - _dstats_cache["ts"] < 15:
+        return _dstats_cache["data"]
+    res = {"rows": [], "error": None}
+    try:
+        out = subprocess.run(["docker", "stats", "--no-stream", "--format", "{{json .}}"],
+                             capture_output=True, text=True, timeout=40)
+        if out.returncode != 0:
+            res["error"] = (out.stderr or "docker stats failed").strip()[:300]
+        host = meminfo().get("MemTotal", 0)
+        for line in out.stdout.splitlines():
+            if not line.strip():
+                continue
+            it = json.loads(line)
+            used_s, _, limit_s = (it.get("MemUsage") or "").partition("/")
+            used, limit = _parse_docker_bytes(used_s), _parse_docker_bytes(limit_s)
+            # No limit set: docker reports the host's RAM as the limit
+            limited = bool(limit) and host and limit < host * 0.97
+            res["rows"].append({
+                "name": it.get("Name", "?"), "used": used, "used_h": human(used),
+                "limit_h": human(limit) if limited else "none",
+                "pct": round(100.0 * used / limit, 1) if limited else None,
+                "host_pct": round(100.0 * used / host, 1) if host else 0,
+                "cpu": it.get("CPUPerc", ""),
+            })
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        res["error"] = str(e)[:300]
+    res["rows"].sort(key=lambda r: r["used"], reverse=True)
+    _dstats_cache.update(ts=now, data=res)
+    return res
+
+
+def top_processes(limit=12):
+    procs = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/status") as f:
+                fields = dict(line.split(":", 1) for line in f if ":" in line)
+            if "VmRSS" not in fields:   # kernel thread
+                continue
+            rss = int(fields["VmRSS"].split()[0]) * 1024
+            swap = int(fields.get("VmSwap", "0 kB").split()[0]) * 1024
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = f.read().replace(b"\0", b" ").decode(errors="replace").strip()
+        except (OSError, ValueError):
+            continue
+        procs.append({"pid": int(pid), "name": fields.get("Name", "").strip(), "rss": rss,
+                      "swap": swap, "cmd": cmd[:140]})
+    procs.sort(key=lambda p: p["rss"] + p["swap"], reverse=True)
+    for p in procs:
+        p["rss_h"], p["swap_h"] = human(p["rss"]), human(p["swap"])
+    return procs[:limit]
+
+
+_vm_last = {"ts": 0.0, "in": 0, "out": 0}
+
+
+def swap_rates():
+    """Bytes/s swapped in and out since the previous call (None on the first)."""
+    vals = {}
+    try:
+        with open("/proc/vmstat") as f:
+            for line in f:
+                k, _, v = line.partition(" ")
+                if k in ("pswpin", "pswpout"):
+                    vals[k] = int(v)
+    except OSError:
+        return None, None
+    now, page = time.time(), os.sysconf("SC_PAGE_SIZE")
+    prev = dict(_vm_last)
+    _vm_last.update(ts=now, **{"in": vals.get("pswpin", 0), "out": vals.get("pswpout", 0)})
+    dt = now - prev["ts"]
+    if not prev["ts"] or dt <= 0:
+        return None, None
+    return (max(0, _vm_last["in"] - prev["in"]) * page / dt,
+            max(0, _vm_last["out"] - prev["out"]) * page / dt)
+
+
+def mem_pressure():
+    """Share of the last 10s some task stalled waiting for memory (PSI), or None."""
+    try:
+        with open("/proc/pressure/memory") as f:
+            m = re.search(r"some avg10=([\d.]+)", f.read())
+        return float(m.group(1)) if m else None
+    except OSError:
+        return None
+
+
+def ram_report():
+    mem = meminfo()
+    total, avail = mem.get("MemTotal", 0), mem.get("MemAvailable", 0)
+    swap_t, swap_f = mem.get("SwapTotal", 0), mem.get("SwapFree", 0)
+    swap_used = swap_t - swap_f
+    sin, sout = swap_rates()
+    psi = mem_pressure()
+    containers = docker_mem_stats()
+    db = dbm_state()
+    alerts = []
+
+    def alert(level, text):
+        alerts.append({"level": level, "text": text})
+
+    avail_pct = 100.0 * avail / total if total else 100
+    if avail_pct < 10:
+        alert("crit", f"Only {human(avail)} RAM available ({avail_pct:.0f}%)")
+    elif avail_pct < 20:
+        alert("warn", f"RAM is getting low: {human(avail)} available ({avail_pct:.0f}%)")
+    if sin is not None and sin > (1 << 20):
+        alert("crit", f"Actively swapping in {human(sin)}/s — the server is out of RAM")
+    elif swap_t and swap_used > swap_t * 0.25:
+        alert("warn", f"{human(swap_used)} of swap in use")
+    if psi is not None and psi >= 10:
+        alert("crit" if psi >= 30 else "warn", f"Tasks stalled on memory {psi:.0f}% of the last 10s")
+    for c in containers["rows"]:
+        if c["pct"] is not None and c["pct"] >= 90:
+            alert("warn", f"{c['name']} is at {c['pct']:.0f}% of its {c['limit_h']} memory limit")
+    miss = db.get("recent_miss_pct")
+    miss = db.get("miss_pct") if miss is None else miss
+    if miss is not None and miss > 1:
+        alert("warn", f"Database reads {miss:.1f}% of pages from disk — raise the "
+                      f"buffer pool (recommended {db['h']['recommended']})")
+    if db.get("live") and db["live"] < db["recommended"] // 2:
+        alert("warn", f"Database buffer pool {db['h']['live']} is well below the recommended "
+                      f"{db['h']['recommended']}")
+    return {
+        "mem": {"total": human(total), "available": human(avail),
+                "used_pct": round(100.0 - avail_pct, 1),
+                "cached": human(mem.get("Cached", 0) + mem.get("Buffers", 0))},
+        "swap": {"total": human(swap_t), "used": human(swap_used),
+                 "pct": round(100.0 * swap_used / swap_t, 1) if swap_t else 0,
+                 "in": human(sin) + "/s" if sin is not None else "–",
+                 "out": human(sout) + "/s" if sout is not None else "–"},
+        "psi": psi, "alerts": alerts, "containers": containers, "processes": top_processes(),
+    }
+
+
+@app.route("/ram")
+@login_required
+def ram_page():
+    return render_template_string(RAM_HTML, user=session["user"], version=PANEL_VERSION)
+
+
+@app.route("/api/ram")
+@login_required
+def api_ram():
+    return jsonify(ram_report())
+
+
+@app.route("/api/db-memory")
+@login_required
+def api_db_memory():
+    return jsonify(dbm_state(force=request.args.get("fresh") == "1"))
+
+
+@app.route("/api/db-memory", methods=["POST"])
+@login_required
+def api_db_memory_set():
+    data = request.get_json(silent=True) or {}
+    st = dbm_state(force=True)
+    raw = str(data.get("size", "")).strip()
+    size = st["recommended"] if raw.lower() == "recommended" else _parse_pool(raw)
+    if size is None:
+        return jsonify({"error": "Size must look like 2G or 1536M"}), 400
+    if not st["min"] <= size <= st["max"]:
+        return jsonify({"error": f"Size must be between {st['h']['min']} and {st['h']['max']} "
+                                 f"(RAM minus {_fmt_pool(DBM_HOST_RESERVE)} for everything else)"}), 400
+    # Some MariaDB builds cap live growth (innodb_buffer_pool_size_max). Then the size is
+    # only saved, and takes effect when the db container next starts.
+    live_ok, out = _db_exec(f"SET GLOBAL innodb_buffer_pool_size = {int(size)}")
+    try:
+        _dbm_write_cnf(size)
+    except OSError as e:
+        return jsonify({"error": (f"Applied live, but could not save {DBM_CNF}: {e}" if live_ok
+                                  else f"MariaDB refused the new size ({out}) and {DBM_CNF} "
+                                       f"could not be saved: {e}")}), 500
+    st = dbm_state(force=True)
+    if not live_ok:
+        return jsonify({"ok": True, "state": st, "message": (
+            f"MariaDB would not resize live ({out}). Saved {_fmt_pool(size)} to the file: it "
+            "applies when the db container restarts" + ("." if st["mounted"] else
+            " — press 'Make permanent', which restarts it."))})
+    msg = f"Buffer pool is now {st['h']['live']}."
+    msg += (" Saved — it stays after a restart." if st["mounted"] else
+            " Saved to the file, but the db container does not read it yet: press"
+            " 'Make permanent' or it falls back to 128M on the next DB restart.")
+    return jsonify({"ok": True, "message": msg, "state": st})
+
+
+@app.route("/api/db-memory/persist", methods=["POST"])
+@login_required
+def api_db_memory_persist():
+    """Add the conf.d mount to the compose file and recreate the db container."""
+    if _dbm_job_busy():
+        return jsonify({"error": "A job is running — wait for it to finish first"}), 409
+    st = dbm_state(force=True)
+    if st["mounted"]:
+        return jsonify({"ok": True, "message": "Already permanent.", "state": st})
+    compose = _dbm_compose()
+    try:
+        if _dbm_configured() is None:
+            _dbm_write_cnf(st["live"] if st["live"] and st["live"] > DBM_MIN else st["recommended"])
+        ov = _dbm_write_override()
+        # Merging the generated file with the override is lossless (it is itself the
+        # output of 'docker compose config'), so no installer re-run is needed.
+        merged = subprocess.run(["docker", "compose", "-f", compose, "-f", str(ov), "config"],
+                                capture_output=True, text=True, timeout=60,
+                                cwd=os.path.dirname(compose))
+    except (OSError, subprocess.SubprocessError) as e:
+        return jsonify({"error": f"Could not prepare the compose change: {e}"}), 500
+    if merged.returncode != 0 or DBM_TARGET not in merged.stdout:
+        return jsonify({"error": "docker compose config failed: "
+                                 + (merged.stderr or "mount missing from output").strip()[:300]}), 500
+    backup = f"{compose}.bak-dbmem-{datetime.now():%Y%m%d_%H%M%S}"
+    shutil.copy2(compose, backup)
+    with open(compose, "w") as f:
+        f.write(merged.stdout)
+
+    def up_db():
+        return subprocess.run(["docker", "compose", "-f", compose, "up", "-d", "db"],
+                              capture_output=True, text=True, timeout=300)
+
+    up = up_db()
+    if up.returncode != 0:
+        shutil.copy2(backup, compose)   # put the old definition back and bring db up on it
+        up_db()
+        return jsonify({"error": "Recreating the db container failed, the old compose file was "
+                                 "restored: " + (up.stderr or "").strip()[-300:]}), 500
+    for _ in range(60):
+        if _db_exec("SELECT 1", timeout=10)[0]:
+            break
+        time.sleep(2)
+    _containers_cache.update(ts=0.0, data=None)
+    st = dbm_state(force=True)
+    if not st["mounted"]:
+        return jsonify({"error": "The db container restarted but the mount is not there — "
+                                 f"check {compose} (backup: {backup})"}), 500
+    return jsonify({"ok": True, "state": st,
+                    "message": f"Permanent: the db container now reads {DBM_CNF} "
+                               f"(buffer pool {st['h']['live']}). Old compose file: {backup}"})
+
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -2591,6 +3038,7 @@ details{margin:2px 0} details summary{cursor:pointer}
   <h1>SSPL ERP Admin</h1><span id="clock" class="badge"></span>
   <span class="badge" title="panel code version — restart the service after updating">v{{ version }}</span>
   <a class="nav" href="/install">ERP Next Installation suite →</a>
+  <a class="nav" href="/ram" title="RAM, swap, containers and the database buffer pool">RAM monitor →</a>
   {% if repo_ok %}
   <button class="act nav-act" data-act="update_panel"
     title="git pull the checkout, then deploy this panel from it"
@@ -3113,6 +3561,216 @@ setInterval(refreshStats, 5000);
 setInterval(refreshBackups, 60000);
 setInterval(refreshSite, 30000);
 pollJob();
+</script></body></html>"""
+
+
+RAM_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RAM monitor</title><style>""" + BASE_CSS + LAYOUT_CSS + r"""
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:16px}
+.tile{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:12px 14px}
+.tile .k{font-size:12px;color:var(--muted)} .tile .v{font-size:22px;margin-top:2px}
+.tile .s{font-size:12px;color:var(--ink-2)}
+.alerts{display:flex;flex-direction:column;gap:6px}
+.alert{border-radius:8px;padding:8px 12px;font-size:14px;border:1px solid var(--border)}
+.alert.warn{border-color:var(--warn);color:var(--warn)}
+.alert.crit{border-color:var(--crit);color:var(--crit);font-weight:600}
+.alert.ok{border-color:var(--ok);color:var(--ok)}
+.bar{height:8px;border-radius:4px;background:var(--track);overflow:hidden;min-width:80px}
+.bar i{display:block;height:100%;background:var(--accent)}
+.bar i.warn{background:var(--warn)} .bar i.crit{background:var(--crit)}
+.right{text-align:right}
+.kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px 18px;margin-bottom:14px}
+.kv .k{font-size:12px;color:var(--muted)} .kv .v{font-size:17px}
+.dbform{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.dbform input{width:120px}
+.note{font-size:13px;color:var(--ink-2);margin:10px 0 0}
+#db-msg{font-size:13px;margin-top:10px;min-height:1em}
+#db-msg.err{color:var(--crit)} #db-msg.okm{color:var(--ok)}
+.cmd{font:12px ui-monospace,Menlo,Consolas,monospace;color:var(--muted);
+  max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.scroll{overflow-x:auto}
+</style></head><body>
+<div class="top">
+  <h1>RAM monitor</h1><span id="clock" class="badge"></span>
+  <span class="badge" title="panel code version">v{{ version }}</span>
+  <a class="nav" href="/">← Dashboard</a>
+  <span class="spacer"></span>
+  <span style="color:var(--muted);font-size:13px">{{ user }}</span>
+  <form method="post" action="/logout" style="margin:0"><button>Log out</button></form>
+</div>
+<main>
+
+<div class="card"><h2>Alerts</h2><div class="alerts" id="alerts">
+  <div class="alert">Loading…</div></div></div>
+
+<div class="tiles">
+  <div class="tile"><div class="k">RAM available</div><div class="v num" id="t-avail">–</div>
+    <div class="s" id="t-total"></div></div>
+  <div class="tile"><div class="k">RAM used</div><div class="v num" id="t-used">–</div>
+    <div class="s" id="t-cache"></div></div>
+  <div class="tile"><div class="k">Swap used</div><div class="v num" id="t-swap">–</div>
+    <div class="s" id="t-swaptot"></div></div>
+  <div class="tile"><div class="k">Swapping in / out</div><div class="v num" id="t-swapio">–</div>
+    <div class="s">since the last refresh</div></div>
+  <div class="tile"><div class="k">Memory pressure</div><div class="v num" id="t-psi">–</div>
+    <div class="s">time tasks waited on RAM (10s)</div></div>
+</div>
+
+<div class="card"><h2>Database memory (InnoDB buffer pool)</h2>
+  <div class="kv">
+    <div><div class="k">Pool size now</div><div class="v num" id="d-live">–</div></div>
+    <div><div class="k">Saved setting</div><div class="v num" id="d-conf">–</div></div>
+    <div><div class="k">Database size</div><div class="v num" id="d-data">–</div></div>
+    <div><div class="k">Recommended</div><div class="v num" id="d-rec">–</div></div>
+    <div><div class="k">Reads from disk (recent)</div><div class="v num" id="d-miss">–</div></div>
+    <div><div class="k">Reads from disk (since DB start)</div><div class="v num" id="d-miss-all">–</div></div>
+    <div><div class="k">Survives a DB restart</div><div class="v" id="d-perm">–</div></div>
+    <div><div class="k">RAM free on the server</div><div class="v num" id="d-avail">–</div></div>
+  </div>
+  <div class="dbform">
+    <input id="d-size" placeholder="e.g. 2G" autocomplete="off">
+    <button class="primary" id="d-set">Apply size</button>
+    <button id="d-userec">Use recommended</button>
+    <button class="danger" id="d-persist" style="display:none"
+      title="Adds the settings mount to the compose file and recreates the db container">Make permanent (restarts DB)</button>
+  </div>
+  <div id="db-msg"></div>
+  <p class="note">The buffer pool is the RAM MariaDB keeps database pages in. When it is smaller than
+    the database, queries read from disk and every bill save slows down. A new size applies at once,
+    with no restart. The allowed range is <span id="d-range">–</span>: the server keeps 2G for
+    everything else. Raise it only when there is free RAM, because a pool pushed into swap is slower than a small one.</p>
+</div>
+
+<div class="card"><h2>Containers by memory</h2>
+  <div id="c-err" style="color:var(--crit);font-size:13px;display:none"></div>
+  <div class="scroll"><table><thead><tr><th>Container</th><th class="right">Memory</th>
+    <th class="right">Limit</th><th>Of limit</th><th class="right">Of host RAM</th><th class="right">CPU</th></tr></thead>
+  <tbody id="containers"><tr><td colspan="6" style="color:var(--muted)">Loading…</td></tr></tbody></table></div>
+</div>
+
+<div class="card"><h2>Top processes (RAM + swap)</h2>
+  <div class="scroll"><table><thead><tr><th class="right">PID</th><th>Name</th><th class="right">RAM</th>
+    <th class="right">Swap</th><th>Command</th></tr></thead>
+  <tbody id="procs"><tr><td colspan="5" style="color:var(--muted)">Loading…</td></tr></tbody></table></div>
+  <div class="dbform" style="margin-top:12px">
+    <button id="clear-ram">Clear RAM caches</button>
+    <span id="ram-msg" style="font-size:13px;color:var(--ink-2)"></span>
+  </div>
+</div>
+
+</main>
+<script>
+const $ = s => document.querySelector(s);
+const esc = t => (t??'').toString().replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const cls = p => p >= 92 ? 'crit' : p >= 80 ? 'warn' : '';
+let dbState = null;
+
+async function getJSON(url, opts){
+  const r = await fetch(url, opts);
+  if (r.status === 401){ location = '/login'; throw new Error('logged out'); }
+  return r.json();
+}
+
+async function refreshRam(){
+  try{
+    const s = await getJSON('/api/ram');
+    $('#t-avail').textContent = s.mem.available;
+    $('#t-total').textContent = 'of ' + s.mem.total;
+    $('#t-used').textContent = s.mem.used_pct + '%';
+    $('#t-cache').textContent = s.mem.cached + ' is reclaimable cache';
+    $('#t-swap').textContent = s.swap.total === '0 B' ? 'no swap' : s.swap.used;
+    $('#t-swaptot').textContent = s.swap.total === '0 B' ? '' : s.swap.pct + '% of ' + s.swap.total;
+    $('#t-swapio').textContent = s.swap.in + ' / ' + s.swap.out;
+    $('#t-psi').textContent = s.psi === null ? 'n/a' : s.psi.toFixed(1) + '%';
+    $('#alerts').innerHTML = s.alerts.length
+      ? s.alerts.map(a => `<div class="alert ${a.level}">${esc(a.text)}</div>`).join('')
+      : '<div class="alert ok">All clear: RAM, swap, containers and the database are healthy.</div>';
+    const ce = s.containers.error;
+    $('#c-err').style.display = ce ? '' : 'none'; if (ce) $('#c-err').textContent = ce;
+    $('#containers').innerHTML = s.containers.rows.map(c => `<tr><td>${esc(c.name)}</td>
+      <td class="right num">${esc(c.used_h)}</td><td class="right num">${esc(c.limit_h)}</td>
+      <td>${c.pct === null ? '<span style="color:var(--muted)">no limit</span>'
+        : `<div class="bar" title="${c.pct}%"><i class="${cls(c.pct)}" style="width:${Math.min(c.pct,100)}%"></i></div>`}</td>
+      <td class="right num">${c.host_pct}%</td><td class="right num">${esc(c.cpu)}</td></tr>`).join('')
+      || '<tr><td colspan="6" style="color:var(--muted)">No running containers</td></tr>';
+    $('#procs').innerHTML = s.processes.map(p => `<tr><td class="right num">${p.pid}</td>
+      <td>${esc(p.name)}</td><td class="right num">${esc(p.rss_h)}</td>
+      <td class="right num">${p.swap ? esc(p.swap_h) : '–'}</td>
+      <td><div class="cmd" title="${esc(p.cmd)}">${esc(p.cmd)}</div></td></tr>`).join('');
+  }catch(e){ console.error(e); }
+}
+
+function showDb(d){
+  dbState = d;
+  $('#d-live').textContent = d.h.live;
+  $('#d-conf').textContent = d.h.configured;
+  $('#d-data').textContent = d.h.data;
+  $('#d-rec').textContent = d.h.recommended;
+  $('#d-miss').textContent = d.recent_miss_pct === null ? 'measuring…' : d.recent_miss_pct + '%';
+  $('#d-miss-all').textContent = d.miss_pct === null ? '–' : d.miss_pct + '%';
+  $('#d-perm').innerHTML = d.mounted ? '<span class="badge ok">yes</span>'
+    : '<span class="badge miss">no — falls back to 128M</span>';
+  $('#d-persist').style.display = d.mounted ? 'none' : '';
+  $('#d-range').textContent = d.h.min + ' – ' + d.h.max;
+  $('#d-avail').textContent = d.h.available;
+  if (!$('#d-size').value) $('#d-size').placeholder = 'e.g. ' + d.h.recommended;
+  if (d.error) dbMsg(d.error, true);
+}
+function dbMsg(t, err){ const m = $('#db-msg'); m.textContent = t || ''; m.className = err ? 'err' : (t ? 'okm' : ''); }
+
+async function refreshDb(fresh){
+  try{ showDb(await getJSON('/api/db-memory' + (fresh ? '?fresh=1' : ''))); }catch(e){ console.error(e); }
+}
+
+const toBytes = v => parseInt(v, 10) * (v.toUpperCase().endsWith('G') ? 1073741824 : 1048576);
+async function applySize(size){
+  const live = dbState && dbState.h.live;
+  let warn = '';
+  if (dbState && dbState.live && toBytes(size) - dbState.live > dbState.available)
+    warn = `\n\nWARNING: this needs ${size} but only ${dbState.h.available} of RAM is free. `
+      + 'The pool would push other programs into swap and make the server slower. '
+      + 'Free RAM first (e.g. restart OpenWA), or pick a smaller size.';
+  if (!confirm(`Change the database buffer pool from ${live} to ${size}?\n\nIt applies at once, with no restart.${warn}`)) return;
+  dbMsg('Applying…');
+  for (const b of ['#d-set','#d-userec']) $(b).disabled = true;
+  try{
+    const j = await getJSON('/api/db-memory', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({size})});
+    if (j.error) dbMsg(j.error, true); else { dbMsg(j.message); showDb(j.state); $('#d-size').value = ''; }
+  }catch(e){ dbMsg('Request failed', true); }
+  for (const b of ['#d-set','#d-userec']) $(b).disabled = false;
+  refreshRam();
+}
+$('#d-set').onclick = () => { const v = $('#d-size').value.trim().toUpperCase();
+  if (!/^\d+[MG]$/.test(v)) { dbMsg('Enter a size like 2G or 1536M', true); return; } applySize(v); };
+$('#d-size').onkeydown = e => { if (e.key === 'Enter') $('#d-set').click(); };
+$('#d-userec').onclick = () => dbState && applySize(dbState.h.recommended);
+
+$('#d-persist').onclick = async () => {
+  if (!confirm('Make the buffer pool size permanent?\n\nThis adds the MariaDB settings mount to the '
+    + 'compose file and RECREATES THE DATABASE CONTAINER. Every site loses its database for about '
+    + '10-30 seconds. Do this when nobody is billing.')) return;
+  const b = $('#d-persist'); b.disabled = true; dbMsg('Recreating the db container… (up to a minute)');
+  try{
+    const j = await getJSON('/api/db-memory/persist', {method:'POST'});
+    if (j.error) dbMsg(j.error, true); else { dbMsg(j.message); showDb(j.state); }
+  }catch(e){ dbMsg('Request failed', true); }
+  b.disabled = false;
+};
+
+$('#clear-ram').onclick = async () => {
+  if (!confirm('Clear RAM caches now? This is safe but may briefly slow the system while caches rebuild.')) return;
+  $('#ram-msg').textContent = 'Clearing…';
+  const j = await getJSON('/api/clear-ram', {method:'POST'});
+  $('#ram-msg').textContent = j.error ? j.error : `Freed ${j.freed} — ${j.available} now available`;
+  refreshRam();
+};
+
+setInterval(() => $('#clock').textContent = new Date().toLocaleString(), 1000);
+refreshRam(); refreshDb(true);
+setInterval(refreshRam, 10000);
+setInterval(() => refreshDb(false), 30000);
 </script></body></html>"""
 
 

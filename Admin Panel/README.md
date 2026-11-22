@@ -172,6 +172,31 @@ internal port) whatever the external port is. Ports 22, 53, 3000 and 8090 are
 refused because this server already uses them. ERPNext is offline for about a
 minute while the containers restart. If `ufw` is active, allow the new port.
 
+## RAM monitor and database memory
+
+The **RAM monitor →** link at the top of the dashboard opens `/ram`. It shows:
+
+- alerts for low RAM, active swapping, memory pressure, containers near their memory
+  limit, and a database reading too much from disk
+- memory per container (`docker stats`) and the top processes by RAM and swap
+- the MariaDB **InnoDB buffer pool**: its size now, the saved setting, the database
+  size, a recommended size and the share of reads that went to disk
+
+MariaDB's default pool is 128M. A database bigger than the pool reads from disk,
+and every bill save slows down. **Apply size** changes the pool live, with no
+restart, and saves it to `/opt/sspl-erp/mariadb/99-sspl.cnf`. The installer mounts
+that folder on the db container's `/etc/mysql/conf.d`
+(`frappe_docker/overrides/compose.sspl-db.yaml`) and sizes the pool at 25% of RAM,
+or `DB_BUFFER_POOL=2G` if set.
+
+A stack installed before this has no mount yet, so the page shows **Make permanent
+(restarts DB)**. It adds the mount to `docker-compose.yml`, keeping a
+`.bak-dbmem-<time>` copy, and recreates the db container. Every site loses its
+database for 10–30 seconds, so do it when nobody is billing. Until then a live
+change is lost on the next DB restart.
+
+Keep the pool below the free RAM. A pool pushed into swap is slower than a small one.
+
 ## Cloud backup
 
 By default a backup stays on the server: `frappe_backup.sh`,
