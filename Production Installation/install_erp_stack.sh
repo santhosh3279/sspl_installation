@@ -131,6 +131,42 @@ services:
 EOF
 echo "✓ Wrote overrides/compose.pdf-fix.yaml"
 
+# MariaDB memory. Its default 128M InnoDB buffer pool leaves an ERPNext
+# database of a GB or more mostly on disk, and every bill save (20+ queries per
+# item row) waits on it. The size lives in $ERP_DIR/mariadb/99-sspl.cnf, which
+# compose.sspl-db.yaml mounts on the db container's conf.d. The file is written
+# once: the admin panel's RAM monitor changes it later and a re-run must not
+# undo that. DB_BUFFER_POOL (e.g. 2G) overrides the auto size, 25% of RAM.
+DB_CNF_DIR="$ERP_DIR/mariadb"
+mkdir -p "$DB_CNF_DIR"
+if [ ! -f "$DB_CNF_DIR/99-sspl.cnf" ]; then
+    POOL="${DB_BUFFER_POOL:-}"; POOL="${POOL^^}"
+    if [ -z "$POOL" ]; then
+        TOTAL_MB=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
+        POOL_MB=$(( TOTAL_MB / 4 / 128 * 128 ))
+        [ "$POOL_MB" -ge 128 ] || POOL_MB=128
+        POOL="${POOL_MB}M"
+    fi
+    [[ "$POOL" =~ ^[0-9]+[MG]$ ]] || err "DB_BUFFER_POOL must look like 2G or 1536M (got '$POOL')"
+    printf '%s\n' "# InnoDB buffer pool for the ERPNext database. Change it from the admin" \
+        "# panel's RAM monitor page (it applies live and rewrites this file)." \
+        "[mysqld]" "innodb_buffer_pool_size = $POOL" > "$DB_CNF_DIR/99-sspl.cnf"
+    # MariaDB skips world-writable option files
+    chmod 644 "$DB_CNF_DIR/99-sspl.cnf"
+    echo "✓ MariaDB buffer pool: $POOL ($DB_CNF_DIR/99-sspl.cnf)"
+fi
+cat > "$FD_DIR/overrides/compose.sspl-db.yaml" <<EOF
+# SSPL: MariaDB settings from $DB_CNF_DIR (InnoDB buffer pool, see 99-sspl.cnf).
+services:
+  db:
+    volumes:
+      - type: bind
+        source: $DB_CNF_DIR
+        target: /etc/mysql/conf.d
+        read_only: true
+EOF
+echo "✓ Wrote overrides/compose.sspl-db.yaml"
+
 # ───────────────────────────────────────────── 3. generate docker-compose.yml
 step "Generating $COMPOSE_FILE"
 (cd "$FD_DIR" && sudo docker compose \
@@ -139,6 +175,7 @@ step "Generating $COMPOSE_FILE"
     -f overrides/compose.redis.yaml \
     -f overrides/compose.noproxy.yaml \
     -f overrides/compose.pdf-fix.yaml \
+    -f overrides/compose.sspl-db.yaml \
     --env-file .env config) > "$COMPOSE_FILE"
 echo "✓ Generated merged compose file"
 
