@@ -43,7 +43,7 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-11-23.mt9"
+PANEL_VERSION = "2026-11-23.mt10"
 FEATURES = ("Multi-tenant panel: sites list with per-site backup, DB backup, "
             "migrate, uninstall app and drop; Create site with app picker; "
             "per-site backup browser and guarded per-site restore (also from "
@@ -222,6 +222,23 @@ def https_on():
             return f"listen {p} ssl" in f.read()
     except OSError:
         return False
+
+
+def https_off_reason():
+    """Why https_on() is False, for the panel ("" = HTTPS is live)."""
+    if https_on():
+        return ""
+    p = https_port()
+    if p is None:
+        return (f"HTTPS is turned off: HTTPS_PORT is empty or not a number in {MT_CONF}. "
+                "Set it (e.g. HTTPS_PORT=443), then run Repair nginx routing.")
+    if not os.path.isfile(PROXY_CONF):
+        return "nginx domain routing is not set up yet. Run Install / Repair nginx routing."
+    if not default_cert_ok():
+        return (f"HTTPS is not set up yet: no default certificate. Run Repair nginx routing; if it "
+                f"does not help, its log shows which program holds port {p}.")
+    return (f"nginx is not serving HTTPS on port {p}; usually another program holds that port. "
+            "Run Repair nginx routing: its log names the program. Free the port, then repair again.")
 
 
 def domain_has_cert(domain):
@@ -1023,6 +1040,7 @@ def proxy_status():
           "configured": os.path.isfile(PROXY_CONF), "frontend_local": False,
           "domains": len(domain_map()), "https_port": https_port(),
           "default_cert": default_cert_ok(), "https_live": https_on(),
+          "https_reason": https_off_reason(),
           "certs": sum(1 for d in domain_map() if domain_has_cert(d))}
     try:
         out = subprocess.run(["systemctl", "is-active", "nginx"], capture_output=True, text=True, timeout=5)
@@ -2032,6 +2050,7 @@ def api_sites():
                     "cloud": wired.split() if wired else [],
                     "http_port": http_port(),
                     "https": https_on(),
+                    "https_reason": https_off_reason(),
                     "auth": {"installed": auth_installed(), "users": {s: auth_users(s) for s in list_sites()} if auth_installed() else {}},
                     "stack": os.path.isfile(compose_file()),
                     "tools": os.path.isfile(_tool("lib/common.sh"))})
@@ -2176,7 +2195,7 @@ def _domain_request(name, data):
         if http_port() != 80:
             return None, None, f"Let's Encrypt checks domains on port 80, but this stack's HTTP port is {http_port()}"
         if not https_on():
-            return None, None, "HTTPS is not set up yet — run Repair nginx routing on the installation page"
+            return None, None, https_off_reason()
         return [domain], f"HTTPS certificate for {domain}", None
     if name == "domain_remove":
         owner = dmap.get(domain)
@@ -3407,13 +3426,13 @@ async function refreshSetup(){
     // Host nginx: routes each domain to its site
     const px = c.proxy;
     const pxOk = px.installed && px.running && px.configured && px.frontend_local
-      && (px.https_port === null || px.default_cert);
+      && (px.https_port === null || px.https_live);
     rows += `<div class="setup-row"><div class="setup-h"><b>nginx domain routing</b> ${pill(pxOk)}`
       + (px.installed ? (px.running ? ' <span class="badge ok">running</span>'
                                     : ' <span class="badge miss">stopped</span>') : '')
       + (px.configured ? ` <span class="badge">${px.domains} domain(s)</span>` : '')
       + (px.https_live ? ` <span class="badge ok">HTTPS :${px.https_port}</span>`
-         : (px.https_port !== null && px.default_cert ? ` <span class="badge miss" title="port ${px.https_port} is held by another program">HTTPS off</span>` : ''))
+         : (px.installed ? ` <span class="badge miss" title="${esc(px.https_reason)}">HTTPS off</span>` : ''))
       + (px.certs ? ` <span class="badge">${px.certs} Let's Encrypt</span>` : '') + `</div>`;
     if(erpDone && s.scripts.proxy && !pxOk){
       rows += `<div class="setup-form">
@@ -3425,8 +3444,8 @@ async function refreshSetup(){
       must still resolve to this server: a DNS A record (public DNS or the router) or a hosts-file line per PC.
       HTTPS works on every domain with a self-signed certificate (browsers warn); a public domain gets a trusted
       Let's Encrypt one with <b>Get certificate</b> in its Domains… dialog.</div>`;
-    if(erpDone && px.installed && px.frontend_local && px.https_port !== null && !px.default_cert){
-      rows += `<div class="note" style="color:var(--warn)">HTTPS is not set up on this stack yet: <b>Repair nginx routing</b> adds it.</div>`;
+    if(erpDone && px.installed && px.frontend_local && !px.https_live){
+      rows += `<div class="note" style="color:var(--warn)">${esc(px.https_reason)}</div>`;
     }
     if(erpDone && px.installed && !px.frontend_local){
       rows += `<div class="note" style="color:var(--warn)">This stack was installed before nginx routing: its frontend
@@ -3951,7 +3970,7 @@ details{margin:2px 0} details summary{cursor:pointer}
 </div></div>
 <script>
 """ + TERM_JS + r"""
-let SITES = [], IMAGE_APPS = [], SITE_INFO = {}, HTTP_PORT = 80, PROXY_HTTPS = false,
+let SITES = [], IMAGE_APPS = [], SITE_INFO = {}, HTTP_PORT = 80, PROXY_HTTPS = false, HTTPS_REASON = '',
     AUTH = {installed: false, users: {}};
 
 async function runAction(act, body){
@@ -4002,7 +4021,7 @@ async function refreshSites(){
     SITES = j.sites.map(s => s.name);
     SITE_INFO = Object.fromEntries(j.sites.map(s => [s.name, s]));
     HTTP_PORT = j.http_port || 80;
-    PROXY_HTTPS = !!j.https;
+    PROXY_HTTPS = !!j.https; HTTPS_REASON = j.https_reason || '';
     AUTH = j.auth || {installed: false, users: {}};
     $('#au-open').style.display = AUTH.installed ? '' : 'none';
     if ($('#au-modal').classList.contains('on') && !$('#au-edit').innerHTML) renderUsers();
@@ -4167,6 +4186,12 @@ function renderDomains(){
   const info = s.domain_info || [];
   $('#dm-body').innerHTML = `<table><thead><tr><th>Domain</th><th></th></tr></thead><tbody>`
     + info.map((d, i) => row(d, i === 0)).join('') + '</tbody></table>';
+  // Say why "Get certificate" is missing.
+  const why = !PROXY_HTTPS ? HTTPS_REASON
+    : HTTP_PORT !== 80 ? `Let's Encrypt checks domains on port 80, but this stack's HTTP_PORT is ${HTTP_PORT}.` : '';
+  if (why && info.some(d => !d.is_ip && !d.cert))
+    $('#dm-body').innerHTML += `<p style="color:var(--warn)"><b>Get certificate</b> is unavailable. ${esc(why)}
+      ${PROXY_HTTPS ? '' : '<a href="/install">Open the installation suite</a>'}</p>`;
   const box = $('#dm-auth');
   if (!AUTH.installed){ box.style.display = 'none'; return; }
   box.style.display = '';
