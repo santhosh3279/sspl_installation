@@ -16,6 +16,9 @@
 #   auth.sh user-remove <site> <user>
 #   auth.sh user-reset-2fa <site> <user>
 #   auth.sh trusted ["<cidr> <cidr>..."]
+#   auth.sh ips [<site>]
+#   auth.sh ip-add <site> bypass|trusted <ip|cidr>
+#   auth.sh ip-remove <site> bypass|trusted <ip|cidr>
 #   auth.sh mail-test <to>
 #   auth.sh apply
 #
@@ -26,6 +29,10 @@
 #   user-*      passwords come from env AUTH_PASSWORD, or a prompt; never argv
 #   user-reset-2fa  forget the user's TOTP / security keys (lost phone)
 #   trusted     networks where the password is enough (no 2FA); "" = none
+#   ip-add      for one site, on top of the all-site lists: bypass = no Authelia
+#               login from there (the ERPNext login still applies), trusted =
+#               password only (no 2FA). /8 or narrower. Everyone behind that
+#               address gets it; behind another proxy that is everyone.
 #   mail-test   send a test mail through the relay (Gmail) and show the result
 #
 # Logging in: https://<domain>/authelia/ is reached automatically. The first
@@ -69,11 +76,30 @@ need_site() {
     auth_init_site "$SITE" || err "could not create $(auth_site_dir "$SITE")"
 }
 
-# The site's own domains must all suit Authelia's cookie rule.
+# An IPv4 network in canonical form ("10.1.2.3/24" is 10.1.2.0/24); fails on
+# anything else, and on networks so wide they would open the site.
+canon_net() {
+    python3 -I - "$1" <<'PY'
+import ipaddress, sys
+try:
+    n = ipaddress.IPv4Network(sys.argv[1], strict=False)
+except ValueError:
+    sys.exit(1)
+if n.prefixlen < 8:
+    sys.exit(1)
+print(n.network_address if n.prefixlen == 32 else n)
+PY
+}
+
+# Authelia needs one address it can set a cookie on: a domain with a dot, or
+# IP + port. The site's dotless names redirect there.
 check_linkable() {   # $1 site
-    local d bad=""
-    for d in $(site_domains "$1"); do auth_domain_ok "$d" || bad="$bad $d"; done
-    [ -z "$bad" ] || err "Authelia needs domains with a dot (or IP addresses): remove or rename$bad first (domains.sh)"
+    local d
+    [ -n "$(auth_site_hosts "$1")" ] \
+        || err "$1 has no domain with a dot and no IP + port, which Authelia needs: add one first (domains.sh add $1 <domain>)"
+    for d in $(site_domains "$1"); do
+        auth_domain_ok "$d" || warn "$d has no dot: browsers that open it are sent to $(auth_home_url "$1")"
+    done
     if [ -n "$(site_ports "$1")" ] && [ -z "$(server_ip)" ]; then
         err "$1 has IP:port addresses but the server IP is unknown — set SERVER_IP in $SSPL_CONF"
     fi
@@ -192,6 +218,51 @@ case "$CMD" in
         apply_proxy || err "Authelia did not take it"
         [ -z "$AUTH_FAILED" ] || err "not applied on:$AUTH_FAILED"
         ok "password only (no 2FA) from: ${NETS:-nowhere}"
+        ;;
+
+    ips)
+        need_auth
+        echo "All sites: bypass: ${AUTH_BYPASS_NETWORKS:-none}   no 2FA: ${AUTH_TRUSTED_NETWORKS:-none}"
+        for SITE in ${1:-$(list_sites)}; do
+            echo "$SITE$(site_auth_linked "$SITE" && echo " (linked)")"
+            for k in bypass trusted; do
+                auth_site_nets "$SITE" "$k" | sed "s/^/   $k  /"
+            done
+        done
+        ;;
+
+    ip-add|ip-remove)
+        [ $# -eq 3 ] || usage
+        need_site "$1"
+        KIND="$2"
+        case "$KIND" in bypass|trusted) ;; *) usage ;; esac
+        NET=$(canon_net "$3") || err "'$3' is not an IPv4 address or network of /8 or narrower (e.g. 203.0.113.7 or 192.168.1.0/24)"
+        take_lock
+        HAVE=no; auth_site_nets "$SITE" "$KIND" | grep -xF -- "$NET" >/dev/null && HAVE=yes
+        if [ "$CMD" = ip-add ]; then
+            [ "$HAVE" = no ] || { ok "$NET is already on the list"; exit 0; }
+            [ "$(auth_site_nets "$SITE" "$KIND" | wc -l)" -lt 100 ] || err "100 entries per list at most"
+        else
+            [ "$HAVE" = yes ] || err "$NET is not on the $KIND list of $SITE"
+        fi
+        BAK=$(mktemp); cp "$AUTH_IPS_FILE" "$BAK" 2>/dev/null || : > "$BAK"
+        if [ "$CMD" = ip-add ]; then auth_add_net "$SITE" "$KIND" "$NET"; else auth_remove_net "$SITE" "$KIND" "$NET"; fi
+        if site_auth_linked "$SITE"; then
+            if ! apply_proxy || [[ " $AUTH_FAILED " == *" $SITE "* ]]; then
+                # Adding failed: take it back. Removing failed: keep it removed,
+                # so the next apply closes it.
+                if [ "$CMD" = ip-add ]; then
+                    _edit_auth_ips sh -c 'cat "$1"' _ "$BAK"
+                    apply_proxy >/dev/null 2>&1 || true
+                    rm -f "$BAK"; err "not applied — see above; $NET was not added"
+                fi
+                rm -f "$BAK"; err "$NET is off the list but may still be in effect — see above, then: $0 apply"
+            fi
+        else
+            warn "$SITE has no Authelia login: the list takes effect when it is linked"
+        fi
+        rm -f "$BAK"
+        ok "$SITE, $KIND: $NET $([ "$CMD" = ip-add ] && echo added || echo removed)"
         ;;
 
     mail-test)

@@ -80,6 +80,17 @@ sudo multi-tenant/install/use-standard-ports.sh
 It needs 80 and 443 free, rewrites every site's `host_name`, and puts the old
 port back if nginx fails. Links with the old port stop working.
 
+### Panel development
+
+```bash
+cd multi-tenant/admin-panel && ./dev.sh      # http://127.0.0.1:8091, dev / dev
+```
+
+Runs the checkout's `app.py` with live reload and fake sites, no root needed.
+It listens on 127.0.0.1 only (`ssh -L 8091:127.0.0.1:8091 <server>` from another
+PC). Buttons print the command they would run; nothing is executed. State is in
+`~/.cache/sspl-panel-dev`; `./dev.sh --reset` rebuilds it.
+
 ## Install from the terminal (fresh server)
 
 ```bash
@@ -243,7 +254,7 @@ sudo SMTP_USER=you@gmail.com SMTP_PASSWORD='abcd efgh ijkl mnop' \
 - Needs HTTPS on the host nginx (`install-proxy.sh`). Authelia only works on
   `https://` pages.
 
-**Add a user, then link the site:** **Authelia users…** on the dashboard, then the
+**Add a user, then link the site:** the **Authelia** page (dashboard top bar), then the
 site's **Domains…** → **Require Authelia login**. Or:
 
 ```bash
@@ -260,7 +271,7 @@ linked, and the last one of a linked site cannot be removed. Then:
 - The site becomes HTTPS-only. HTTP redirects to HTTPS, and its IP + port
   addresses switch to TLS. Without a Let's Encrypt certificate, browsers warn
   about the self-signed one.
-- Only the site's own users get in. Manage them under **Authelia users…**, or with
+- Only the site's own users get in. Manage them on the **Authelia** page, or with
   `auth.sh user-add`, `user-passwd`, `user-disable`, `user-remove` and
   `user-reset-2fa`, each with the site first. Passwords come from `AUTH_PASSWORD`
   or a prompt, never the command line.
@@ -278,14 +289,25 @@ linked, and the last one of a linked site cannot be removed. Then:
 - **IP + port:** each port has its own login at `https://<server-ip>:<port>/authelia/`.
 - **If a site's Authelia is down,** that site is closed, not open; other sites are
   not affected. `auth.sh status` shows which.
-- **Trusted and bypass networks** apply to every linked site.
+- **Trusted and bypass networks** in `sspl-mt.conf` apply to every linked site.
+  Each site can add its own on the Authelia page, or with
+  `auth.sh ip-add <site> bypass|trusted <ip|cidr>` (`ip-remove`, `ips`); stored in
+  `/opt/sspl-erp/site-auth-ips`. `bypass` (whitelist) skips the Authelia login; the
+  ERPNext login still applies, and HTTP still redirects to HTTPS. Both match the
+  address nginx sees: behind another proxy or CDN that is the proxy's, so do not
+  list it there.
+- **2FA IPs:** the Authelia page lists where each user passed 2FA, read from the
+  site's `db.sqlite3` login log. Sessions stay in Redis: Authelia has no SQLite
+  session store.
 - **Not gated:** the ERP containers themselves (PDF rendering fetches the
   site's own URL), plus `AUTH_BYPASS_NETWORKS`.
 - **Stopped by the login:** API-token clients, the Frappe mobile app,
   webhooks, payment callbacks and public web forms. Give those an unlinked
   domain, or put their fixed addresses in `AUTH_BYPASS_NETWORKS`.
-- **Domain names:** Authelia needs domains with a dot (or IP addresses).
-  Single-label names like `acmelan` cannot be linked.
+- **Domain names:** Authelia needs one domain with a dot, or an IP + port. Names
+  without a dot (a site called `acmelan`) redirect to it: the domain with a
+  Let's Encrypt certificate, else the first one. The last such address of a
+  linked site cannot be removed.
 
 **From the single shared Authelia (before mt9):** re-run `install-auth.sh` (**Save
 settings**). Each site gets the users that were allowed on it, and each linked site

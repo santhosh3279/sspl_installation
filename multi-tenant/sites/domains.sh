@@ -116,7 +116,7 @@ case "$CMD" in
             err "$DOMAIN is the name of another site"
         fi
         if site_auth_linked "$SITE" && ! auth_domain_ok "$DOMAIN"; then
-            err "$SITE is behind Authelia, which needs a domain with a dot (or an IP address) — $DOMAIN has none"
+            warn "$SITE is behind Authelia and $DOMAIN has no dot: browsers are sent to $(auth_home_url "$SITE")"
         fi
         if [ -n "$CUR" ]; then
             ok "$DOMAIN already points at $SITE"
@@ -140,6 +140,8 @@ case "$CMD" in
         SITE=$(domain_site "$DOMAIN")
         [ -n "$SITE" ] || err "$DOMAIN is not in the domain table"
         [ "$DOMAIN" != "$SITE" ] || err "$DOMAIN is the site's own name — drop the site to remove it"
+        auth_keeps_address "$SITE" "$DOMAIN" \
+            || err "$DOMAIN is the last address of $SITE that works with Authelia — add another or unlink the site first (auth.sh unlink $SITE)"
         # A domain that is the site's host_name: fall back to the site's own name.
         if [ "$(primary_domain "$SITE")" = "$DOMAIN" ]; then
             set_primary "$SITE" "$SITE"
@@ -249,6 +251,8 @@ case "$CMD" in
         take_lock
         SITE=$(port_site "$PORT")
         [ -n "$SITE" ] || err "port $PORT is not assigned to a site"
+        auth_keeps_address "$SITE" "$PORT" \
+            || err "port $PORT is the last address of $SITE that works with Authelia — add a domain with a dot or unlink the site first (auth.sh unlink $SITE)"
         if [ "$(primary_port "$SITE")" = "$PORT" ]; then
             set_primary "$SITE" "$SITE"
         fi
