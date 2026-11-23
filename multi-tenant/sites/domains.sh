@@ -220,10 +220,11 @@ case "$CMD" in
         take_lock
         CUR=$(port_site "$PORT")
         [ -z "$CUR" ] || [ "$CUR" = "$SITE" ] || err "port $PORT already belongs to $CUR"
-        for r in "$HTTP_PORT" "$HTTPS_PORT" "$FRONTEND_PORT" "$AUTH_PORT" 22 2785 8090; do
-            [ "$PORT" != "$r" ] || err "port $PORT is reserved (HTTP/HTTPS, the stack's nginx, Authelia, SSH, OpenWA or the panel)"
+        for r in "$HTTP_PORT" "$HTTPS_PORT" "$FRONTEND_PORT" 22 2785 8090; do
+            [ "$PORT" != "$r" ] || err "port $PORT is reserved (HTTP/HTTPS, the stack's nginx, SSH, OpenWA or the panel)"
         done
         if [ -z "$CUR" ]; then
+            auth_port_reserved "$PORT" && err "ports $((AUTH_BASE_PORT + 1))-$((AUTH_BASE_PORT + AUTH_MAX_SITES - 1)) are reserved for Authelia"
             port_busy_by_other "$PORT" && err "port $PORT is in use by another program: $(ss -ltnpH "sport = :$PORT" | head -1)"
             add_port "$PORT" "$SITE"
             if ! apply_proxy; then

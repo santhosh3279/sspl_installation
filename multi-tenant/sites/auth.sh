@@ -2,25 +2,27 @@
 # The Authelia login gate in front of tenant sites (install/install-auth.sh
 # installs it).
 #
+# Every site has its own Authelia: own users, passwords and 2FA. The same user
+# name on two sites is two unrelated accounts.
+#
 # Usage:
 #   auth.sh status
 #   auth.sh link <site>                 put <site> behind Authelia
 #   auth.sh unlink <site>
-#   auth.sh users
-#   auth.sh user-add <user> <email> <name> [<site>,<site>...] [--admin]
-#   auth.sh user-passwd <user>
-#   auth.sh user-sites <user> [<site>,<site>...]
-#   auth.sh user-admin <user> yes|no
-#   auth.sh user-disable <user> yes|no
-#   auth.sh user-remove <user>
-#   auth.sh user-reset-2fa <user>
+#   auth.sh users [<site>]
+#   auth.sh user-add <site> <user> <email> <name>
+#   auth.sh user-passwd <site> <user>
+#   auth.sh user-disable <site> <user> yes|no
+#   auth.sh user-remove <site> <user>
+#   auth.sh user-reset-2fa <site> <user>
 #   auth.sh trusted ["<cidr> <cidr>..."]
 #   auth.sh mail-test <to>
 #   auth.sh apply
 #
 #   link        every domain and IP:port of the site asks for a login; the
 #               site becomes HTTPS-only (self-signed until a domain gets a
-#               certificate). Users need the site in their list, or admin.
+#               certificate). Add a user first: user-add.
+#   unlink      stops asking; the site's users and 2FA are kept for later
 #   user-*      passwords come from env AUTH_PASSWORD, or a prompt; never argv
 #   user-reset-2fa  forget the user's TOTP / security keys (lost phone)
 #   trusted     networks where the password is enough (no 2FA); "" = none
@@ -36,9 +38,8 @@
 set -euo pipefail
 source "$(cd "$(dirname "$0")/.." && pwd)/lib/common.sh"
 
-usage() { sed -n '5,19p' "$0" | sed 's/^#  */Usage: /' >&2; exit 2; }
-USERS_DB="$AUTH_DIR/config/users_database.yml"
-users_py() { python3 "$TOOLS_DIR/lib/authusers.py" "$USERS_DB" "$@"; }
+usage() { sed -n '/^# Usage:/,/^#   auth.sh apply/p' "$0" | sed '1d; s/^#  */Usage: /' >&2; exit 2; }
+users_py() { python3 "$TOOLS_DIR/lib/authusers.py" "$(auth_users_db "$SITE")" "${@}"; }
 
 need_root()    { [ "$(id -u)" -eq 0 ] || err "Run as root (sudo)."; }
 need_auth()    { auth_installed || err "Authelia is not installed — run install/install-auth.sh from the checkout"; }
@@ -57,9 +58,15 @@ ask_password() {
     export AUTH_PASSWORD
 }
 
-check_sites() {   # $1 = comma list; every name must be a site
-    local s
-    for s in ${1//,/ }; do site_exists "$s" || err "no site '$s'"; done
+# A user command's site, with its files. Users set up by the old shared
+# Authelia are moved to their sites first.
+need_site() {
+    SITE="${1:-}"
+    [ -n "$SITE" ] || usage
+    need_root; need_auth
+    require_site "$SITE"
+    if auth_legacy && [ ! -e "$AUTH_DIR/.per-site" ]; then take_lock; auth_migrate || err "could not move the old users to their sites"; fi
+    auth_init_site "$SITE" || err "could not create $(auth_site_dir "$SITE")"
 }
 
 # The site's own domains must all suit Authelia's cookie rule.
@@ -95,29 +102,31 @@ CMD="${1:-}"; shift || true
 case "$CMD" in
     status)
         if ! auth_installed; then echo "Authelia: not installed (install/install-auth.sh)"; exit 0; fi
-        echo "Authelia:  $(curl -fsS -o /dev/null -w 'up' "http://127.0.0.1:$AUTH_PORT/authelia/api/health" 2>/dev/null || echo DOWN) (127.0.0.1:$AUTH_PORT)"
         echo "Mail:      ${SMTP_USER:-not configured} via $SMTP_RELAY_HOST:$SMTP_RELAY_PORT"
         echo "Remember:  $AUTH_REMEMBER_ME    no-2FA networks: ${AUTH_TRUSTED_NETWORKS:-none}"
         echo "Linked sites:"
         auth_sites | while read -r s; do
-            printf '  %-30s %s\n' "$s" "$(site_domains "$s" | tr '\n' ' ')$(for p in $(site_ports "$s"); do printf '%s:%s ' "$(server_ip)" "$p"; done)"
+            printf '  %-30s %-5s %s user(s)  127.0.0.1:%s  %s\n' "$s" "$(auth_healthy "$s" && echo up || echo DOWN)" \
+                "$(auth_user_count "$s")" "$(auth_upstream_port "$s")" \
+                "$(site_domains "$s" | tr '\n' ' ')$(for p in $(site_ports "$s"); do printf '%s:%s ' "$(server_ip)" "$p"; done)"
         done
+        if auth_legacy; then echo "Still on the old shared Authelia — run: $0 apply"; fi
         [ -n "$(auth_sites)" ] || echo "  (none)"
         ;;
 
     link|unlink)
-        SITE="${1:-}"; [ -n "$SITE" ] || usage
-        need_root; need_auth
-        require_site "$SITE"
+        need_site "${1:-}"
         take_lock
         if [ "$CMD" = link ]; then
             https_on || err "HTTPS is off on the host nginx — Authelia only works on https:// pages (run install/install-proxy.sh)"
             check_linkable "$SITE"
+            [ "$(auth_user_count "$SITE")" -gt 0 ] || err "add a user first, or nobody can enter: $0 user-add $SITE <user> <email> <name>"
+            WAS=no; site_auth_linked "$SITE" && WAS=yes
             if site_auth_linked "$SITE"; then ok "$SITE is already behind Authelia"; fi
             auth_link_site "$SITE"
-            if ! apply_proxy; then
-                auth_unlink_site "$SITE"; apply_proxy >/dev/null 2>&1 || true
-                err "could not apply — $SITE is NOT linked"
+            if ! apply_proxy || [[ " $AUTH_FAILED " == *" $SITE "* ]]; then
+                if [ "$WAS" = no ]; then auth_unlink_site "$SITE"; apply_proxy >/dev/null 2>&1 || true; fi
+                err "could not apply — see above$([ "$WAS" = yes ] || echo "; $SITE is NOT linked")"
             fi
             ok "$SITE is behind Authelia"
         else
@@ -128,78 +137,65 @@ case "$CMD" in
         fi
         host_name_to_https "$SITE" || warn "could not update host_name of $SITE"
         if [ "$CMD" = link ]; then
-            N=$(users_py list --json | python3 -c "import json,sys; s=sys.argv[1]; print(sum(1 for u in json.load(sys.stdin) if s in u['sites'] or u['admin']))" "$SITE")
             echo ""
             echo "✅ $SITE asks for a login on:"
             for d in $(site_domains "$SITE"); do echo "   $(domain_url "$d")"; done
             for p in $(site_ports "$SITE"); do echo "   https://$(server_ip):$p"; done
-            [ "$N" -gt 0 ] || warn "no user may enter $SITE yet: $0 user-add <user> <email> <name> $SITE"
         fi
         ;;
 
     users)
-        need_auth; users_py list
+        need_auth
+        for SITE in ${1:-$(list_sites)}; do
+            echo "$SITE$(site_auth_linked "$SITE" && echo " (linked)")"
+            users_py list | sed 's/^/   /'
+        done
         ;;
 
     user-add)
-        need_root; need_auth
-        [ $# -ge 3 ] || usage
-        U="$1" E="$2" N="$3"; shift 3
-        SITES=""; ADMIN=()
-        for a in "$@"; do
-            if [ "$a" = --admin ]; then ADMIN=(--admin); else SITES="$a"; fi
-        done
-        check_sites "$SITES"
-        ask_password "$U"
-        users_py add "$U" "$E" "$N" "$SITES" ${ADMIN[@]+"${ADMIN[@]}"}
-        # Without any user Authelia crash-loops: bring it up with the first one.
-        if ! curl -fsS -m 5 -o /dev/null "http://127.0.0.1:$AUTH_PORT/authelia/api/health" 2>/dev/null; then
-            echo "→ Authelia is not answering; restarting it..."
-            auth_dc up -d authelia >/dev/null 2>&1 && auth_dc restart authelia >/dev/null 2>&1 \
-                || err "could not start Authelia — docker compose -p $AUTH_PROJECT logs authelia"
-            auth_wait || err "the user was added, but Authelia is not healthy"
-            ok "Authelia is running"
+        [ $# -eq 4 ] || usage
+        need_site "$1"; shift
+        ask_password "$1"
+        users_py add "$1" "$2" "$3"
+        # Its Authelia does not run without users: start it with the first one.
+        if site_auth_linked "$SITE" && ! auth_healthy "$SITE"; then
+            take_lock
+            apply_proxy || err "the user was added, but Authelia was not applied — see above"
+            auth_healthy "$SITE" || err "the user was added, but Authelia of $SITE is not healthy"
         fi
         ;;
 
     user-passwd)
-        need_root; need_auth
-        [ -n "${1:-}" ] || usage
-        ask_password "$1"
-        users_py passwd "$1"
+        [ $# -eq 2 ] || usage
+        need_site "$1"
+        ask_password "$2"
+        users_py passwd "$2"
         ;;
 
-    user-sites)
-        need_root; need_auth
-        [ -n "${1:-}" ] || usage
-        check_sites "${2:-}"
-        users_py sites "$1" "${2:-}"
-        ;;
-
-    user-admin|user-disable)
-        need_root; need_auth
-        [ -n "${1:-}" ] && [ -n "${2:-}" ] || usage
-        users_py "${CMD#user-}" "$1" "$2"
+    user-disable)
+        [ $# -eq 3 ] || usage
+        need_site "$1"
+        users_py disable "$2" "$3"
         ;;
 
     user-remove)
-        need_root; need_auth
-        [ -n "${1:-}" ] || usage
-        users_py remove "$1"
-        # Its 2FA devices, so a re-created user with the same name starts clean.
-        auth_dc exec -T authelia authelia storage user totp delete "$1" --config /config/configuration.yml >/dev/null 2>&1 || true
-        auth_dc exec -T authelia authelia storage user webauthn delete "$1" --all --config /config/configuration.yml >/dev/null 2>&1 || true
+        [ $# -eq 2 ] || usage
+        need_site "$1"
+        users_py list --json | grep -F "\"user\": \"$2\"" >/dev/null || err "no user '$2' on $SITE"
+        if site_auth_linked "$SITE" && [ "$(auth_user_count "$SITE")" -le 1 ]; then
+            err "$2 is the only user of $SITE — Authelia does not start without one; add another or unlink the site first"
+        fi
+        # Its 2FA devices too, so a re-created user with the same name starts clean.
+        auth_forget_2fa "$SITE" "$2" || err "could not remove the 2FA devices of $2 — nothing was changed"
+        users_py remove "$2"
         ;;
 
     user-reset-2fa)
-        need_root; need_auth
-        [ -n "${1:-}" ] || usage
-        users_py list --json | grep -F "\"user\": \"$1\"" >/dev/null || err "no user '$1'"
-        auth_dc exec -T authelia authelia storage user totp delete "$1" --config /config/configuration.yml >/dev/null 2>&1 \
-            && ok "TOTP of $1 removed" || ok "$1 had no TOTP"
-        auth_dc exec -T authelia authelia storage user webauthn delete "$1" --all --config /config/configuration.yml >/dev/null 2>&1 \
-            && ok "security keys of $1 removed" || true
-        ok "$1 registers 2FA again at the next login"
+        [ $# -eq 2 ] || usage
+        need_site "$1"
+        users_py list --json | grep -F "\"user\": \"$2\"" >/dev/null || err "no user '$2' on $SITE"
+        auth_forget_2fa "$SITE" "$2" || err "could not reset the 2FA of $2"
+        ok "$2 registers 2FA again at the next login on $SITE"
         ;;
 
     trusted)
@@ -212,7 +208,8 @@ case "$CMD" in
             "$SSPL_CONF" > "$tmp"
         chmod --reference="$SSPL_CONF" "$tmp"; mv -f "$tmp" "$SSPL_CONF"
         AUTH_TRUSTED_NETWORKS="$NETS"
-        apply_auth || err "Authelia did not take it"
+        apply_proxy || err "Authelia did not take it"
+        [ -z "$AUTH_FAILED" ] || err "not applied on:$AUTH_FAILED"
         ok "password only (no 2FA) from: ${NETS:-nowhere}"
         ;;
 
@@ -243,6 +240,7 @@ case "$CMD" in
         need_root; need_auth
         take_lock
         apply_proxy || err "not applied — see above"
+        [ -z "$AUTH_FAILED" ] || err "not working on:$AUTH_FAILED"
         ok "Authelia and nginx are up to date"
         ;;
 

@@ -43,7 +43,6 @@ LOCK_FILE=/run/lock/sspl-erp.lock
 # Authelia login gate + mail relay (install/install-auth.sh, sites/auth.sh)
 AUTH_DIR=/opt/sspl-auth
 AUTH_PROJECT=sspl-auth
-AUTH_PORT=9091                 # Authelia, on 127.0.0.1 only
 AUTH_IMAGE=authelia/authelia:4.39.28
 AUTH_REDIS_IMAGE=redis:7.4-alpine
 AUTH_REMEMBER_ME=1y            # "Remember me" ticked: no login for this long
@@ -494,15 +493,24 @@ remove_cert() {   # $1 domain
 
 # ───────────────────────────────────────────── Authelia login gate
 #
-# install/install-auth.sh runs Authelia, its Redis and a mail relay (Postfix
-# → Gmail) as a separate compose project in AUTH_DIR. A site linked with
-# 'sites/auth.sh link <site>' is gated: the host nginx asks Authelia about
-# every request (auth_request) and sends a browser without a session to the
-# login portal, served at /authelia/ on the site's own domain.
+# One Authelia per linked site, so nothing is shared between tenants: own
+# users and passwords, own 2FA registrations, own lockouts, own sessions. The
+# same user name on two sites is two unrelated accounts; there is no global
+# admin. They run in one compose project in AUTH_DIR, next to one Redis and
+# one mail relay (Postfix → Gmail), see install/install-auth.sh.
 #
-#   - Users and their sites: AUTH_DIR/users.json (lib/authusers.py). A user
-#     may enter the sites whose name is one of their groups; group "admins"
-#     enters every linked site.
+#   AUTH_DIR/sites/<site>/config    configuration.yml, users, 2FA database
+#   AUTH_DIR/sites/<site>/secrets   this site's own session/storage/jwt keys
+#   AUTH_DIR/sites/.ports           "<site> <port>": its Authelia, 127.0.0.1
+#
+# A site linked with 'sites/auth.sh link <site>' is gated: the host nginx asks
+# the site's Authelia about every request (auth_request) and sends a browser
+# without a session to the login portal, at /authelia/ on the site's own
+# address. If that Authelia is down, the site is closed, not open.
+#
+#   - Sessions: own Redis database, own secret and own cookie name per site.
+#     The cookie name matters: browsers share cookies across the ports of one
+#     IP, and a parent domain's cookie reaches its subdomains.
 #   - "Remember me" keeps the session for AUTH_REMEMBER_ME (1y), in Redis
 #     (persistent), so a browser that logged in with 2FA is not asked again.
 #   - AUTH_TRUSTED_NETWORKS: there the password is enough (no 2FA).
@@ -514,16 +522,17 @@ remove_cert() {   # $1 domain
 # its domains redirect HTTP to HTTPS, and its IP:port addresses switch to
 # TLS (self-signed default certificate).
 #
-# Authelia rules match the hostname, not the port, and every IP:port site
-# shares the one IP. So the gate tells Authelia which port it is asking
-# about with a marker path, https://<ip>:<port>/__sspl_port/<port>/..., and
-# the rules match that path. After the login the browser lands on the
-# marker URL; nginx strips it again.
+# An Authelia without any user does not start: link needs a user, and the
+# last user of a linked site cannot be removed.
+AUTH_SITES_DIR="$AUTH_DIR/sites"
+AUTH_PORTS_FILE="$AUTH_SITES_DIR/.ports"
+AUTH_BASE_PORT=29100        # a site's Authelia: AUTH_BASE_PORT + n, never reused
+AUTH_MAX_SITES=1000         # = Redis databases
 
 auth_dc() { docker compose -p "$AUTH_PROJECT" -f "$AUTH_DIR/compose.yaml" "$@"; }
-auth_installed() { [ -f "$AUTH_DIR/compose.yaml" ] && [ -f "$AUTH_DIR/config/configuration.yml" ]; }
+auth_installed() { [ -f "$AUTH_DIR/compose.yaml" ] && [ -s "$AUTH_DIR/secrets/redis" ]; }
 
-# Linked sites that still exist in the domain table, one per line.
+# Linked sites, one per line.
 auth_sites() {
     [ -r "$AUTH_SITES_FILE" ] || return 0
     local s
@@ -547,6 +556,84 @@ _edit_auth_sites() {
 auth_link_site()   { site_auth_linked "$1" || _edit_auth_sites sh -c 'cat; printf "%s\n" "$1"' _ "$1"; }
 auth_unlink_site() { _edit_auth_sites awk -v s="$1" '$1 != s'; }
 
+auth_site_dir()  { printf '%s/%s' "$AUTH_SITES_DIR" "$1"; }
+auth_users_db()  { printf '%s/%s/config/users_database.yml' "$AUTH_SITES_DIR" "$1"; }
+auth_user_count() {   # $1 site
+    python3 "$TOOLS_DIR/lib/authusers.py" "$(auth_users_db "$1")" list --json 2>/dev/null \
+        | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || echo 0
+}
+auth_site_port() {   # $1 site; empty = none yet
+    [ -r "$AUTH_PORTS_FILE" ] || return 0
+    awk -v s="$1" '$1 == s && !f {print $2; f = 1}' "$AUTH_PORTS_FILE"
+}
+auth_service() { printf 'authelia-%s' "$(auth_site_port "$1")"; }
+auth_port_reserved() { [ "$1" -gt "$AUTH_BASE_PORT" ] && [ "$1" -lt $((AUTH_BASE_PORT + AUTH_MAX_SITES)) ]; }
+# Where nginx sends a linked site's checks. Port 1 (nothing there) if it has
+# no Authelia: the site is closed.
+auth_upstream_port() { local p; p=$(auth_site_port "$1"); printf '%s' "${p:-1}"; }
+
+auth_new_secret() {   # $1 file, $2 length
+    [ -s "$1" ] && return 0
+    # openssl, not 'tr </dev/urandom | head': that pipe dies of SIGPIPE under pipefail.
+    ( umask 077; openssl rand -hex "$(( $2 / 2 ))" | tr -d '\n' > "$1" )
+}
+
+auth_init_site() {   # $1 site: its directories, secrets and users file
+    local d f
+    valid_site_name "$1" || return 1
+    d=$(auth_site_dir "$1")
+    mkdir -p "$d/config" "$d/secrets" || return 1
+    chmod 700 "$AUTH_SITES_DIR" "$d" "$d/config" "$d/secrets"
+    for f in session storage jwt; do auth_new_secret "$d/secrets/$f" 64 || return 1; done
+    [ -s "$(auth_users_db "$1")" ] || ( umask 077; echo '{"users": {}}' > "$(auth_users_db "$1")" )
+}
+
+auth_alloc_port() {   # $1 site
+    [ -z "$(auth_site_port "$1")" ] || return 0
+    local n p
+    n=$(cat "$AUTH_SITES_DIR/.last" 2>/dev/null || echo 0)
+    while :; do
+        n=$((n + 1)); p=$((AUTH_BASE_PORT + n))
+        [ "$n" -lt "$AUTH_MAX_SITES" ] || { warn "no Authelia port left"; return 1; }
+        [ -n "$(ss -ltnH "sport = :$p")" ] || [ -n "$(port_site "$p")" ] || break
+    done
+    echo "$n" > "$AUTH_SITES_DIR/.last"
+    echo "$1 $p" >> "$AUTH_PORTS_FILE"
+}
+
+# A dropped site: no login, no port, and a new site of the same name does not
+# inherit its users. The files are kept aside.
+auth_forget_site() {   # $1 site
+    local d tmp
+    d=$(auth_site_dir "$1")
+    if [ -r "$AUTH_PORTS_FILE" ]; then
+        tmp=$(mktemp "$AUTH_PORTS_FILE.XXXXXX")
+        awk -v s="$1" '$1 != s' "$AUTH_PORTS_FILE" > "$tmp" && mv -f "$tmp" "$AUTH_PORTS_FILE"
+    fi
+    [ -d "$d" ] || return 0
+    mkdir -p "$AUTH_DIR/archived" && chmod 700 "$AUTH_DIR/archived" \
+        && mv "$d" "$AUTH_DIR/archived/$1.$(date +%Y%m%d%H%M%S)"
+}
+
+# Run Authelia's CLI on a site's files, whether or not its container runs.
+auth_cli() {   # $1 site, rest: authelia arguments
+    local d
+    d=$(auth_site_dir "$1"); shift
+    docker run --rm --network none -v "$d/config:/config" -v "$d/secrets:/secrets:ro" \
+        -e AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE=/secrets/storage \
+        "$AUTH_IMAGE" authelia "$@"
+}
+auth_forget_2fa() {   # $1 site, $2 user: their TOTP and security keys
+    [ -f "$(auth_site_dir "$1")/config/db.sqlite3" ] || return 0   # never ran: none
+    local out
+    out=$(auth_cli "$1" storage user totp delete "$2" --config /config/configuration.yml 2>&1) \
+        || printf '%s' "$out" | grep -qiE 'no (totp|rows)|not (found|exist)' \
+        || { printf '%s\n' "$out" | tail -2 >&2; return 1; }
+    out=$(auth_cli "$1" storage user webauthn delete "$2" --all --config /config/configuration.yml 2>&1) \
+        || printf '%s' "$out" | grep -qiE 'no (webauthn|rows)|not (found|exist)' \
+        || { printf '%s\n' "$out" | tail -2 >&2; return 1; }
+}
+
 # Authelia's cookie rule: a domain needs a dot, or must be an IP address.
 auth_domain_ok() { is_ip "$1" || [[ "$1" == *.* ]]; }
 
@@ -554,20 +641,19 @@ auth_linked_domains() {   # every domain of every linked site
     local s
     auth_sites | while read -r s; do site_domains "$s"; done | awk '!seen[$1]++'
 }
-auth_linked_ports() {     # "<port> <site>" for ports of linked sites
-    local p s
-    port_lines | while read -r p s; do
-        if site_auth_linked "$s"; then printf '%s %s\n' "$p" "$s"; fi
-    done
+
+# The hosts of one site: its domains, plus the server IP if it has a port.
+auth_site_hosts() {
+    { site_domains "$1"; [ -z "$(site_ports "$1")" ] || server_ip; echo; } \
+        | while read -r d; do if [ -n "$d" ] && auth_domain_ok "$d"; then echo "$d"; fi; done | awk '!seen[$1]++'
 }
 
-# Session cookie domains: every linked domain (plus the server IP when a
-# linked site has a port), minus those under another one — Authelia refuses
-# overlapping cookie domains, and the parent's cookie covers its subdomains.
-auth_cookie_domains() {
+# Its session cookie domains: the hosts minus those under another one —
+# Authelia refuses overlapping cookie domains, and the parent's cookie covers
+# its subdomains.
+auth_cookie_domains() {   # $1 site
     local all d c under
-    all=$( { auth_linked_domains; [ -z "$(auth_linked_ports)" ] || server_ip; echo; } \
-           | while read -r d; do if [ -n "$d" ] && auth_domain_ok "$d"; then echo "$d"; fi; done | awk '!seen[$1]++')
+    all=$(auth_site_hosts "$1")
     for d in $all; do
         under=no
         if ! is_ip "$d"; then
@@ -580,8 +666,14 @@ auth_cookie_domains() {
     return 0
 }
 
-auth_portal_url() {   # $1 domain
-    printf 'https://%s' "$1"; [ "$HTTPS_PORT" = 443 ] || printf ':%s' "$HTTPS_PORT"; printf '/authelia'
+auth_portal_url() {   # $1 site, $2 host
+    local p=""
+    if [ "$(domain_site "$2")" = "$1" ]; then
+        [ "$HTTPS_PORT" = 443 ] || p=":$HTTPS_PORT"
+    else
+        p=":$(site_ports "$1" | awk 'NR == 1')"      # the server IP: its first port
+    fi
+    printf 'https://%s%s/authelia' "$2" "$p"
 }
 
 # Subnets of the ERP stack's Docker networks: its containers fetch the sites'
@@ -598,12 +690,13 @@ _cidr_list() { local c; for c in $1; do valid_cidr "$c" && echo "$c"; done; retu
 
 _yq() { printf "'%s'" "${1//\'/\'\'}"; }   # YAML single-quoted scalar
 
-# Authelia's configuration.yml, from the linked sites and the config.
-render_authelia_conf() {
-    local d s p trusted subj from
+# One site's configuration.yml.
+render_authelia_conf() {   # $1 site (with a port)
+    local s="$1" d n hosts trusted from
+    n=$(( $(auth_site_port "$s") - AUTH_BASE_PORT ))
     trusted=$(_cidr_list "$AUTH_TRUSTED_NETWORKS")
     from="${MAIL_FROM:-$SMTP_USER}"
-    cat <<EOF
+    cat <<CONF
 # Generated by the SSPL multi-tenant tools — do not edit; sites/auth.sh apply
 # rewrites it. Secrets come from /secrets (the *_FILE variables in compose).
 theme: auto
@@ -614,7 +707,9 @@ log:
 ntp:
   disable_failure: true
 totp:
-  issuer: 'SSPL ERP'
+  issuer: $(_yq "$s")
+webauthn:
+  display_name: $(_yq "$s")
 authentication_backend:
   # Users are managed by sites/auth.sh / the panel (lib/authusers.py), which
   # owns the users file: Authelia must never rewrite it.
@@ -622,8 +717,8 @@ authentication_backend:
     disable: true
   password_change:
     disable: true
-  # Re-read the user on every request: removing a site from a user, or
-  # disabling them, takes effect at once — even on a 1-year session.
+  # Re-read the user on every request: removing or disabling a user takes
+  # effect at once — even on a 1-year session.
   refresh_interval: always
   file:
     path: /config/users_database.yml
@@ -638,7 +733,9 @@ storage:
   local:
     path: /config/db.sqlite3
 session:
-  name: sspl_auth_session
+  # Own cookie name, Redis database and secret: a session of one site means
+  # nothing on another.
+  name: sspl_auth_$n
   same_site: lax
   expiration: $AUTH_EXPIRATION
   inactivity: $AUTH_INACTIVITY
@@ -646,107 +743,238 @@ session:
   redis:
     host: redis
     port: 6379
+    database_index: $n
   cookies:
-EOF
-    local cookies
-    cookies=$(auth_cookie_domains)
-    if [ -z "$cookies" ]; then
-        # Authelia needs one; nothing is linked, nothing reaches it.
-        printf "    - domain: 'sspl-auth.invalid'\n      authelia_url: 'https://sspl-auth.invalid/authelia'\n"
-    fi
-    for d in $cookies; do
-        printf '    - domain: %s\n      authelia_url: %s\n' "$(_yq "$d")" "$(_yq "$(auth_portal_url "$d")")"
+CONF
+    for d in $(auth_cookie_domains "$s"); do
+        printf '    - domain: %s\n      authelia_url: %s\n' "$(_yq "$d")" "$(_yq "$(auth_portal_url "$s" "$d")")"
     done
     if [ -n "$SMTP_USER" ]; then
-        cat <<EOF
+        cat <<CONF
 notifier:
   smtp:
     # The relay container; it forwards to $SMTP_RELAY_HOST:$SMTP_RELAY_PORT.
     address: 'smtp://mail:25'
     sender: $(_yq "SSPL ERP <$from>")
+    subject: $(_yq "[$s] {title}")
     disable_require_tls: true
-EOF
+CONF
     else
-        cat <<'EOF'
+        cat <<'CONF'
 notifier:
   # No mail relay configured (install-auth.sh SMTP_USER): codes are written here.
   filesystem:
     filename: /config/notification.txt
-EOF
+CONF
     fi
-    cat <<'EOF'
+    cat <<'CONF'
 access_control:
   default_policy: deny
   rules:
-EOF
-    # Per-site ports first: the marker path tells them apart on one IP. A
-    # deny after each, so a broader rule for the same IP can never match.
-    local ip
-    ip=$(server_ip)
-    auth_linked_ports | while read -r p s; do
-        [ -n "$ip" ] || continue
-        subj="['group:$s', 'group:admins']"
-        if [ -n "$trusted" ]; then
-            printf "    - domain: %s\n      resources: ['^/__sspl_port/%s([/?]|\$)']\n      subject: %s\n      networks: [%s]\n      policy: one_factor\n" \
-                "$(_yq "$ip")" "$p" "$subj" "$(printf "'%s', " $trusted | sed 's/, $//')"
-        fi
-        printf "    - domain: %s\n      resources: ['^/__sspl_port/%s([/?]|\$)']\n      subject: %s\n      policy: two_factor\n" \
-            "$(_yq "$ip")" "$p" "$subj"
-        printf "    - domain: %s\n      resources: ['^/__sspl_port/%s([/?]|\$)']\n      policy: deny\n" "$(_yq "$ip")" "$p"
+CONF
+    hosts=$(auth_site_hosts "$s" | while read -r d; do printf '%s, ' "$(_yq "$d")"; done | sed 's/, $//')
+    if [ -n "$trusted" ]; then
+        printf "    - domain: [%s]\n      networks: [%s]\n      policy: one_factor\n" \
+            "$hosts" "$(printf "'%s', " $trusted | sed 's/, $//')"
+    fi
+    printf "    - domain: [%s]\n      policy: two_factor\n" "$hosts"
+}
+
+render_auth_redis_conf() {
+    cat <<CONF
+# Generated by the SSPL multi-tenant tools. Authelia's sessions, one database
+# per site: keep them on disk.
+requirepass $(cat "$AUTH_DIR/secrets/redis")
+databases $AUTH_MAX_SITES
+appendonly yes
+appendfsync everysec
+save 3600 1 300 100
+dir /data
+maxmemory-policy noeviction
+protected-mode no
+CONF
+}
+
+render_auth_compose() {
+    local s p
+    cat <<CONF
+# Generated by the SSPL multi-tenant tools — do not edit (sites/auth.sh apply).
+name: $AUTH_PROJECT
+services:
+  redis:
+    image: $AUTH_REDIS_IMAGE
+    restart: unless-stopped
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    volumes:
+      - ./secrets/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - ./redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\$\$(sed -n 's/^requirepass //p' /usr/local/etc/redis/redis.conf) redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+  mail:
+    build: ./mail
+    image: sspl-mail-relay:local
+    restart: unless-stopped
+    environment:
+      SMTP_RELAY_HOST: "$SMTP_RELAY_HOST"
+      SMTP_RELAY_PORT: "$SMTP_RELAY_PORT"
+      SMTP_USER: "$SMTP_USER"
+    volumes:
+      - ./secrets/smtp_password:/run/secrets/smtp_password:ro
+CONF
+    auth_run_sites | while read -r s; do
+        p=$(auth_site_port "$s")
+        cat <<CONF
+  authelia-$p:    # $s
+    image: $AUTH_IMAGE
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      mail:
+        condition: service_started
+    environment:
+      TZ: "$(cat /etc/timezone 2>/dev/null || echo Etc/UTC)"
+      AUTHELIA_SESSION_SECRET_FILE: /secrets/session
+      AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE: /secrets/storage
+      AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE: /secrets/jwt
+      AUTHELIA_SESSION_REDIS_PASSWORD_FILE: /redis_password
+    volumes:
+      - ./sites/$s/config:/config
+      - ./sites/$s/secrets:/secrets:ro
+      - ./secrets/redis:/redis_password:ro
+    ports:
+      - "127.0.0.1:$p:9091"
+CONF
     done
-    # Nothing else may use the marker path.
-    printf "    - domain_regex: '^.*\$'\n      resources: ['^/__sspl_port/']\n      policy: deny\n"
+    cat <<CONF
+networks:
+  default:
+    name: $AUTH_PROJECT
+CONF
+}
+
+# Linked sites that can run an Authelia: a port, a user, a config.
+auth_run_sites() {
+    local s
     auth_sites | while read -r s; do
-        local doms
-        doms=$(site_domains "$s" | while read -r d; do if auth_domain_ok "$d"; then printf '%s, ' "$(_yq "$d")"; fi; done | sed 's/, $//')
-        [ -n "$doms" ] || continue
-        subj="['group:$s', 'group:admins']"
-        if [ -n "$trusted" ]; then
-            printf "    - domain: [%s]\n      subject: %s\n      networks: [%s]\n      policy: one_factor\n" \
-                "$doms" "$subj" "$(printf "'%s', " $trusted | sed 's/, $//')"
-        fi
-        printf "    - domain: [%s]\n      subject: %s\n      policy: two_factor\n" "$doms" "$subj"
+        [ -n "$(auth_site_port "$s")" ] && [ -f "$(auth_site_dir "$s")/config/configuration.yml" ] \
+            && [ "$(auth_user_count "$s")" -gt 0 ] && echo "$s"
     done
     return 0
 }
 
-# Write Authelia's config if it changed, after Authelia itself validated it,
-# and restart it (sessions live in Redis: nobody is logged out).
-apply_auth() {
-    auth_installed || return 0
-    local conf="$AUTH_DIR/config/configuration.yml" tmp out
-    tmp=$(mktemp "$AUTH_DIR/config/.configuration.XXXXXX")
-    render_authelia_conf > "$tmp"
-    if cmp -s "$tmp" "$conf"; then rm -f "$tmp"; return 0; fi
-    if ! out=$(docker run --rm --network none \
-            -v "$tmp:/config/configuration.yml:ro" \
-            -e AUTHELIA_SESSION_SECRET_FILE=/secrets/session \
-            -e AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE=/secrets/storage \
-            -e AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE=/secrets/jwt \
-            -e AUTHELIA_SESSION_REDIS_PASSWORD_FILE=/secrets/redis \
-            -v "$AUTH_DIR/secrets:/secrets:ro" \
-            "$AUTH_IMAGE" authelia validate-config --config /config/configuration.yml 2>&1); then
-        rm -f "$tmp"
-        printf '%s\n' "$out" | grep -E '^\s+- ' | sed 's/^\s*/     /' >&2
-        warn "Authelia rejected the new config — the previous one is kept"
-        return 1
-    fi
-    chmod 644 "$tmp"
-    mv -f "$tmp" "$conf"
-    if auth_dc ps --status running --services 2>/dev/null | grep -x authelia >/dev/null; then
-        auth_dc restart authelia >/dev/null 2>&1 || { warn "could not restart Authelia"; return 1; }
-        auth_wait || return 1
-    fi
+auth_healthy() {   # $1 site
+    curl -fsS -m 5 -o /dev/null "http://127.0.0.1:$(auth_upstream_port "$1")/authelia/api/health" 2>/dev/null
+}
+auth_wait() {   # $1 site — until its Authelia answers (it checks Redis and SMTP at start)
+    local i
+    for i in $(seq 1 60); do auth_healthy "$1" && return 0; sleep 1; done
+    warn "Authelia of $1 did not come up — docker compose -p $AUTH_PROJECT logs $(auth_service "$1")"
+    return 1
 }
 
-auth_wait() {   # until Authelia answers (it checks Redis and SMTP at start)
-    local i
-    for i in $(seq 1 60); do
-        curl -fsS -o /dev/null "http://127.0.0.1:$AUTH_PORT/authelia/api/health" 2>/dev/null && return 0
-        sleep 1
+# Before, one Authelia served every site: give each site its users. Passwords
+# carry over; 2FA is registered again. A global admin becomes an ordinary user
+# of each linked site. The old container keeps serving until nginx switches.
+auth_legacy() { [ -f "$AUTH_DIR/config/configuration.yml" ]; }
+auth_migrate() {
+    auth_legacy && [ ! -e "$AUTH_DIR/.per-site" ] || return 0
+    mkdir -p "$AUTH_SITES_DIR"
+    local s
+    for s in $( { auth_sites; list_sites; } | awk '!seen[$1]++'); do
+        auth_init_site "$s" || return 1
+        python3 "$TOOLS_DIR/lib/authusers.py" "$(auth_users_db "$s")" import \
+            "$AUTH_DIR/config/users_database.yml" "$s" "$(site_auth_linked "$s" && echo linked || echo unlinked)" || return 1
     done
-    warn "Authelia did not come up — docker compose -p $AUTH_PROJECT logs authelia"
-    return 1
+    touch "$AUTH_DIR/.per-site"
+}
+
+# Write a file from stdin if it differs. 0 = changed, 1 = same.
+_auth_put() {   # $1 file, $2 mode
+    local tmp
+    tmp=$(mktemp "$1.XXXXXX"); cat > "$tmp"
+    if cmp -s "$tmp" "$1"; then rm -f "$tmp"; return 1; fi
+    # In place: a single-file bind mount follows the inode, not the name.
+    chmod "$2" "$tmp"
+    if [ -f "$1" ]; then cat "$tmp" > "$1"; chmod "$2" "$1"; rm -f "$tmp"; else mv -f "$tmp" "$1"; fi
+}
+
+# Bring every linked site's Authelia up to date; Authelia validates a config
+# before it is used. A site that fails is named in AUTH_FAILED and stays
+# closed (or on its old config); the others are not held up.
+AUTH_FAILED=""
+apply_auth() {
+    auth_installed || return 0
+    AUTH_FAILED=""
+    local s d tmp out was changed="" running
+    auth_migrate || { warn "could not move the Authelia users to their sites"; return 1; }
+    mkdir -p "$AUTH_SITES_DIR"; chmod 700 "$AUTH_SITES_DIR"
+    docker image inspect "$AUTH_IMAGE" >/dev/null 2>&1 || docker pull -q "$AUTH_IMAGE" >/dev/null \
+        || { warn "could not pull $AUTH_IMAGE"; return 1; }
+    for s in $(auth_sites); do
+        d=$(auth_site_dir "$s")
+        if [ -z "$(site_domains "$s")$(site_ports "$s")" ]; then continue; fi     # no address, nothing to gate
+        if ! auth_init_site "$s" || ! auth_alloc_port "$s"; then AUTH_FAILED="$AUTH_FAILED $s"; continue; fi
+        if [ "$(auth_user_count "$s")" -eq 0 ]; then
+            warn "$s has no Authelia user, so nobody can enter: auth.sh user-add $s <user> <email> <name>"
+            AUTH_FAILED="$AUTH_FAILED $s"; continue
+        fi
+        tmp=$(mktemp "$d/config/.configuration.XXXXXX")
+        render_authelia_conf "$s" > "$tmp"
+        if cmp -s "$tmp" "$d/config/configuration.yml"; then rm -f "$tmp"; continue; fi
+        if ! out=$(docker run --rm --network none \
+                -v "$tmp:/config/configuration.yml:ro" \
+                -e AUTHELIA_SESSION_SECRET_FILE=/secrets/session \
+                -e AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE=/secrets/storage \
+                -e AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE=/secrets/jwt \
+                -e AUTHELIA_SESSION_REDIS_PASSWORD_FILE=/redis_password \
+                -v "$d/secrets:/secrets:ro" -v "$AUTH_DIR/secrets/redis:/redis_password:ro" \
+                "$AUTH_IMAGE" authelia validate-config --config /config/configuration.yml 2>&1); then
+            rm -f "$tmp"
+            printf '%s\n' "$out" | grep -E '^\s+- ' | sed 's/^\s*/     /' >&2
+            warn "Authelia rejected the new config of $s"
+            AUTH_FAILED="$AUTH_FAILED $s"; continue
+        fi
+        chmod 600 "$tmp"; mv -f "$tmp" "$d/config/configuration.yml"
+        changed="$changed $s"
+    done
+
+    was=$(auth_dc ps --status running --services 2>/dev/null || true)
+    render_auth_compose | _auth_put "$AUTH_DIR/compose.yaml" 600 || true
+    if render_auth_redis_conf | _auth_put "$AUTH_DIR/secrets/redis.conf" 644 \
+            && grep -x redis <<< "$was" >/dev/null; then
+        auth_dc restart redis >/dev/null 2>&1 || true      # sessions are on disk
+    fi
+    # No --remove-orphans here: what nginx still uses stays up (auth_cleanup).
+    auth_dc up -d >/dev/null 2>&1 || { auth_dc up -d 2>&1 | tail -5 >&2; warn "docker compose up failed"; return 1; }
+    for s in $changed; do
+        if grep -xF "$(auth_service "$s")" <<< "$was" >/dev/null; then
+            auth_dc restart "$(auth_service "$s")" >/dev/null 2>&1 || true
+        fi
+    done
+    for s in $(auth_run_sites); do
+        auth_wait "$s" || AUTH_FAILED="$AUTH_FAILED $s"
+    done
+    # A site that works through the old shared Authelia must not go dark.
+    if auth_legacy; then
+        for s in $AUTH_FAILED; do
+            [ "$(auth_user_count "$s")" -eq 0 ] || { warn "the old shared Authelia stays in use until $s works"; return 1; }
+        done
+    fi
+    return 0
+}
+
+# After nginx switched: drop the containers of unlinked sites, and the old
+# shared Authelia.
+auth_cleanup() {
+    auth_dc up -d --remove-orphans >/dev/null 2>&1 || warn "could not remove old Authelia containers"
+    if auth_legacy; then
+        mv "$AUTH_DIR/config" "$AUTH_DIR/config.shared-old" && ok "one Authelia per site (old files: $AUTH_DIR/config.shared-old)"
+    fi
+    return 0
 }
 
 # ─────────────────────────────────────────────── host nginx config
@@ -794,23 +1022,28 @@ EOF
 EOF
 }
 
-# The Authelia locations of one server.
+# The Authelia locations of one server: the check and the login portal.
 #   $1 ""      a domain-map server: gate only linked domains ($sspl_auth_skip)
-#      <port>  a linked site's port server: always gated, marker path
-#   $2 "portal" also serve the login portal (HTTPS servers)
+#      <port>  a linked site's port server, always gated
+#   $2         that site
+#   $3 "portal" also serve the login portal (HTTPS servers)
 _auth_locations() {
-    local p="${1:-}" skip='$sspl_auth_skip' url='$scheme://$http_host$request_uri'
+    local p="${1:-}" up='$sspl_auth_port' skip='$sspl_auth_skip' url='$scheme://$http_host$request_uri' guard=""
     if [ -n "$p" ]; then
+        up=$(auth_upstream_port "$2")
         skip='$sspl_bypass'
-        url="https://$(server_ip):$p/__sspl_port/$p\$request_uri"
+        # Our address, not a client-sent Host; Authelia knows only this one.
+        url="https://$(server_ip):$p\$request_uri"
+    else
+        guard='if ($sspl_auth_port = 0) { return 404; }'
     fi
     cat <<EOF
 
-    # Asks Authelia whether this browser may open this URL.
+    # Asks the site's Authelia whether this browser may open this URL.
     location = /internal/sspl-authz {
         internal;
         if ($skip) { return 204; }
-        proxy_pass http://127.0.0.1:$AUTH_PORT/authelia/api/authz/auth-request;
+        proxy_pass http://127.0.0.1:$up/authelia/api/authz/auth-request;
         proxy_pass_request_body off;
         proxy_set_header Content-Length "";
         proxy_set_header Connection "";
@@ -821,23 +1054,13 @@ _auth_locations() {
         proxy_set_header X-Forwarded-For \$remote_addr;
     }
 EOF
-    if [ -n "$p" ]; then
-        cat <<EOF
-    # Back from the login page: drop the port marker.
-    location ^~ /__sspl_port/$p/ {
-        rewrite ^/__sspl_port/$p(/.*)\$ \$1 redirect;
-    }
-EOF
-        return 0
-    fi
-    echo '    location ^~ /__sspl_port/ { return 404; }'
-    [ "${2:-}" = portal ] || return 0
+    [ "${3:-}" = portal ] || return 0
     cat <<EOF
-    # The login portal, on the user's own domain.
-    location = /authelia { return 301 /authelia/; }
+    # The login portal, on the site's own address.
+    location = /authelia { return 301 \$scheme://\$http_host/authelia/; }
     location ^~ /authelia/ {
-        if (\$sspl_auth_portal = 0) { return 404; }
-        proxy_pass http://127.0.0.1:$AUTH_PORT;
+        $guard
+        proxy_pass http://127.0.0.1:$up;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Forwarded-Host \$http_host;
@@ -927,11 +1150,12 @@ map "$sspl_auth:$sspl_bypass" $sspl_auth_skip {
     "1:0"   0;
 }
 EOF
-        echo '# Where the login portal answers: every linked domain, and the IP for ports.'
-        echo 'map $host $sspl_auth_portal {'
+        echo '# The Authelia of each linked domain (127.0.0.1); 0 = not linked.'
+        echo 'map $host $sspl_auth_port {'
         echo '    default 0;'
-        { auth_linked_domains; [ -z "$(auth_linked_ports)" ] || server_ip; } | awk 'NF && !seen[$1]++' \
-            | while read -r d; do printf '    %-40s 1;\n' "$d"; done
+        auth_sites | while read -r s; do
+            site_domains "$s" | while read -r d; do printf '    %-40s %s;\n' "$d" "$(auth_upstream_port "$s")"; done
+        done
         echo '}'
     fi
     local hp=""
@@ -973,7 +1197,7 @@ server {
     # Plain HTTP on this TLS port: send the browser to https://.
     error_page 497 =301 https://\$host:\$server_port\$request_uri;
 $(_proxy_server_common)
-$(_auth_locations "$p")
+$(_auth_locations "$p" "$s" portal)
 
     location / {
 $(_proxy_location "$s" gate)
@@ -1008,7 +1232,7 @@ server {
     ssl_certificate     $SSL_DIR/default.crt;
     ssl_certificate_key $SSL_DIR/default.key;
 $(_proxy_server_common)
-$( [ "$auth" = yes ] && _auth_locations "" portal)
+$( [ "$auth" = yes ] && _auth_locations "" "" portal)
 
     location / {
 $(_proxy_location "" $gate)
@@ -1028,7 +1252,7 @@ server {
     ssl_certificate     $LE_LIVE/$d/fullchain.pem;
     ssl_certificate_key $LE_LIVE/$d/privkey.pem;
 $(_proxy_server_common)
-$( [ "$auth" = yes ] && _auth_locations "" portal)
+$( [ "$auth" = yes ] && _auth_locations "" "" portal)
 
     location / {
 $(_proxy_location "" $gate)
@@ -1088,6 +1312,7 @@ apply_proxy() {
     for p in $HTTP_PORT $(https_on && echo "$HTTPS_PORT") $(port_lines | awk '{print $1}'); do
         nginx_listens "$p" || { warn "nginx is not listening on port $p — journalctl -u nginx"; return 1; }
     done
+    if auth_installed; then auth_cleanup; fi
 }
 
 # ─────────────────────────────────────────────── per-site maintenance window

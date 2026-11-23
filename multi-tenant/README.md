@@ -208,22 +208,22 @@ for a few seconds while the frontend moves.
 
 ## Authelia login (2FA) per site
 
-An optional login gate in front of chosen sites: Authelia (login portal and
-2FA), its Redis (sessions) and a Postfix mail relay that sends through Gmail.
-They run as their own compose project in `/opt/sspl-auth`. Nothing is gated
-until you link a site.
+An optional login gate in front of chosen sites. **Every linked site has its own
+Authelia** (login portal and 2FA), so its users, passwords, 2FA registrations,
+lockouts and sessions are its own: the same user name on two sites is two
+unrelated accounts, and there is no global admin. Each takes about 30-90 MB of
+RAM. They share one Redis (a database per site) and one Postfix mail relay that
+sends through Gmail, in one compose project in `/opt/sspl-auth`. Nothing is
+gated until you link a site.
 
 **Install:** installation page, **Authelia login (2FA) + mail relay** row. Or:
 
 ```bash
 sudo SMTP_USER=you@gmail.com SMTP_PASSWORD='abcd efgh ijkl mnop' \
-     ADMIN_USER=admin ADMIN_EMAIL=you@gmail.com AUTH_PASSWORD='…' \
      AUTH_TRUSTED_NETWORKS="192.168.1.0/24" \
      multi-tenant/install/install-auth.sh
 ```
 
-- The admin user is required on the first install: Authelia does not start
-  without a user, so the last one cannot be removed either.
 - **Gmail:** turn on 2-Step Verification for the Google account, then create an
   **app password** (Google Account → Security → App passwords). Use that, not
   the account password. Gmail sends as that address, or a verified "Send mail
@@ -233,19 +233,27 @@ sudo SMTP_USER=you@gmail.com SMTP_PASSWORD='abcd efgh ijkl mnop' \
 - Needs HTTPS on the host nginx (`install-proxy.sh`). Authelia only works on
   `https://` pages.
 
-**Link a site:** **Domains…** → **Require Authelia login**, or
-`sudo $T/sites/auth.sh link acme.erp.lan`. Then:
+**Add a user, then link the site:** **Authelia users…** on the dashboard, then the
+site's **Domains…** → **Require Authelia login**. Or:
+
+```bash
+sudo $T/sites/auth.sh user-add acme.erp.lan ravi ravi@acme.com "Ravi"
+sudo $T/sites/auth.sh link acme.erp.lan
+```
+
+Authelia does not start without a user, so a site needs one before it can be
+linked, and the last one of a linked site cannot be removed. Then:
 
 - Every domain of the site and every IP + port asks for the Authelia login
-  first. The portal is at `https://<domain>/authelia/` on the site's own
-  domain, so no extra DNS name is needed.
+  first. The portal is at `/authelia/` on the site's own address, so no extra
+  DNS name is needed.
 - The site becomes HTTPS-only. HTTP redirects to HTTPS, and its IP + port
   addresses switch to TLS. Without a Let's Encrypt certificate, browsers warn
   about the self-signed one.
-- Only users who have the site in their list get in, or **admins**. Manage
-  them under **Authelia users…** on the dashboard, or `auth.sh user-add`,
-  `user-sites`, `user-passwd`, `user-reset-2fa` and the like. Passwords come
-  from `AUTH_PASSWORD` or a prompt, never the command line.
+- Only the site's own users get in. Manage them under **Authelia users…**, or with
+  `auth.sh user-add`, `user-passwd`, `user-disable`, `user-remove` and
+  `user-reset-2fa`, each with the site first. Passwords come from `AUTH_PASSWORD`
+  or a prompt, never the command line.
 - **First login:** the user registers 2FA (an authenticator app or a security
   key), confirmed by a code e-mailed through the relay.
 - **Remember me:** that browser stays logged in for `AUTH_REMEMBER_ME` (1y)
@@ -257,9 +265,10 @@ sudo SMTP_USER=you@gmail.com SMTP_PASSWORD='abcd efgh ijkl mnop' \
   password is enough, with no 2FA. Set it with `auth.sh trusted "192.168.1.0/24"`
   or on the installation page. nginx passes Authelia the address of the
   connection, never a client-sent header, so the shortcut cannot be faked.
-- **Where to log in on IP + port:** a site's IP + port shares one login per
-  server IP, at `https://<server-ip>/authelia/`. Each port still only admits
-  the users of its own site.
+- **IP + port:** each port has its own login at `https://<server-ip>:<port>/authelia/`.
+- **If a site's Authelia is down,** that site is closed, not open; other sites are
+  not affected. `auth.sh status` shows which.
+- **Trusted and bypass networks** apply to every linked site.
 - **Not gated:** the ERP containers themselves (PDF rendering fetches the
   site's own URL), plus `AUTH_BYPASS_NETWORKS`.
 - **Stopped by the login:** API-token clients, the Frappe mobile app,
@@ -268,9 +277,14 @@ sudo SMTP_USER=you@gmail.com SMTP_PASSWORD='abcd efgh ijkl mnop' \
 - **Domain names:** Authelia needs domains with a dot (or IP addresses).
   Single-label names like `acmelan` cannot be linked.
 
-**Back up** `/opt/sspl-auth/secrets/` and `/opt/sspl-auth/config/`. The site
-backups do not include them. The `storage` key encrypts the 2FA registrations:
-without it every user registers 2FA again.
+**From the single shared Authelia (before mt9):** re-run `install-auth.sh` (**Save
+settings**). Each site gets the users that were allowed on it, and each linked site
+the old admins as ordinary users. Passwords carry over; everyone logs in and
+registers 2FA again. The old files stay in `/opt/sspl-auth/config.shared-old`.
+
+**Back up** `/opt/sspl-auth/sites/` and `/opt/sspl-auth/secrets/`. The site
+backups do not include them. Each site's `storage` key encrypts its 2FA
+registrations: without it every user registers 2FA again.
 
 ## WireGuard to the print servers
 

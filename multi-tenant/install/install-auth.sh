@@ -2,16 +2,17 @@
 # Install the Authelia login gate for tenant sites, with its Redis and a mail
 # relay, as one compose project in AUTH_DIR (default /opt/sspl-auth):
 #
-#   authelia  login portal + 2FA (TOTP / security keys), 127.0.0.1:AUTH_PORT
-#   redis     Authelia's sessions, persistent: "Remember me" lasts
-#             AUTH_REMEMBER_ME (1y) and survives restarts
-#   mail      Postfix relay → Gmail (smtp.gmail.com:587) with an app
-#             password; not published on any host port, so it can never be
-#             an open relay. Authelia sends 2FA registration codes through it.
+#   authelia-*  one per linked site: login portal + 2FA (TOTP / security
+#               keys) with the site's own users, on 127.0.0.1
+#   redis       their sessions, persistent: "Remember me" lasts
+#               AUTH_REMEMBER_ME (1y) and survives restarts
+#   mail        Postfix relay → Gmail (smtp.gmail.com:587) with an app
+#               password; not published on any host port, so it can never be
+#               an open relay. Authelia sends 2FA registration codes through it.
 #
-# Nothing is gated yet: link a site afterwards with
+# Nothing is gated yet. For each site: add its users, then link it
+#   sites/auth.sh user-add <site> <user> <email> <name>
 #   sites/auth.sh link <site>      (or the panel's Domains… → Authelia)
-# and add users with sites/auth.sh user-add.
 #
 # Needs the host nginx with HTTPS (install-proxy.sh): Authelia only works on
 # https:// pages. Idempotent: re-run to change the mail settings or repair.
@@ -24,8 +25,6 @@
 #                        the account itself or a verified "Send mail as" alias)
 #   AUTH_TRUSTED_NETWORKS  CIDRs where the password is enough, no 2FA,
 #                        e.g. "192.168.1.0/24"
-#   ADMIN_USER, ADMIN_EMAIL, AUTH_PASSWORD   the first admin user; required
-#                        while there are no users (Authelia does not start without one)
 #   MAIL_TEST_TO         send a test mail there at the end
 #   SSPL_CONF            default /opt/sspl-erp/sspl-mt.conf
 #
@@ -55,9 +54,8 @@ if ! grep -q '^AUTH_DIR=' "$SSPL_CONF"; then
     cat >> "$SSPL_CONF" <<EOF
 
 # Authelia login gate (install/install-auth.sh, sites/auth.sh) and its mail
-# relay. Sites behind it: \$ERP_DIR/site-auth. Users: \$AUTH_DIR/config/users_database.yml
+# relay. Sites behind it: \$ERP_DIR/site-auth. Users: \$AUTH_DIR/sites/<site>/config
 AUTH_DIR=$AUTH_DIR
-AUTH_PORT=$AUTH_PORT
 AUTH_REMEMBER_ME=$AUTH_REMEMBER_ME        # "Remember me": no new login for this long
 AUTH_EXPIRATION=$AUTH_EXPIRATION        # without it: session ends after this ...
 AUTH_INACTIVITY=$AUTH_INACTIVITY         # ... or this long idle
@@ -82,34 +80,18 @@ if [ "$_TRUSTED" != __keep__ ]; then
     for c in $_TRUSTED; do valid_cidr "$c" || err "AUTH_TRUSTED_NETWORKS: '$c' is not an IPv4 address or CIDR"; done
     AUTH_TRUSTED_NETWORKS="$_TRUSTED"; set_conf AUTH_TRUSTED_NETWORKS "$AUTH_TRUSTED_NETWORKS"
 fi
-[[ "$AUTH_PORT" =~ ^[0-9]+$ ]] || err "AUTH_PORT must be a number"
-ok "Authelia on 127.0.0.1:$AUTH_PORT, sessions: remember me $AUTH_REMEMBER_ME"
-ok "Mail: ${SMTP_USER:-not configured (2FA codes go to $AUTH_DIR/config/notification.txt)} via $SMTP_RELAY_HOST:$SMTP_RELAY_PORT"
+ok "Sessions: remember me $AUTH_REMEMBER_ME"
+ok "Mail: ${SMTP_USER:-not configured (2FA codes go to $AUTH_DIR/sites/<site>/config/notification.txt)} via $SMTP_RELAY_HOST:$SMTP_RELAY_PORT"
 [ -n "$AUTH_TRUSTED_NETWORKS" ] && ok "Password only (no 2FA) from: $AUTH_TRUSTED_NETWORKS"
 proxy_installed || warn "the host nginx is not installed yet — run install/install-proxy.sh before linking sites"
 https_on || warn "HTTPS is off on the host nginx — linked sites need it (HTTPS_PORT + default certificate)"
 command -v python3 >/dev/null 2>&1 || err "python3 is needed (users file)"
-USERS_DB="$AUTH_DIR/config/users_database.yml"
-USERS_JSON=$(python3 "$TOOLS_DIR/lib/authusers.py" "$USERS_DB" list --json) || err "could not read $USERS_DB"
-if [ "$USERS_JSON" = "[]" ]; then
-    [ -n "${ADMIN_USER:-}" ] && [ -n "${ADMIN_EMAIL:-}" ] && [ "${AUTH_PASSWORD:-}" != "" ] && [ "${#AUTH_PASSWORD}" -ge 8 ] \
-        || err "there are no users yet and Authelia does not start without one — set ADMIN_USER, ADMIN_EMAIL and AUTH_PASSWORD (8+ characters)"
-fi
 
 # ─────────────────────────────────────────────── 2. files and secrets
 step "Files in $AUTH_DIR"
-mkdir -p "$AUTH_DIR"/{config,secrets,redis-data,mail}
-chmod 700 "$AUTH_DIR" "$AUTH_DIR/secrets" "$AUTH_DIR/config"
-new_secret() {   # $1 file, $2 length
-    [ -s "$1" ] && return 0
-    # openssl, not 'tr </dev/urandom | head': that pipe dies of SIGPIPE under pipefail.
-    ( umask 077; openssl rand -hex "$(( $2 / 2 ))" | tr -d '\n' > "$1" )
-    ok "created $(basename "$1") secret"
-}
-new_secret "$AUTH_DIR/secrets/session" 64
-new_secret "$AUTH_DIR/secrets/storage" 64     # encrypts the 2FA data: back it up
-new_secret "$AUTH_DIR/secrets/jwt"     64
-new_secret "$AUTH_DIR/secrets/redis"   40
+mkdir -p "$AUTH_DIR"/{sites,secrets,redis-data,mail}
+chmod 700 "$AUTH_DIR" "$AUTH_DIR/secrets" "$AUTH_DIR/sites"
+auth_new_secret "$AUTH_DIR/secrets/redis" 40
 if [ -n "${SMTP_PASSWORD:-}" ]; then
     ( umask 077; printf '%s' "${SMTP_PASSWORD// /}" > "$AUTH_DIR/secrets/smtp_password" )
     ok "saved the Gmail app password"
@@ -119,20 +101,10 @@ fi
 [ -z "$SMTP_USER" ] || [ -s "$AUTH_DIR/secrets/smtp_password" ] \
     || warn "SMTP_USER is set but there is no app password yet — re-run with SMTP_PASSWORD"
 
-# Redis reads its password from this file (not argv: 'ps' would show it).
-( umask 077
-  cat > "$AUTH_DIR/secrets/redis.conf" <<EOF
-# Generated by install-auth.sh. Authelia's sessions: keep them on disk.
-requirepass $(cat "$AUTH_DIR/secrets/redis")
-appendonly yes
-appendfsync everysec
-save 3600 1 300 100
-dir /data
-maxmemory-policy noeviction
-protected-mode no
-EOF
-)
-chmod 644 "$AUTH_DIR/secrets/redis.conf"   # the container's redis user reads it; the directory is 0700
+# Redis reads its password from this file (not argv: 'ps' would show it). 644:
+# the container's redis user reads it; the directory is 0700.
+REDIS_CHANGED=no
+render_auth_redis_conf | _auth_put "$AUTH_DIR/secrets/redis.conf" 644 && REDIS_CHANGED=yes
 
 cat > "$AUTH_DIR/mail/Dockerfile" <<'EOF'
 # Postfix relay: accepts mail from the containers on its Docker networks and
@@ -175,98 +147,24 @@ postmap lmdb:/etc/postfix/sasl_passwd
 exec postfix start-fg
 EOF
 
-cat > "$AUTH_DIR/compose.yaml" <<EOF
-# Generated by install-auth.sh — re-run it instead of editing.
-name: $AUTH_PROJECT
-services:
-  redis:
-    image: $AUTH_REDIS_IMAGE
-    restart: unless-stopped
-    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
-    volumes:
-      - ./secrets/redis.conf:/usr/local/etc/redis/redis.conf:ro
-      - ./redis-data:/data
-    healthcheck:
-      test: ["CMD-SHELL", "REDISCLI_AUTH=\$\$(sed -n 's/^requirepass //p' /usr/local/etc/redis/redis.conf) redis-cli ping | grep -q PONG"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-  mail:
-    build: ./mail
-    image: sspl-mail-relay:local
-    restart: unless-stopped
-    environment:
-      SMTP_RELAY_HOST: "$SMTP_RELAY_HOST"
-      SMTP_RELAY_PORT: "$SMTP_RELAY_PORT"
-      SMTP_USER: "$SMTP_USER"
-    volumes:
-      - ./secrets/smtp_password:/run/secrets/smtp_password:ro
-  authelia:
-    image: $AUTH_IMAGE
-    restart: unless-stopped
-    depends_on:
-      redis:
-        condition: service_healthy
-      mail:
-        condition: service_started
-    environment:
-      TZ: "$(cat /etc/timezone 2>/dev/null || echo Etc/UTC)"
-      AUTHELIA_SESSION_SECRET_FILE: /secrets/session
-      AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE: /secrets/storage
-      AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE: /secrets/jwt
-      AUTHELIA_SESSION_REDIS_PASSWORD_FILE: /secrets/redis
-    volumes:
-      - ./config:/config
-      - ./secrets:/secrets:ro
-    ports:
-      - "127.0.0.1:$AUTH_PORT:9091"
-networks:
-  default:
-    name: $AUTH_PROJECT
-EOF
+render_auth_compose | _auth_put "$AUTH_DIR/compose.yaml" 600 || true
 ok "compose.yaml, mail relay, Redis config"
 
-# Users file (JSON is valid YAML; lib/authusers.py owns it).
-[ -s "$USERS_DB" ] || { ( umask 077; echo '{"users": {}}' > "$USERS_DB" ); ok "empty users file"; }
-if [ -n "${ADMIN_USER:-}" ]; then
-    if python3 "$TOOLS_DIR/lib/authusers.py" "$USERS_DB" list --json | grep -F "\"user\": \"$ADMIN_USER\"" >/dev/null; then
-        ok "user $ADMIN_USER already exists"
-    else
-        : "${ADMIN_EMAIL:?ADMIN_EMAIL is needed with ADMIN_USER}"
-        python3 "$TOOLS_DIR/lib/authusers.py" "$USERS_DB" add "$ADMIN_USER" "$ADMIN_EMAIL" "$ADMIN_USER" "" --admin
-    fi
-fi
-
-# ─────────────────────────────────────────────── 3. Authelia config + start
+# ─────────────────────────────────────────────── 3. start
 step "Authelia"
 docker image inspect "$AUTH_IMAGE" >/dev/null 2>&1 || docker pull -q "$AUTH_IMAGE" >/dev/null || err "could not pull $AUTH_IMAGE"
-CONF="$AUTH_DIR/config/configuration.yml"
-TMP=$(mktemp "$AUTH_DIR/config/.configuration.XXXXXX")
-render_authelia_conf > "$TMP"
-if ! OUT=$(docker run --rm --network none -v "$TMP:/config/configuration.yml:ro" \
-        -e AUTHELIA_SESSION_SECRET_FILE=/secrets/session \
-        -e AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE=/secrets/storage \
-        -e AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE=/secrets/jwt \
-        -e AUTHELIA_SESSION_REDIS_PASSWORD_FILE=/secrets/redis \
-        -v "$AUTH_DIR/secrets:/secrets:ro" \
-        "$AUTH_IMAGE" authelia validate-config --config /config/configuration.yml 2>&1); then
-    rm -f "$TMP"
-    printf '%s\n' "$OUT" | grep -E '^\s+- ' >&2 || printf '%s\n' "$OUT" | tail -5 >&2
-    err "Authelia rejected the generated config"
-fi
-chmod 644 "$TMP"; mv -f "$TMP" "$CONF"
-ok "configuration.yml (validated)"
-
-auth_dc up -d --build --remove-orphans >/dev/null 2>&1 || { auth_dc up -d --build 2>&1 | tail -5; err "docker compose up failed"; }
-# A changed config or secret needs a restart; 'up' only recreates on compose changes.
-auth_dc restart authelia mail >/dev/null 2>&1 || true
-auth_wait || err "Authelia is not healthy"
-ok "Authelia, Redis and the mail relay are running"
+# Redis and the relay; the sites' Authelias follow in apply_proxy.
+auth_dc up -d --build redis mail >/dev/null 2>&1 || { auth_dc up -d --build redis mail 2>&1 | tail -5; err "docker compose up failed"; }
+# A changed password needs a restart; 'up' only recreates on compose changes.
+[ "$REDIS_CHANGED" = no ] || auth_dc restart redis >/dev/null 2>&1 || true
+auth_dc restart mail >/dev/null 2>&1 || true
+ok "Redis and the mail relay are running"
 
 # ─────────────────────────────────────────────── 4. nginx
 if proxy_installed && [ -f "$FD_DIR/.env" ]; then
     apply_proxy || err "nginx config not applied — see above"
-    ok "nginx reloaded${AUTH_SITES_FILE:+ ($(auth_sites | wc -l) linked site(s))}"
+    [ -z "$AUTH_FAILED" ] || warn "Authelia is not working on:$AUTH_FAILED"
+    ok "nginx reloaded ($(auth_sites | wc -l) linked site(s))"
 fi
 
 if [ -n "${MAIL_TEST_TO:-}" ]; then
@@ -275,8 +173,9 @@ fi
 
 echo ""
 echo "✅ Authelia is installed. Nothing is gated until you link a site:"
-echo "   $TOOLS_DIR/sites/auth.sh user-add <user> <email> \"<Name>\" <site>[,<site>]   (password: env AUTH_PASSWORD or prompt)"
+echo "   $TOOLS_DIR/sites/auth.sh user-add <site> <user> <email> \"<Name>\"   (password: env AUTH_PASSWORD or prompt)"
 echo "   $TOOLS_DIR/sites/auth.sh link <site>"
+echo "   Every site has its own users, passwords and 2FA."
 echo "   Users log in at https://<site domain>/authelia/, register 2FA (a code is e-mailed),"
 echo "   and tick \"Remember me\" to stay logged in for $AUTH_REMEMBER_ME on that browser."
-echo "   Back up $AUTH_DIR/secrets/storage and $AUTH_DIR/config/: without them every user re-registers 2FA."
+echo "   Back up $AUTH_DIR/sites/ and $AUTH_DIR/secrets/: without them every user re-registers 2FA."

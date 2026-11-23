@@ -44,11 +44,12 @@ DOMAINS=$(site_domains "$SITE" | tr '\n' ' ')
 PORTS=$(site_ports "$SITE" | tr '\n' ' ')
 remove_site_domains "$SITE"
 remove_site_ports "$SITE"
-# Authelia: the site is no longer gated, and no user keeps it in their list.
+# Authelia: the site is no longer gated; its users are put aside. The container
+# goes with the next nginx config (apply_proxy below).
 if site_auth_linked "$SITE"; then auth_unlink_site "$SITE"; fi
 if auth_installed; then
-    python3 "$TOOLS_DIR/lib/authusers.py" "$AUTH_DIR/config/users_database.yml" drop-site "$SITE" \
-        || warn "could not remove $SITE from the Authelia users"
+    if auth_legacy && [ ! -e "$AUTH_DIR/.per-site" ]; then auth_migrate || warn "could not move the old Authelia users"; fi
+    auth_forget_site "$SITE" || warn "could not archive the Authelia users of $SITE"
 fi
 if [ -n "$PORTS" ]; then
     echo "   Ports freed: $PORTS"

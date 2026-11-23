@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 """Authelia users for the SSPL multi-tenant stack.
 
-The users file (AUTH_DIR/config/users_database.yml) is written as JSON, which
-is valid YAML, and Authelia never rewrites it (password reset and change are
-disabled in its config). A user may enter the linked sites named in their
-groups; the group "admins" enters every linked site.
+Each linked site has its own users file (AUTH_DIR/sites/<site>/config/
+users_database.yml), written as JSON, which is valid YAML; Authelia never
+rewrites it (password reset and change are disabled in its config).
 
 Usage (sites/auth.sh calls this; run as root):
   authusers.py FILE list [--json]
-  authusers.py FILE add USER EMAIL NAME [SITE,SITE...] [--admin]   password: env AUTH_PASSWORD
-  authusers.py FILE passwd USER                                     password: env AUTH_PASSWORD
-  authusers.py FILE sites USER [SITE,SITE...]       replace the user's sites ("" = none)
-  authusers.py FILE admin USER yes|no
+  authusers.py FILE add USER EMAIL NAME              password: env AUTH_PASSWORD
+  authusers.py FILE passwd USER                      password: env AUTH_PASSWORD
   authusers.py FILE disable USER yes|no
   authusers.py FILE remove USER
-  authusers.py FILE drop-site SITE                  remove SITE from every user
+  authusers.py FILE import OLDFILE SITE linked|unlinked
+        from the old file shared by all sites: the users of SITE, and, if it
+        is linked, the global admins. Users already in FILE are kept.
 
 Passwords never travel in argv. They are stored as PBKDF2-SHA512 (310000
 rounds), a format Authelia verifies natively.
@@ -30,8 +29,6 @@ import tempfile
 
 USER_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9.\-]{1,190}\.[A-Za-z]{2,24}$")
-SITE_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$")
-ADMIN = "admins"
 ROUNDS = 310000
 
 
@@ -94,14 +91,6 @@ def save(path, data):
         raise
 
 
-def parse_sites(arg):
-    sites = [s.strip().lower() for s in (arg or "").split(",") if s.strip()]
-    for s in sites:
-        if not SITE_RE.match(s) or s == ADMIN:
-            die(f"'{s}' is not a site name")
-    return sorted(set(sites))
-
-
 def get_user(data, name):
     u = data["users"].get(name)
     if u is None:
@@ -118,45 +107,42 @@ def main(argv):
     users = data["users"]
 
     if cmd == "list":
-        rows = []
-        for name in sorted(users):
-            u = users[name]
-            groups = u.get("groups") or []
-            rows.append({"user": name, "name": u.get("displayname", ""), "email": u.get("email", ""),
-                         "admin": ADMIN in groups, "disabled": bool(u.get("disabled")),
-                         "sites": sorted(g for g in groups if g != ADMIN)})
+        rows = [{"user": n, "name": users[n].get("displayname", ""), "email": users[n].get("email", ""),
+                 "disabled": bool(users[n].get("disabled"))} for n in sorted(users)]
         if args[:1] == ["--json"]:
             print(json.dumps(rows))
             return
         if not rows:
             print("(no users)")
         for r in rows:
-            flags = (" [admin]" if r["admin"] else "") + (" [disabled]" if r["disabled"] else "")
-            print(f"{r['user']:<20} {r['email']:<32} {', '.join(r['sites']) or '-'}{flags}")
+            print(f"{r['user']:<20} {r['email']:<32}{' [disabled]' if r['disabled'] else ''}")
+        return
+
+    if cmd == "import":
+        if len(args) != 3:
+            die("import OLDFILE SITE linked|unlinked")
+        site, linked = args[1], args[2] == "linked"
+        n = 0
+        for name, u in load(args[0])["users"].items():
+            g = u.get("groups") or []
+            if name not in users and (site in g or (linked and "admins" in g)):
+                users[name] = {**u, "groups": []}
+                n += 1
+        if n:
+            save(path, data)
+            print(f"   ✓ {site}: {n} user(s) carried over")
         return
 
     if not args:
         die("which user?")
     name = args[0].strip().lower()
 
-    if cmd == "drop-site":
-        site = name
-        n = 0
-        for u in users.values():
-            g = u.get("groups") or []
-            if site in g:
-                u["groups"] = [x for x in g if x != site]
-                n += 1
-        save(path, data)
-        print(f"   ✓ {site} removed from {n} user(s)")
-        return
-
     if not USER_RE.match(name):
         die("user names: lowercase letters, digits, . _ - (start with a letter or digit)")
 
     if cmd == "add":
         if len(args) < 3:
-            die("add USER EMAIL NAME [SITES] [--admin]")
+            die("add USER EMAIL NAME")
         if name in users:
             die(f"user '{name}' already exists")
         email, display = args[1].strip(), args[2].strip()
@@ -164,12 +150,8 @@ def main(argv):
             die("that e-mail address does not look right")
         if not display or len(display) > 100 or any(c in display for c in "\n\r"):
             display = name
-        rest = args[3:]
-        admin = "--admin" in rest
-        rest = [a for a in rest if a != "--admin"]
-        groups = parse_sites(rest[0] if rest else "") + ([ADMIN] if admin else [])
         users[name] = {"displayname": display, "email": email, "password": hash_password(password_from_env()),
-                       "groups": groups, "disabled": False}
+                       "groups": [], "disabled": False}
         save(path, data)
         print(f"   ✓ user {name} added")
         return
@@ -179,26 +161,13 @@ def main(argv):
         u["password"] = hash_password(password_from_env())
         save(path, data)
         print(f"   ✓ password of {name} changed")
-    elif cmd == "sites":
-        keep_admin = ADMIN in (u.get("groups") or [])
-        u["groups"] = parse_sites(args[1] if len(args) > 1 else "") + ([ADMIN] if keep_admin else [])
-        save(path, data)
-        print(f"   ✓ {name} may enter: {', '.join(g for g in u['groups'] if g != ADMIN) or '(no site)'}"
-              + (" + every site (admin)" if keep_admin else ""))
-    elif cmd in ("admin", "disable"):
+    elif cmd == "disable":
         if len(args) < 2 or args[1] not in ("yes", "no"):
-            die(f"{cmd} USER yes|no")
-        on = args[1] == "yes"
-        if cmd == "admin":
-            g = [x for x in (u.get("groups") or []) if x != ADMIN]
-            u["groups"] = g + ([ADMIN] if on else [])
-        else:
-            u["disabled"] = on
+            die("disable USER yes|no")
+        u["disabled"] = args[1] == "yes"
         save(path, data)
-        print(f"   ✓ {name}: {cmd} = {args[1]}")
+        print(f"   ✓ {name}: disabled = {args[1]}")
     elif cmd == "remove":
-        if len(users) == 1:
-            die("this is the only user — Authelia does not start without one; add another first")
         del users[name]
         save(path, data)
         print(f"   ✓ user {name} removed")

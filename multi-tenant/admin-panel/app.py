@@ -30,6 +30,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 from functools import wraps
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from flask import (Flask, Response, abort, jsonify, redirect, render_template_string,
@@ -42,7 +43,7 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-11-23.mt8"
+PANEL_VERSION = "2026-11-23.mt9"
 FEATURES = ("Multi-tenant panel: sites list with per-site backup, DB backup, "
             "migrate, uninstall app and drop; Create site with app picker; "
             "per-site backup browser and guarded per-site restore (also from "
@@ -103,7 +104,6 @@ MT_DEFAULTS = {
     "CLOUD_KEEP": "10",
     "RCLONE_REMOTE": "",
     "AUTH_DIR": "/opt/sspl-auth",
-    "AUTH_PORT": "9091",
     "AUTH_REMEMBER_ME": "1y",
     "AUTH_TRUSTED_NETWORKS": "",
     "SMTP_USER": "",
@@ -244,7 +244,7 @@ def auth_dir():
 def auth_installed():
     d = auth_dir()
     return (os.path.isfile(os.path.join(d, "compose.yaml"))
-            and os.path.isfile(os.path.join(d, "config", "configuration.yml")))
+            and os.path.isfile(os.path.join(d, "secrets", "redis")))
 
 
 def auth_sites():
@@ -268,40 +268,58 @@ def auth_domain_ok(d):
     return bool(IPV4_RE.match(d)) or "." in d
 
 
-def auth_users():
-    """Authelia users without their password hashes (lib/authusers.py's file)."""
+def auth_users(site):
+    """One site's Authelia users, without password hashes (lib/authusers.py's file)."""
     try:
-        with open(os.path.join(auth_dir(), "config", "users_database.yml")) as f:
+        with open(os.path.join(auth_dir(), "sites", site, "config", "users_database.yml")) as f:
             data = json.load(f)
     except (OSError, ValueError):
         return []
-    rows = []
-    for name, u in sorted((data.get("users") or {}).items()):
-        g = u.get("groups") or []
-        rows.append({"user": name, "name": u.get("displayname", ""), "email": u.get("email", ""),
-                     "admin": "admins" in g, "disabled": bool(u.get("disabled")),
-                     "sites": sorted(x for x in g if x != "admins")})
-    return rows
+    return [{"user": name, "name": u.get("displayname", ""), "email": u.get("email", ""),
+             "disabled": bool(u.get("disabled"))}
+            for name, u in sorted((data.get("users") or {}).items())]
 
 
-def auth_port():
-    p = str(mt_conf().get("AUTH_PORT", "9091"))
-    return int(p) if p.isdigit() else 9091
+def auth_ports():
+    """{site: port of its Authelia}."""
+    out = {}
+    try:
+        with open(os.path.join(auth_dir(), "sites", ".ports")) as f:
+            for line in f:
+                p = line.split()
+                if len(p) == 2 and p[1].isdigit():
+                    out[p[0]] = int(p[1])
+    except OSError:
+        pass
+    return out
+
+
+def auth_site_up(port):
+    if not port:
+        return False
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/authelia/api/health", timeout=2) as r:
+            return r.status == 200
+    except Exception:
+        return False
 
 
 def auth_status():
     c = mt_conf()
-    st = {"installed": auth_installed(), "running": False, "linked": auth_sites(),
-          "users": len(auth_users()), "mail": c.get("SMTP_USER", ""),
+    linked = auth_sites()
+    st = {"installed": auth_installed(), "linked": linked, "down": [], "legacy": False,
+          "mail": c.get("SMTP_USER", ""),
           "mail_from": c.get("MAIL_FROM", "") or c.get("SMTP_USER", ""),
           "relay": c.get("SMTP_RELAY_HOST", ""), "trusted": c.get("AUTH_TRUSTED_NETWORKS", ""),
           "remember": c.get("AUTH_REMEMBER_ME", "1y")}
     if st["installed"]:
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{auth_port()}/authelia/api/health", timeout=2) as r:
-                st["running"] = r.status == 200
-        except Exception:
-            pass
+        ports = auth_ports()
+        if linked:
+            with ThreadPoolExecutor(max_workers=16) as ex:
+                up = list(ex.map(lambda s: auth_site_up(ports.get(s)), linked))
+            st["down"] = [s for s, ok in zip(linked, up) if not ok]
+        # Still the one shared Authelia from before: "Save settings" converts it.
+        st["legacy"] = os.path.isfile(os.path.join(auth_dir(), "config", "configuration.yml"))
     return st
 
 
@@ -448,8 +466,6 @@ ACTIONS = {
     "auth_unlink":         {"label": "Unlink site from Authelia", "cmd": [_tool("sites/auth.sh"), "unlink"]},
     "auth_user_add":       {"label": "Add Authelia user",         "cmd": [_tool("sites/auth.sh"), "user-add"]},
     "auth_user_passwd":    {"label": "Set user password",         "cmd": [_tool("sites/auth.sh"), "user-passwd"]},
-    "auth_user_sites":     {"label": "Set user sites",            "cmd": [_tool("sites/auth.sh"), "user-sites"]},
-    "auth_user_admin":     {"label": "Set user admin",            "cmd": [_tool("sites/auth.sh"), "user-admin"]},
     "auth_user_disable":   {"label": "Enable/disable user",       "cmd": [_tool("sites/auth.sh"), "user-disable"]},
     "auth_user_remove":    {"label": "Remove Authelia user",      "cmd": [_tool("sites/auth.sh"), "user-remove"]},
     "auth_user_reset_2fa": {"label": "Reset user 2FA",            "cmd": [_tool("sites/auth.sh"), "user-reset-2fa"]},
@@ -508,7 +524,7 @@ ERP_IMAGE_RE = re.compile(r"^[a-z0-9][a-z0-9._\-]*(?::[0-9]{1,5})?(?:/[a-z0-9][a
 
 # Ports this server already uses: SSH, OpenWA, this panel, and the stack's
 # own nginx behind the host nginx (FRONTEND_PORT, 127.0.0.1).
-RESERVED_PORTS = {22, 443, 2785, 8090, int(MT_DEFAULTS["FRONTEND_PORT"]), int(MT_DEFAULTS["AUTH_PORT"])}
+RESERVED_PORTS = {22, 443, 2785, 8090, int(MT_DEFAULTS["FRONTEND_PORT"])}
 
 # OpenWA (WhatsApp API). Its compose file pins the container name, so the
 # container is how the panel finds it, wherever it was installed from.
@@ -2016,7 +2032,7 @@ def api_sites():
                     "cloud": wired.split() if wired else [],
                     "http_port": http_port(),
                     "https": https_on(),
-                    "auth": {"installed": auth_installed(), "users": auth_users() if auth_installed() else []},
+                    "auth": {"installed": auth_installed(), "users": {s: auth_users(s) for s in list_sites()} if auth_installed() else {}},
                     "stack": os.path.isfile(compose_file()),
                     "tools": os.path.isfile(_tool("lib/common.sh"))})
 
@@ -2135,7 +2151,8 @@ def _port_request(name, data):
     owner = pmap.get(port)
     if owner and owner != site:
         return None, None, f"port {port} already belongs to {owner}"
-    reserved = RESERVED_PORTS | {http_port()} | ({https_port()} if https_port() else set())
+    # 29101-30099: the sites' Authelias (lib/common.sh AUTH_BASE_PORT).
+    reserved = RESERVED_PORTS | set(range(29101, 30100)) | {http_port()} | ({https_port()} if https_port() else set())
     if port in reserved:
         return None, None, f"port {port} is reserved (HTTP/HTTPS, SSH, OpenWA, this panel or the stack's nginx)"
     args = [site, str(port)] + (["--primary"] if data.get("primary") else [])
@@ -2198,18 +2215,6 @@ def _auth_password(data):
     return pw, None
 
 
-def _auth_sites_arg(data):
-    sites = data.get("sites") or []
-    if isinstance(sites, str):
-        sites = [x for x in sites.split(",")]
-    sites = sorted({str(x).strip().lower() for x in sites if str(x).strip()})
-    known = set(list_sites())
-    bad = [x for x in sites if x not in known]
-    if bad:
-        return None, f"no such site: {', '.join(bad)}"
-    return ",".join(sites), None
-
-
 def _auth_request(name, data):
     """Arguments for sites/auth.sh. (args, env, label, None) or (None, None, None, error).
     Passwords go in env (AUTH_PASSWORD), never argv."""
@@ -2226,6 +2231,8 @@ def _auth_request(name, data):
             if bad:
                 return None, None, None, (f"Authelia needs domains with a dot (or IP addresses): "
                                           f"remove {', '.join(bad)} first")
+            if not auth_users(site):
+                return None, None, None, f"add an Authelia user for {site} first, or nobody can enter"
             return [site], None, f"Put {site} behind Authelia", None
         return [site], None, f"Remove the Authelia login from {site}", None
     if name == "auth_trusted":
@@ -2239,47 +2246,43 @@ def _auth_request(name, data):
             return None, None, None, "that e-mail address does not look right"
         return [to], None, f"Test mail to {to}", None
 
+    site = str(data.get("site", "")).strip().lower()
+    if site not in list_sites():
+        return None, None, None, "no such site"
     user = str(data.get("user", "")).strip().lower()
     if not AUTH_USER_RE.match(user):
         return None, None, None, "user names: lowercase letters, digits, . _ - (start with a letter or digit)"
-    exists = any(u["user"] == user for u in auth_users())
+    exists = any(u["user"] == user for u in auth_users(site))
     if name == "auth_user_add":
         if exists:
-            return None, None, None, f"user {user} already exists"
+            return None, None, None, f"user {user} already exists on {site}"
         email = str(data.get("email", "")).strip()
         if not EMAIL_RE.match(email):
             return None, None, None, "that e-mail address does not look right (2FA codes are sent there)"
         disp = str(data.get("name", "")).strip()[:100] or user
         if any(ord(c) < 32 for c in disp):
             return None, None, None, "the display name has control characters"
-        sites, err = _auth_sites_arg(data)
-        if err:
-            return None, None, None, err
         pw, err = _auth_password(data)
         if err:
             return None, None, None, err
-        args = [user, email, disp, sites] + (["--admin"] if data.get("admin") else [])
-        return args, {"AUTH_PASSWORD": pw}, f"Add Authelia user {user}", None
+        return [site, user, email, disp], {"AUTH_PASSWORD": pw}, f"Add Authelia user {user} on {site}", None
     if not exists:
-        return None, None, None, f"no user {user}"
+        return None, None, None, f"no user {user} on {site}"
     if name == "auth_user_passwd":
         pw, err = _auth_password(data)
         if err:
             return None, None, None, err
-        return [user], {"AUTH_PASSWORD": pw}, f"New password for {user}", None
-    if name == "auth_user_sites":
-        sites, err = _auth_sites_arg(data)
-        if err:
-            return None, None, None, err
-        return [user, sites], None, f"Sites of {user}: {sites or 'none'}", None
-    if name in ("auth_user_admin", "auth_user_disable"):
+        return [site, user], {"AUTH_PASSWORD": pw}, f"New password for {user} on {site}", None
+    if name == "auth_user_disable":
         on = "yes" if data.get("on") else "no"
-        what = "admin" if name == "auth_user_admin" else "disabled"
-        return [user, on], None, f"{user}: {what} = {on}", None
-    if name == "auth_user_remove" and len(auth_users()) == 1:
-        return None, None, None, "this is the only user — Authelia does not start without one; add another first"
-    if name in ("auth_user_remove", "auth_user_reset_2fa"):
-        return [user], None, (f"Remove user {user}" if name == "auth_user_remove" else f"Reset 2FA of {user}"), None
+        return [site, user, on], None, f"{user} on {site}: disabled = {on}", None
+    if name == "auth_user_remove" and site_auth_linked(site) and len(auth_users(site)) == 1:
+        return None, None, None, (f"{user} is the only user of {site} — Authelia does not start without one; "
+                                  "add another or remove the login from the site first")
+    if name == "auth_user_remove":
+        return [site, user], None, f"Remove user {user} from {site}", None
+    if name == "auth_user_reset_2fa":
+        return [site, user], None, f"Reset 2FA of {user} on {site}", None
     return None, None, None, "unknown action"
 
 
@@ -2507,19 +2510,6 @@ def _install_env(name, data):
             if len(nets) > 20 or any(not CIDR_RE.match(n) for n in nets):
                 return None, None, "no-2FA networks: IPv4 addresses or CIDRs, space-separated"
             env["AUTH_TRUSTED_NETWORKS"] = " ".join(nets)
-        au = str(data.get("admin_user", "")).strip().lower()
-        if au:
-            if not AUTH_USER_RE.match(au):
-                return None, None, "admin user name: lowercase letters, digits, . _ -"
-            ae = str(data.get("admin_email", "")).strip()
-            if not EMAIL_RE.match(ae):
-                return None, None, "admin e-mail: that does not look right (2FA codes are sent there)"
-            apw, err = _auth_password({"password": data.get("admin_password", "")})
-            if err:
-                return None, None, "admin " + err
-            env.update({"ADMIN_USER": au, "ADMIN_EMAIL": ae, "AUTH_PASSWORD": apw})
-        if not au and not auth_users():
-            return None, None, "enter the first admin user (Authelia does not start without a user)"
         if not auth_installed() and not (user and pw):
             return None, None, "enter the Gmail address and its app password (Authelia mails the 2FA codes)"
         return env, None, None
@@ -3446,10 +3436,9 @@ async function refreshSetup(){
     // Authelia login gate + Redis + mail relay (Gmail)
     const au = c.auth || {};
     rows += `<div class="setup-row"><div class="setup-h"><b>Authelia login (2FA) + mail relay</b> ${pill(au.installed)}`
-      + (au.installed ? (au.running ? ' <span class="badge ok">running</span>'
-                                    : ' <span class="badge miss">not answering</span>') : '')
-      + (au.installed ? ` <span class="badge">${(au.linked||[]).length} site(s) linked</span>
-                         <span class="badge">${au.users} user(s)</span>` : '')
+      + (au.installed ? (au.down||[]).map(x => ` <span class="badge miss">${esc(x)}: not answering</span>`).join('')
+          + ` <span class="badge${(au.linked||[]).length && !(au.down||[]).length ? ' ok' : ''}">${(au.linked||[]).length} site(s) linked</span>`
+          + (au.legacy ? ' <span class="badge miss">one login for all sites — Save settings gives each site its own</span>' : '') : '')
       + (au.mail ? ` <span class="badge ok" title="sends through ${esc(au.relay)}">mail: ${esc(au.mail)}</span>`
                  : (au.installed ? ' <span class="badge miss">no mail account</span>' : '')) + `</div>`;
     if(erpDone && s.scripts.auth){
@@ -3459,22 +3448,19 @@ async function refreshSetup(){
         <input type="email" id="au-from" placeholder="sender (default: the Gmail address)" value="${esc(au.mail_from && au.mail_from !== au.mail ? au.mail_from : '')}" size="28" autocomplete="off">
         <input type="text" id="au-trusted" placeholder="no-2FA networks, e.g. 192.168.1.0/24" value="${esc(au.trusted||'')}" size="30"
           title="From these networks the password is enough (no 2FA). Space-separated. Empty: 2FA everywhere.">`
-        + (au.installed && au.users ? '' : `
-        <input type="text" id="au-admin-user" placeholder="first admin user" size="14" autocomplete="off" autocapitalize="off">
-        <input type="email" id="au-admin-email" placeholder="admin e-mail" size="22" autocomplete="off">
-        <input type="password" id="au-admin-pw" placeholder="admin password (8+)" size="16" autocomplete="new-password">`)
         + `
         <button class="primary setup-install" data-inst="install_auth"
-          data-confirm="${au.installed ? 'Apply these Authelia / mail settings? Authelia restarts for a few seconds; nobody is logged out.' : 'Install Authelia, Redis and the mail relay now? Nothing is gated until you link a site in its Domains… dialog.'}">${au.installed ? 'Save settings' : 'Install Authelia'}</button></div>`;
+          data-confirm="${au.installed ? ('Apply these Authelia / mail settings? Authelia may restart for a few seconds.' + (au.legacy ? ' Every site gets its own users and 2FA: passwords carry over, everyone logs in and registers 2FA again.' : ' Nobody is logged out.')) : 'Install Authelia, Redis and the mail relay now? Nothing is gated until you link a site in its Domains… dialog.'}">${au.installed ? 'Save settings' : 'Install Authelia'}</button></div>`;
       if(au.installed && au.mail){
         rows += `<div class="setup-form"><input type="email" id="au-test-to" placeholder="send a test mail to…" size="26">
           <button id="au-test" onclick="authMailTest()">Send test mail</button></div>`;
       }
     }
     rows += `<div class="note">A linked site shows an Authelia login with 2FA (authenticator app or security key)
-      before ERPNext. <b>Remember me</b> keeps that browser logged in for ${esc(au.remember||'1y')}, stored in Redis
-      (survives restarts). Users and their sites: <b>Authelia users…</b> on the <a href="/">dashboard</a>; link a site
-      in its <b>Domains…</b> dialog. Mail goes through Gmail: turn on 2-Step Verification for the Google account, then
+      before ERPNext. Every site has <b>its own users, passwords and 2FA</b>. <b>Remember me</b> keeps that browser
+      logged in for ${esc(au.remember||'1y')} (survives restarts). Add users under <b>Authelia users…</b> on the
+      <a href="/">dashboard</a>, then link the site in its <b>Domains…</b> dialog. Each linked site uses about
+      30–90 MB of RAM. Mail goes through Gmail: turn on 2-Step Verification for the Google account, then
       create an <b>app password</b> (Google Account → Security → App passwords); Gmail sends as that address or a
       verified alias only. Needs HTTPS on the nginx routing above.</div>`;
     if(au.installed && !c.proxy.https_live){
@@ -3628,11 +3614,6 @@ async function installComponent(btn){
     body.smtp_password = $('#au-smtp-pw').value;
     body.mail_from = $('#au-from').value.trim();
     body.trusted = $('#au-trusted').value.trim();
-    if ($('#au-admin-user')){
-      body.admin_user = $('#au-admin-user').value.trim();
-      body.admin_email = $('#au-admin-email').value.trim();
-      body.admin_password = $('#au-admin-pw').value;
-    }
   }
   btn.disabled = true;
   try{
@@ -3943,13 +3924,14 @@ details{margin:2px 0} details summary{cursor:pointer}
 
 <div class="modal" id="au-modal"><div class="card">
   <h1 style="font-size:17px;margin-bottom:6px">Authelia users</h1>
-  <p style="font-size:12.5px;color:var(--muted);margin:0 0 8px">A user passes the login of the sites ticked for
-    them (an <b>admin</b> passes every linked site), then signs in to ERPNext as usual. The first login asks
-    them to register 2FA — an authenticator app or a security key; a code e-mailed to them confirms it.
-    With <b>Remember me</b> ticked, that browser stays logged in for a year.</p>
+  <p style="font-size:12.5px;color:var(--muted);margin:0 0 8px">Every site has its own users, passwords and 2FA: the
+    same name on two sites is two separate accounts. After this login the user signs in to ERPNext as usual. The
+    first login asks them to register 2FA — an authenticator app or a security key; a code e-mailed to them
+    confirms it. With <b>Remember me</b> ticked, that browser stays logged in for a year.</p>
+  <div style="margin-bottom:8px"><label>Site <select id="au-site"></select></label></div>
   <div id="au-body" style="font-size:13px"></div>
   <div id="au-edit" style="display:none;margin-top:10px;padding:10px 12px;border:1px solid var(--hairline);border-radius:8px"></div>
-  <h2 style="font-size:15px;margin:16px 0 4px">Add a user</h2>
+  <h2 style="font-size:15px;margin:16px 0 4px">Add a user to <span id="au-site-name"></span></h2>
   <div class="au-grid">
     <input type="text" id="au-user" placeholder="user name, e.g. ravi" autocomplete="off" autocapitalize="off" spellcheck="false">
     <input type="text" id="au-name" placeholder="display name" autocomplete="off">
@@ -3957,8 +3939,6 @@ details{margin:2px 0} details summary{cursor:pointer}
     <input type="password" id="au-pw" placeholder="password (8+)" autocomplete="new-password">
     <input type="password" id="au-pw2" placeholder="confirm" autocomplete="new-password">
   </div>
-  <div id="au-sites" style="margin-top:6px"></div>
-  <label class="chk"><input type="checkbox" id="au-admin"> admin — every linked site</label>
   <div class="row"><button id="au-close">Close</button><button class="primary" id="au-add">Add user</button></div>
 </div></div>
 
@@ -3972,7 +3952,7 @@ details{margin:2px 0} details summary{cursor:pointer}
 <script>
 """ + TERM_JS + r"""
 let SITES = [], IMAGE_APPS = [], SITE_INFO = {}, HTTP_PORT = 80, PROXY_HTTPS = false,
-    AUTH = {installed: false, users: []};
+    AUTH = {installed: false, users: {}};
 
 async function runAction(act, body){
   try{
@@ -4023,7 +4003,7 @@ async function refreshSites(){
     SITE_INFO = Object.fromEntries(j.sites.map(s => [s.name, s]));
     HTTP_PORT = j.http_port || 80;
     PROXY_HTTPS = !!j.https;
-    AUTH = j.auth || {installed: false, users: []};
+    AUTH = j.auth || {installed: false, users: {}};
     $('#au-open').style.display = AUTH.installed ? '' : 'none';
     if ($('#au-modal').classList.contains('on') && !$('#au-edit').innerHTML) renderUsers();
     IMAGE_APPS = j.image_apps || [];
@@ -4190,19 +4170,19 @@ function renderDomains(){
   const box = $('#dm-auth');
   if (!AUTH.installed){ box.style.display = 'none'; return; }
   box.style.display = '';
-  const who = (AUTH.users || []).filter(u => !u.disabled && (u.admin || u.sites.includes(dmSite)));
+  const who = siteUsers(dmSite).filter(u => !u.disabled);
   box.innerHTML = s.auth
     ? `<b>🔐 Authelia login: on</b> — every domain and IP + port of this site asks for a login with 2FA
        first (HTTPS only). ${who.length} user(s) may enter.
        <div class="row" style="margin-top:8px"><button class="danger" id="dm-unlink">Remove the login</button></div>`
     : `<b>Authelia login: off</b> — anyone who reaches this site sees the ERPNext login.
        <div style="color:var(--muted);font-size:12.5px;margin-top:4px">Turning it on makes the site HTTPS-only and puts
-       a 2FA login in front of every domain and IP + port. API clients, the mobile app, webhooks and payment
+       a 2FA login in front of every domain and IP + port, with this site's own users (${who.length} so far). API clients, the mobile app, webhooks and payment
        callbacks are stopped by it too — give those an unlinked domain.</div>
        <div class="row" style="margin-top:8px"><button class="primary" id="dm-link" ${PROXY_HTTPS ? '' : 'disabled title="HTTPS is off"'}>Require Authelia login</button></div>`;
   if ($('#dm-link')) $('#dm-link').onclick = async () => {
     const site = dmSite;
-    if (!who.length && !confirm(`No Authelia user may enter ${site} yet — nobody will get in until you add one under "Authelia users…". Link anyway?`)) return;
+    if (!who.length){ alert(`Add a user for ${site} under "Authelia users…" first, or nobody can enter.`); return; }
     closeDomains(); await runAction('auth_link', {site});
   };
   if ($('#dm-unlink')) $('#dm-unlink').onclick = async () => {
@@ -4213,61 +4193,55 @@ function renderDomains(){
 }
 
 // ---- Authelia users ----
-function siteChecks(boxId, picked){
-  return SITES.map(x => `<label class="chk"><input type="checkbox" class="${boxId}" value="${esc(x)}"
-    ${picked.includes(x) ? 'checked' : ''}> ${esc(x)}${SITE_INFO[x] && SITE_INFO[x].auth ? ' 🔐' : ''}</label>`).join('');
-}
-function pickedSites(cls){ return [...document.querySelectorAll('.' + cls + ':checked')].map(c => c.value); }
+let auSite = '';
+function siteUsers(site){ return (AUTH.users || {})[site] || []; }
 function renderUsers(){
-  const us = AUTH.users || [];
+  if (!SITES.includes(auSite)) auSite = SITES[0] || '';
+  $('#au-site').innerHTML = SITES.map(x => `<option value="${esc(x)}"${x === auSite ? ' selected' : ''}>${esc(x)}${SITE_INFO[x] && SITE_INFO[x].auth ? ' 🔐' : ''}</option>`).join('');
+  $('#au-site-name').textContent = auSite;
+  $('#au-add').disabled = !auSite;
+  const us = siteUsers(auSite);
   $('#au-body').innerHTML = us.length
-    ? `<table><thead><tr><th>User</th><th>Sites</th><th></th></tr></thead><tbody>` + us.map(u => `<tr>
-        <td><b>${esc(u.user)}</b>${u.admin ? ' <span class="badge ok">admin</span>' : ''}${u.disabled ? ' <span class="badge miss">disabled</span>' : ''}
+    ? `<table><thead><tr><th>User</th><th></th></tr></thead><tbody>` + us.map(u => `<tr>
+        <td><b>${esc(u.user)}</b>${u.disabled ? ' <span class="badge miss">disabled</span>' : ''}
           <div style="color:var(--muted)">${esc(u.name)} · ${esc(u.email)}</div></td>
-        <td>${u.admin ? '<i>every linked site</i>' : (u.sites.map(esc).join('<br>') || '<span style="color:var(--muted)">none</span>')}</td>
         <td><div class="acts">
-          <button class="au-sites" data-u="${esc(u.user)}">Sites…</button>
           <button class="au-pw" data-u="${esc(u.user)}">Password…</button>
-          <button class="au-admin" data-u="${esc(u.user)}" data-on="${u.admin ? 0 : 1}">${u.admin ? 'Not admin' : 'Make admin'}</button>
           <button class="au-2fa" data-u="${esc(u.user)}" title="Lost phone: register 2FA again at the next login">Reset 2FA</button>
           <button class="au-dis" data-u="${esc(u.user)}" data-on="${u.disabled ? 0 : 1}">${u.disabled ? 'Enable' : 'Disable'}</button>
           <button class="danger au-rm" data-u="${esc(u.user)}">Remove</button>
         </div></td></tr>`).join('') + '</tbody></table>'
-    : '<p style="color:var(--muted);margin:0">No users yet.</p>';
-  $('#au-sites').innerHTML = SITES.length ? siteChecks('au-new-site', []) : '';
+    : '<p style="color:var(--muted);margin:0">No users on this site yet.</p>';
 }
 function closeUsers(){ $('#au-modal').classList.remove('on'); $('#au-edit').innerHTML = ''; $('#au-edit').style.display = 'none'; }
 $('#au-open').onclick = () => {
   ['#au-user','#au-name','#au-email','#au-pw','#au-pw2'].forEach(i => $(i).value = '');
-  $('#au-admin').checked = false;
   $('#au-edit').innerHTML = ''; $('#au-edit').style.display = 'none';
   renderUsers(); $('#au-modal').classList.add('on');
+};
+$('#au-site').onchange = () => {
+  auSite = $('#au-site').value;
+  $('#au-edit').innerHTML = ''; $('#au-edit').style.display = 'none';
+  renderUsers();
 };
 $('#au-close').onclick = closeUsers;
 $('#au-modal').onclick = e => { if (e.target === $('#au-modal')) closeUsers(); };
 $('#au-add').onclick = async () => {
   const user = $('#au-user').value.trim().toLowerCase(), pw = $('#au-pw').value;
-  if (!user) return;
+  const site = auSite;
+  if (!user || !site) return;
   if (pw !== $('#au-pw2').value){ alert('The passwords do not match.'); return; }
-  const body = {user, name: $('#au-name').value.trim(), email: $('#au-email').value.trim(),
-                password: pw, sites: pickedSites('au-new-site'), admin: $('#au-admin').checked};
+  const body = {site, user, name: $('#au-name').value.trim(), email: $('#au-email').value.trim(),
+                password: pw};
   closeUsers(); await runAction('auth_user_add', body);
 };
 document.addEventListener('click', async e => {
   const b = e.target.closest('#au-modal .acts button');
   if (!b) return;
-  const user = b.dataset.u, u = (AUTH.users || []).find(x => x.user === user) || {sites: []};
+  const user = b.dataset.u, site = auSite;
   const ed = $('#au-edit');
-  if (b.classList.contains('au-sites')){
-    ed.innerHTML = `<b>Sites ${esc(user)} may enter</b><div style="margin-top:6px">${siteChecks('au-ed-site', u.sites)}</div>
-      <div class="row" style="margin-top:8px"><button id="au-ed-cancel">Cancel</button><button class="primary" id="au-ed-save">Save sites</button></div>`;
-    ed.style.display = '';
-    $('#au-ed-cancel').onclick = () => { ed.innerHTML = ''; ed.style.display = 'none'; };
-    $('#au-ed-save').onclick = async () => { const sites = pickedSites('au-ed-site'); closeUsers(); await runAction('auth_user_sites', {user, sites}); };
-    return;
-  }
   if (b.classList.contains('au-pw')){
-    ed.innerHTML = `<b>New password for ${esc(user)}</b><div class="au-grid" style="margin-top:6px">
+    ed.innerHTML = `<b>New password for ${esc(user)} on ${esc(site)}</b><div class="au-grid" style="margin-top:6px">
       <input type="password" id="au-ed-pw" placeholder="password (8+)" autocomplete="new-password">
       <input type="password" id="au-ed-pw2" placeholder="confirm" autocomplete="new-password"></div>
       <div class="row" style="margin-top:8px"><button id="au-ed-cancel">Cancel</button><button class="primary" id="au-ed-save">Set password</button></div>`;
@@ -4277,17 +4251,15 @@ document.addEventListener('click', async e => {
     $('#au-ed-save').onclick = async () => {
       const password = $('#au-ed-pw').value;
       if (password !== $('#au-ed-pw2').value){ alert('The passwords do not match.'); return; }
-      closeUsers(); await runAction('auth_user_passwd', {user, password});
+      closeUsers(); await runAction('auth_user_passwd', {site, user, password});
     };
     return;
   }
-  let act, body = {user}, q = null;
-  if (b.classList.contains('au-admin')){ act = 'auth_user_admin'; body.on = b.dataset.on === '1';
-    q = body.on ? `Make ${user} an admin? Admins pass the login of every linked site.` : null; }
-  else if (b.classList.contains('au-dis')){ act = 'auth_user_disable'; body.on = b.dataset.on === '1';
-    q = body.on ? `Disable ${user}? They cannot log in until enabled again.` : null; }
-  else if (b.classList.contains('au-2fa')){ act = 'auth_user_reset_2fa'; q = `Forget ${user}'s 2FA devices? They register again at the next login.`; }
-  else if (b.classList.contains('au-rm')){ act = 'auth_user_remove'; q = `Remove ${user}? This cannot be undone.`; }
+  let act, body = {site, user}, q = null;
+  if (b.classList.contains('au-dis')){ act = 'auth_user_disable'; body.on = b.dataset.on === '1';
+    q = body.on ? `Disable ${user} on ${site}? They cannot log in until enabled again.` : null; }
+  else if (b.classList.contains('au-2fa')){ act = 'auth_user_reset_2fa'; q = `Forget ${user}'s 2FA devices on ${site}? They register again at the next login.`; }
+  else if (b.classList.contains('au-rm')){ act = 'auth_user_remove'; q = `Remove ${user} from ${site}? This cannot be undone.`; }
   else return;
   if (q && !confirm(q)) return;
   closeUsers(); await runAction(act, body);
