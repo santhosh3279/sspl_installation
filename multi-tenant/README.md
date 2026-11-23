@@ -206,6 +206,109 @@ every existing site to the domain table, creates the default certificate, and
 starts nginx. It is safe to re-run. Every site is down
 for a few seconds while the frontend moves.
 
+## Authelia login (2FA) per site
+
+An optional login gate in front of chosen sites: Authelia (login portal and
+2FA), its Redis (sessions) and a Postfix mail relay that sends through Gmail.
+They run as their own compose project in `/opt/sspl-auth`. Nothing is gated
+until you link a site.
+
+**Install:** installation page, **Authelia login (2FA) + mail relay** row. Or:
+
+```bash
+sudo SMTP_USER=you@gmail.com SMTP_PASSWORD='abcd efgh ijkl mnop' \
+     ADMIN_USER=admin ADMIN_EMAIL=you@gmail.com AUTH_PASSWORD='…' \
+     AUTH_TRUSTED_NETWORKS="192.168.1.0/24" \
+     multi-tenant/install/install-auth.sh
+```
+
+- **Gmail:** turn on 2-Step Verification for the Google account, then create an
+  **app password** (Google Account → Security → App passwords). Use that, not
+  the account password. Gmail sends as that address, or a verified "Send mail
+  as" alias only. Check delivery with `sites/auth.sh mail-test you@x.com`.
+- The relay is not published on any host port: only containers on its Docker
+  network can use it, so it can never be an open relay.
+- Needs HTTPS on the host nginx (`install-proxy.sh`). Authelia only works on
+  `https://` pages.
+
+**Link a site:** **Domains…** → **Require Authelia login**, or
+`sudo $T/sites/auth.sh link acme.erp.lan`. Then:
+
+- Every domain of the site and every IP + port asks for the Authelia login
+  first. The portal is at `https://<domain>/authelia/` on the site's own
+  domain, so no extra DNS name is needed.
+- The site becomes HTTPS-only. HTTP redirects to HTTPS, and its IP + port
+  addresses switch to TLS. Without a Let's Encrypt certificate, browsers warn
+  about the self-signed one.
+- Only users who have the site in their list get in, or **admins**. Manage
+  them under **Authelia users…** on the dashboard, or `auth.sh user-add`,
+  `user-sites`, `user-passwd`, `user-reset-2fa` and the like. Passwords come
+  from `AUTH_PASSWORD` or a prompt, never the command line.
+- **First login:** the user registers 2FA (an authenticator app or a security
+  key), confirmed by a code e-mailed through the relay.
+- **Remember me:** that browser stays logged in for `AUTH_REMEMBER_ME` (1y)
+  without asking again. The session is kept in Redis, on disk, so restarts and
+  updates do not log anyone out. The inactivity timeout does not apply to such
+  sessions. Without it ticked, the session ends after `AUTH_EXPIRATION` (12h)
+  or `AUTH_INACTIVITY` (2h) idle.
+- **Trusted networks:** from `AUTH_TRUSTED_NETWORKS` (the office LAN, say) the
+  password is enough, with no 2FA. Set it with `auth.sh trusted "192.168.1.0/24"`
+  or on the installation page. nginx passes Authelia the address of the
+  connection, never a client-sent header, so the shortcut cannot be faked.
+- **Where to log in on IP + port:** a site's IP + port shares one login per
+  server IP, at `https://<server-ip>/authelia/`. Each port still only admits
+  the users of its own site.
+- **Not gated:** the ERP containers themselves (PDF rendering fetches the
+  site's own URL), plus `AUTH_BYPASS_NETWORKS`.
+- **Stopped by the login:** API-token clients, the Frappe mobile app,
+  webhooks, payment callbacks and public web forms. Give those an unlinked
+  domain, or put their fixed addresses in `AUTH_BYPASS_NETWORKS`.
+- **Domain names:** Authelia needs domains with a dot (or IP addresses).
+  Single-label names like `acmelan` cannot be linked.
+
+**Back up** `/opt/sspl-auth/secrets/` and `/opt/sspl-auth/config/`. The site
+backups do not include them. The `storage` key encrypts the 2FA registrations:
+without it every user registers 2FA again.
+
+## WireGuard to the print servers
+
+Lets the ERP containers reach CUPS print servers in the shops. WireGuard runs on
+the host (`wg-quick@sspl-wg`); this server is the hub (`10.99.0.1`) and each CUPS
+machine dials in, so it works behind a shop router.
+
+1. Open UDP 51820 to this server (cloud firewall or router).
+2. Installation page, **WireGuard (print servers)**, or:
+
+   ```bash
+   sudo WG_ENDPOINT=erp.example.com multi-tenant/install/install-wireguard.sh
+   ```
+
+   `WG_ENDPOINT` is the **public** IP or DNS name. After changing it, re-run each
+   print server's setup script.
+3. Add the print server and get its setup script (the panel has both too):
+
+   ```bash
+   sudo $T/sites/wireguard.sh add shop1 --site acme.erp.lan
+   sudo $T/sites/wireguard.sh setup-script shop1 > sspl-wg-shop1.sh
+   ```
+
+   Run it as root on the CUPS machine (Debian/Ubuntu). It installs WireGuard and
+   makes CUPS listen on the tunnel and allow `10.99.0.1` (keeping a copy of
+   `cupsd.conf`). **It contains a private key**: delete it afterwards. Share each
+   printer: `lpadmin -p <printer> -o printer-is-shared=true`.
+4. In ERPNext, set the Printer Server host to the tunnel address, port 631.
+   Check with `sudo $T/sites/wireguard.sh test shop1`, which asks CUPS from
+   inside the backend container.
+
+- **One direction.** Firewall rules let the host and the containers connect to the
+  print servers, not the reverse, and print servers cannot reach each other.
+- **Tenants share containers**, so every site can reach every print server.
+  `--site` is only a label. Protect CUPS with a password if that matters.
+- Addresses are never reused after `remove`, so an old Printer Server record
+  cannot print on another tenant's printer.
+- **Back up** `/etc/wireguard/` and `/opt/sspl-erp/wg-peers`; site backups do not
+  include them.
+
 ## Backups
 
 Every backup tool takes `--site <host>` (repeatable) or `--all`.
@@ -249,6 +352,31 @@ It refuses a backup taken from a **different** site unless you pass
 `--allow-other-site`, which also copies that backup's encryption key so
 encrypted fields stay readable. Use that flag only when moving a tenant.
 
+## RAM monitor and database memory
+
+The **RAM monitor →** link at the top of the dashboard opens `/ram`. It shows:
+
+- alerts for low RAM, active swapping, memory pressure, containers near their memory
+  limit, and a database reading too much from disk
+- memory per container (`docker stats`) and the top processes by RAM and swap
+- the MariaDB **InnoDB buffer pool**: its size now, the saved setting, the database
+  size, a recommended size and the share of reads that went to disk
+
+MariaDB's default pool is 128M. A database bigger than the pool reads from disk,
+and every bill save slows down. **Apply size** changes the pool live, with no
+restart, and saves it to `/opt/sspl-erp/mariadb/99-sspl.cnf`. The installer mounts
+that folder on the db container's `/etc/mysql/conf.d`
+(`frappe_docker/overrides/compose.sspl-db.yaml`) and sizes the pool at 25% of RAM,
+or `DB_BUFFER_POOL=2G` if set.
+
+A stack installed before this has no mount yet, so the page shows **Make permanent
+(restarts DB)**. It adds the mount to `docker-compose.yml`, keeping a
+`.bak-dbmem-<time>` copy, and recreates the db container. Every site loses its
+database for 10–30 seconds, so do it when nobody is billing. Until then a live
+change is lost on the next DB restart.
+
+Keep the pool below the free RAM. A pool pushed into swap is slower than a small one.
+
 ## Update (all tenants)
 
 ```bash
@@ -278,10 +406,14 @@ restore those sites from the backups the update took.
 multi-tenant/
   admin-panel/  the web panel: app.py, setup_admin_panel.sh, update_panel.sh
   install/   install.sh (fresh server), panel-install.sh (the panel's),
-             install-stack.sh, install-proxy.sh (host nginx), install-tools.sh
+             install-stack.sh, install-proxy.sh (host nginx), install-auth.sh
+             (Authelia + Redis + mail relay), install-wireguard.sh,
+             install-tools.sh
   lib/       common.sh — config, site validation, domain table + nginx config,
-             maintenance helpers, rclone
-  sites/     new-site, drop-site, list-sites, domains, apply-hosts
+             Authelia config, maintenance helpers, rclone; authusers.py — the
+             Authelia users file
+  sites/     new-site, drop-site, list-sites, domains, auth (Authelia),
+             wireguard (print servers), apply-hosts
   backup/    backup, db-backup, verify, restore, restore-with-backup, migrate,
              rclone_trash_cleanup (from main, unchanged)
   update/    update, rollback, download-images, uninstall-app,

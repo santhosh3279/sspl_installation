@@ -57,10 +57,15 @@ primary_domain() {   # $1 site
 
 # The port in a site's host_name when it is http://<server-ip>:<port>.
 primary_port() {   # $1 site
-    current_host_name "$1" | sed -nE "s#^http://$(server_ip | sed 's/\./\\./g'):([0-9]+)/?\$#\1#p"
+    current_host_name "$1" | sed -nE "s#^https?://$(server_ip | sed 's/\./\\./g'):([0-9]+)/?\$#\1#p"
 }
 
-port_url() { printf 'http://%s:%s' "$(server_ip)" "$1"; }
+# A port of a site behind Authelia is HTTPS (self-signed).
+port_url() {
+    local scheme=http
+    if https_on && auth_active && site_auth_linked "$(port_site "$1")"; then scheme=https; fi
+    printf '%s://%s:%s' "$scheme" "$(server_ip)" "$1"
+}
 
 set_primary() {   # $1 site, $2 domain (or a port number)
     local url
@@ -109,6 +114,9 @@ case "$CMD" in
         [ -z "$CUR" ] || [ "$CUR" = "$SITE" ] || err "$DOMAIN already points at $CUR"
         if [ "$DOMAIN" != "$SITE" ] && list_sites | grep -qx -- "$DOMAIN"; then
             err "$DOMAIN is the name of another site"
+        fi
+        if site_auth_linked "$SITE" && ! auth_domain_ok "$DOMAIN"; then
+            err "$SITE is behind Authelia, which needs a domain with a dot (or an IP address) — $DOMAIN has none"
         fi
         if [ -n "$CUR" ]; then
             ok "$DOMAIN already points at $SITE"
@@ -212,8 +220,8 @@ case "$CMD" in
         take_lock
         CUR=$(port_site "$PORT")
         [ -z "$CUR" ] || [ "$CUR" = "$SITE" ] || err "port $PORT already belongs to $CUR"
-        for r in "$HTTP_PORT" "$HTTPS_PORT" "$FRONTEND_PORT" 22 2785 8090; do
-            [ "$PORT" != "$r" ] || err "port $PORT is reserved (HTTP/HTTPS, the stack's nginx, SSH, OpenWA or the panel)"
+        for r in "$HTTP_PORT" "$HTTPS_PORT" "$FRONTEND_PORT" "$AUTH_PORT" 22 2785 8090; do
+            [ "$PORT" != "$r" ] || err "port $PORT is reserved (HTTP/HTTPS, the stack's nginx, Authelia, SSH, OpenWA or the panel)"
         done
         if [ -z "$CUR" ]; then
             port_busy_by_other "$PORT" && err "port $PORT is in use by another program: $(ss -ltnpH "sport = :$PORT" | head -1)"
@@ -231,7 +239,7 @@ case "$CMD" in
         fi
         [ "$PRIMARY" = yes ] && set_primary "$SITE" "$PORT"
         echo ""
-        echo "✅ $SITE answers on $(port_url "$PORT")  (HTTP; no DNS needed)"
+        echo "✅ $SITE answers on $(port_url "$PORT")  (no DNS needed)"
         ;;
 
     unport)

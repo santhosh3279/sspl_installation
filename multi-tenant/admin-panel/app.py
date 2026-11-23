@@ -26,6 +26,7 @@ import subprocess
 import termios
 import threading
 import time
+import urllib.request
 import zipfile
 from datetime import datetime
 from functools import wraps
@@ -41,7 +42,7 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-11-19.mt4"
+PANEL_VERSION = "2026-11-23.mt7"
 FEATURES = ("Multi-tenant panel: sites list with per-site backup, DB backup, "
             "migrate, uninstall app and drop; Create site with app picker; "
             "per-site backup browser and guarded per-site restore (also from "
@@ -51,7 +52,13 @@ FEATURES = ("Multi-tenant panel: sites list with per-site backup, DB backup, "
             "tools update from git; nginx domain → site routing with per-site "
             "Domains… (add, remove, primary); AdGuard removed; HTTPS: self-signed "
             "default + Let's Encrypt per domain (Get certificate); per-site "
-            "IP + port (Add IP + port)")
+            "IP + port (Add IP + port); Authelia login with 2FA per site "
+            "(Domains… → Require Authelia login), Authelia users… (sites, "
+            "password, admin, 2FA reset), Redis sessions (Remember me 1 year), "
+            "no-2FA trusted networks, Gmail mail relay with test mail, "
+            "RAM monitor page with alerts, per-container and per-process memory, "
+            "and the MariaDB buffer pool size applied live from the panel, "
+            "WireGuard tunnel to the CUPS print servers (add, remove, test, setup script)")
 
 CONFIG_FILE = os.environ.get("SSPL_ADMIN_CONFIG", "/opt/sspl-admin/config.json")
 with open(CONFIG_FILE) as f:
@@ -95,6 +102,17 @@ MT_DEFAULTS = {
     "LOCAL_KEEP_MIN": "20",
     "CLOUD_KEEP": "10",
     "RCLONE_REMOTE": "",
+    "AUTH_DIR": "/opt/sspl-auth",
+    "AUTH_PORT": "9091",
+    "AUTH_REMEMBER_ME": "1y",
+    "AUTH_TRUSTED_NETWORKS": "",
+    "SMTP_USER": "",
+    "MAIL_FROM": "",
+    "SMTP_RELAY_HOST": "smtp.gmail.com",
+    "WG_IFACE": "sspl-wg",
+    "WG_PORT": "51820",
+    "WG_SUBNET": "10.99.0.0/24",
+    "WG_ENDPOINT": "",
 }
 CONF_LINE_RE = re.compile(
     r"""^([A-Z_][A-Z0-9_]*)=(?:"([^"]*)"|'([^']*)'|([^\s#]*))""", re.M)
@@ -212,8 +230,129 @@ def domain_has_cert(domain):
                for f in ("fullchain.pem", "privkey.pem"))
 
 
+# Authelia login gate — the same rules as lib/common.sh (auth_sites,
+# auth_active): a linked site is HTTPS-only (self-signed until it has a
+# certificate) and its IP:port addresses switch to TLS.
+AUTH_USER_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+CIDR_RE = re.compile(r"^(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:/(?:3[0-2]|[12]?\d))?$")
+
+
+def auth_dir():
+    return mt_conf()["AUTH_DIR"]
+
+
+def auth_installed():
+    d = auth_dir()
+    return (os.path.isfile(os.path.join(d, "compose.yaml"))
+            and os.path.isfile(os.path.join(d, "config", "configuration.yml")))
+
+
+def auth_sites():
+    out = []
+    try:
+        with open(Path(erp_dir()) / "site-auth") as f:
+            for line in f:
+                parts = line.split()
+                if parts and not parts[0].startswith("#") and valid_site_name(parts[0]) and parts[0] not in out:
+                    out.append(parts[0])
+    except OSError:
+        pass
+    return out
+
+
+def site_auth_linked(site):
+    return auth_installed() and site in auth_sites()
+
+
+def auth_domain_ok(d):
+    return bool(IPV4_RE.match(d)) or "." in d
+
+
+def auth_users():
+    """Authelia users without their password hashes (lib/authusers.py's file)."""
+    try:
+        with open(os.path.join(auth_dir(), "config", "users_database.yml")) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    rows = []
+    for name, u in sorted((data.get("users") or {}).items()):
+        g = u.get("groups") or []
+        rows.append({"user": name, "name": u.get("displayname", ""), "email": u.get("email", ""),
+                     "admin": "admins" in g, "disabled": bool(u.get("disabled")),
+                     "sites": sorted(x for x in g if x != "admins")})
+    return rows
+
+
+def auth_port():
+    p = str(mt_conf().get("AUTH_PORT", "9091"))
+    return int(p) if p.isdigit() else 9091
+
+
+def auth_status():
+    c = mt_conf()
+    st = {"installed": auth_installed(), "running": False, "linked": auth_sites(),
+          "users": len(auth_users()), "mail": c.get("SMTP_USER", ""),
+          "mail_from": c.get("MAIL_FROM", "") or c.get("SMTP_USER", ""),
+          "relay": c.get("SMTP_RELAY_HOST", ""), "trusted": c.get("AUTH_TRUSTED_NETWORKS", ""),
+          "remember": c.get("AUTH_REMEMBER_ME", "1y")}
+    if st["installed"]:
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{auth_port()}/authelia/api/health", timeout=2) as r:
+                st["running"] = r.status == 200
+        except Exception:
+            pass
+    return st
+
+
+# WireGuard to the CUPS print servers (sites/wireguard.sh). The peer table
+# holds public keys only; private keys stay in /etc/wireguard.
+WG_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,30}")
+WG_ENDPOINT_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?")
+WG_SUBNET_RE = re.compile(r"(?:10|172|192)(?:\.[0-9]{1,3}){2}\.0/24")
+
+
+def wg_peers():
+    rows = []
+    try:
+        with open(Path(erp_dir()) / "wg-peers") as f:
+            for line in f:
+                p = line.split()
+                if len(p) >= 3 and WG_NAME_RE.fullmatch(p[0]):
+                    rows.append({"name": p[0], "ip": p[1], "key": p[2],
+                                 "site": p[3] if len(p) > 3 else ""})
+    except OSError:
+        pass
+    return rows
+
+
+def wg_status():
+    c = mt_conf()
+    iface = c["WG_IFACE"]
+    st = {"installed": os.path.isfile(f"/etc/wireguard/{iface}.conf"),
+          "running": os.path.isdir(f"/sys/class/net/{iface}"),
+          "endpoint": c["WG_ENDPOINT"], "port": c["WG_PORT"], "subnet": c["WG_SUBNET"], "peers": []}
+    seen = {}
+    if st["running"]:
+        try:
+            r = subprocess.run(["wg", "show", iface, "latest-handshakes"],
+                               capture_output=True, text=True, timeout=5)
+            for line in r.stdout.splitlines():
+                key, _, ts = line.partition("\t")
+                seen[key] = int(ts) if ts.isdigit() else 0
+        except (OSError, subprocess.SubprocessError):
+            pass
+    now = int(time.time())
+    for p in wg_peers():
+        ts = seen.get(p.pop("key"), 0)
+        # Keepalives renew the handshake about every 2 minutes.
+        st["peers"].append({**p, "age": max(0, now - ts) if ts else None,
+                            "up": bool(ts) and now - ts < 200})
+    return st
+
+
 def domain_url(domain):
-    if https_on() and domain_has_cert(domain):
+    if https_on() and (domain_has_cert(domain) or site_auth_linked(domain_map().get(domain, ""))):
         p = https_port()
         return f"https://{domain}" + ("" if p == 443 else f":{p}")
     return site_url(domain)
@@ -247,9 +386,10 @@ def domain_info(site):
     out = [{"name": d, "url": domain_url(d), "cert": domain_has_cert(d),
             "is_ip": bool(IPV4_RE.match(d))} for d in names]
     ip = server_ip()
+    scheme = "https" if https_on() and site_auth_linked(site) else "http"
     for p, s in sorted(port_map().items()):
         if s == site:
-            out.append({"name": f"{ip}:{p}", "url": f"http://{ip}:{p}", "cert": False,
+            out.append({"name": f"{ip}:{p}", "url": f"{scheme}://{ip}:{p}", "cert": False,
                         "is_ip": True, "port": p})
     return out
 
@@ -303,6 +443,22 @@ ACTIONS = {
     "domain_cert":    {"label": "Get HTTPS certificate",  "cmd": [_tool("sites/domains.sh"), "cert"]},
     "port_add":       {"label": "Add site port",          "cmd": [_tool("sites/domains.sh"), "port"]},
     "port_remove":    {"label": "Remove site port",       "cmd": [_tool("sites/domains.sh"), "unport"]},
+    # Authelia login gate (sites/auth.sh). Passwords travel as AUTH_PASSWORD.
+    "auth_link":           {"label": "Link site to Authelia",     "cmd": [_tool("sites/auth.sh"), "link"]},
+    "auth_unlink":         {"label": "Unlink site from Authelia", "cmd": [_tool("sites/auth.sh"), "unlink"]},
+    "auth_user_add":       {"label": "Add Authelia user",         "cmd": [_tool("sites/auth.sh"), "user-add"]},
+    "auth_user_passwd":    {"label": "Set user password",         "cmd": [_tool("sites/auth.sh"), "user-passwd"]},
+    "auth_user_sites":     {"label": "Set user sites",            "cmd": [_tool("sites/auth.sh"), "user-sites"]},
+    "auth_user_admin":     {"label": "Set user admin",            "cmd": [_tool("sites/auth.sh"), "user-admin"]},
+    "auth_user_disable":   {"label": "Enable/disable user",       "cmd": [_tool("sites/auth.sh"), "user-disable"]},
+    "auth_user_remove":    {"label": "Remove Authelia user",      "cmd": [_tool("sites/auth.sh"), "user-remove"]},
+    "auth_user_reset_2fa": {"label": "Reset user 2FA",            "cmd": [_tool("sites/auth.sh"), "user-reset-2fa"]},
+    "auth_trusted":        {"label": "Set no-2FA networks",       "cmd": [_tool("sites/auth.sh"), "trusted"]},
+    "auth_mail_test":      {"label": "Send test mail",            "cmd": [_tool("sites/auth.sh"), "mail-test"]},
+    # WireGuard peers (CUPS print servers)
+    "wg_add":    {"label": "Add print server",    "cmd": [_tool("sites/wireguard.sh"), "add"]},
+    "wg_remove": {"label": "Remove print server", "cmd": [_tool("sites/wireguard.sh"), "remove"]},
+    "wg_test":   {"label": "Test print server",   "cmd": [_tool("sites/wireguard.sh"), "test"]},
 }
 
 # Component installers, run from the repo checkout. Only wired up when
@@ -311,6 +467,8 @@ STACK_SETUP_SCRIPT = _repo("multi-tenant/install/panel-install.sh")
 TOOLS_SETUP_SCRIPT = _repo("multi-tenant/install/install-tools.sh")
 RCLONE_SETUP_SCRIPT = _repo("Backup/frappe_backup_system/install_rclone.sh")
 PROXY_SETUP_SCRIPT = _repo("multi-tenant/install/install-proxy.sh")
+AUTH_SETUP_SCRIPT = _repo("multi-tenant/install/install-auth.sh")
+WG_SETUP_SCRIPT = _repo("multi-tenant/install/install-wireguard.sh")
 OPENWA_SETUP_SCRIPT = _repo("Production Installation/install_openwa.sh")
 RCLONE_GUIDE = _repo("Backup/Rclone_Configuration_Guide.docx")
 # The multi-tenant updater. NOT the repo-root update_panel.sh/update_tooling.sh:
@@ -326,6 +484,9 @@ INSTALL_ACTIONS = {
     # Host nginx: domain → site routing. Also moves an older stack's frontend
     # off the public port.
     "install_proxy":   {"label": "Install / repair nginx proxy",  "cmd": ["bash", PROXY_SETUP_SCRIPT or ""]},
+    # Authelia + Redis + Postfix relay (Gmail). Secrets go as env vars.
+    "install_auth":    {"label": "Install / update Authelia",     "cmd": ["bash", AUTH_SETUP_SCRIPT or ""]},
+    "install_wireguard": {"label": "Install / update WireGuard", "cmd": ["bash", WG_SETUP_SCRIPT or ""]},
     # OpenWA WhatsApp API gateway in Docker. Its admin API key never goes
     # through the job log: /api/openwa/key reads it from the container.
     "install_openwa":  {"label": "Install OpenWA",                "cmd": ["bash", OPENWA_SETUP_SCRIPT or ""]},
@@ -347,7 +508,7 @@ ERP_IMAGE_RE = re.compile(r"^[a-z0-9][a-z0-9._\-]*(?::[0-9]{1,5})?(?:/[a-z0-9][a
 
 # Ports this server already uses: SSH, OpenWA, this panel, and the stack's
 # own nginx behind the host nginx (FRONTEND_PORT, 127.0.0.1).
-RESERVED_PORTS = {22, 443, 2785, 8090, int(MT_DEFAULTS["FRONTEND_PORT"])}
+RESERVED_PORTS = {22, 443, 2785, 8090, int(MT_DEFAULTS["FRONTEND_PORT"]), int(MT_DEFAULTS["AUTH_PORT"])}
 
 # OpenWA (WhatsApp API). Its compose file pins the container name, so the
 # container is how the panel finds it, wherever it was installed from.
@@ -812,6 +973,7 @@ def sites_overview():
                     "host_name": cfg.get("host_name"),
                     "domains": [d for d in site_domains(s) if d != s],
                     "domain_info": domain_info(s),
+                    "auth": site_auth_linked(s),
                     "maintenance": cfg.get("maintenance_mode", False),
                     "paused": cfg.get("pause_scheduler", False),
                     "latest_backup": latest, "backups": count,
@@ -1058,11 +1220,15 @@ def setup_status():
                       "conf": os.path.isfile(MT_CONF)},
             "rclone":  rclone_status(),
             "proxy": proxy_status(),
+            "auth": auth_status(),
+            "wireguard": wg_status(),
             "openwa": openwa_status(),
         },
         "scripts": {
             "rclone": _script_ok(RCLONE_SETUP_SCRIPT),
             "proxy": _script_ok(PROXY_SETUP_SCRIPT),
+            "auth": _script_ok(AUTH_SETUP_SCRIPT),
+            "wireguard": _script_ok(WG_SETUP_SCRIPT),
             "openwa": _script_ok(OPENWA_SETUP_SCRIPT),
             "update_panel": _script_ok(UPDATE_PANEL_SCRIPT),
         },
@@ -1347,6 +1513,451 @@ def _zip_stream(folder, arc_root):
 
 # ---------------------------------------------------------------- routes
 
+# ---------------------------------------------------------------- RAM monitor + database memory
+# MariaDB ships with a 128M InnoDB buffer pool. An ERPNext database of a GB or more then reads
+# most pages from disk, and every bill save (20+ queries per item row) waits on it. The pool size
+# lives in <erp_dir>/mariadb/99-sspl.cnf; overrides/compose.sspl-db.yaml mounts that folder on the
+# db container's /etc/mysql/conf.d. MariaDB 11.8 resizes the pool live, so a new size applies at
+# once and the file keeps it across restarts. A stack installed before the mount existed gets it
+# from "Make permanent", which recreates the db container.
+
+DBM_CNF = "99-sspl.cnf"
+DBM_TARGET = "/etc/mysql/conf.d"
+DBM_OVERRIDE = "compose.sspl-db.yaml"
+DBM_STEP = 128 << 20
+DBM_MIN = 128 << 20
+DBM_HOST_RESERVE = 2 << 30   # never handed to the pool: OS, Redis, workers, OpenWA
+DBM_SIZE_RE = re.compile(r"^\s*(\d{1,7})\s*([MG])\s*$", re.I)
+
+
+def _dbm_erp_dir():
+    return erp_dir()
+
+
+def _dbm_compose():
+    return compose_file()
+
+
+def _dbm_cnf_dir():
+    return Path(_dbm_erp_dir()) / "mariadb"
+
+
+def _dbm_override_path():
+    return Path(_dbm_erp_dir()) / "frappe_docker" / "overrides" / DBM_OVERRIDE
+
+
+def _fmt_pool(n):
+    mb = int(n) // (1 << 20)
+    return f"{mb // 1024}G" if mb and mb % 1024 == 0 else f"{mb}M"
+
+
+def _parse_pool(text):
+    m = DBM_SIZE_RE.match(str(text or ""))
+    if not m:
+        return None
+    return int(m.group(1)) << (30 if m.group(2).upper() == "G" else 20)
+
+
+def _round_pool(n, up=False):
+    q, r = divmod(int(n), DBM_STEP)
+    return (q + (1 if up and r else 0)) * DBM_STEP
+
+
+def _db_exec(sql, timeout=30):
+    """Run SQL as root inside the db container -> (ok, stdout or error text).
+
+    The SQL travels as $1, never through shell interpolation, and the password is
+    the container's own, the one MariaDB was initialised with.
+    """
+    cmd = ["docker", "compose", "-f", _dbm_compose(), "exec", "-T", "db", "sh", "-c",
+           'MYSQL_PWD="${MARIADB_ROOT_PASSWORD:-$MYSQL_ROOT_PASSWORD}" '
+           'exec mariadb -uroot -N -B -e "$1"', "sh", sql]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, str(e)[:300]
+    if out.returncode != 0:
+        return False, (out.stderr or "mariadb failed").strip()[:300]
+    return True, out.stdout
+
+
+def _db_container():
+    """{'mounted': conf.d mount present, 'mem_limit': bytes or 0} for the db container."""
+    info = {"mounted": False, "mem_limit": 0}
+    try:
+        ps = subprocess.run(["docker", "compose", "-f", _dbm_compose(), "ps", "-q", "db"],
+                            capture_output=True, text=True, timeout=20)
+        cid = (ps.stdout.split() or [""])[0]
+        if not cid:
+            return info
+        out = subprocess.run(["docker", "inspect", cid], capture_output=True, text=True, timeout=20)
+        data = json.loads(out.stdout)[0]
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return info
+    info["mounted"] = any(m.get("Destination") == DBM_TARGET for m in data.get("Mounts") or [])
+    info["mem_limit"] = int((data.get("HostConfig") or {}).get("Memory") or 0)
+    return info
+
+
+def _dbm_configured():
+    try:
+        text = (_dbm_cnf_dir() / DBM_CNF).read_text()
+    except OSError:
+        return None
+    m = re.search(r"^\s*innodb_buffer_pool_size\s*=\s*(\S+)", text, re.M)
+    if not m:
+        return None
+    return int(m.group(1)) if m.group(1).isdigit() else _parse_pool(m.group(1))
+
+
+def _dbm_write_cnf(size):
+    d = _dbm_cnf_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / DBM_CNF
+    # Written in place: MariaDB skips world-writable files, hence the explicit 0644.
+    with open(path, "w") as f:
+        f.write("# InnoDB buffer pool for the ERPNext database. Set from the admin panel's\n"
+                "# RAM monitor page, which also applies it live.\n"
+                f"[mysqld]\ninnodb_buffer_pool_size = {_fmt_pool(size)}\n")
+    os.chmod(path, 0o644)
+
+
+def _dbm_write_override():
+    ov = _dbm_override_path()
+    if not ov.parent.is_dir():
+        raise OSError(f"{ov.parent} not found")
+    ov.write_text(
+        f"# SSPL: MariaDB settings from {_dbm_cnf_dir()} (InnoDB buffer pool, see {DBM_CNF}).\n"
+        "services:\n  db:\n    volumes:\n      - type: bind\n"
+        f"        source: {_dbm_cnf_dir()}\n        target: {DBM_TARGET}\n"
+        "        read_only: true\n")
+    return ov
+
+
+_dbm_cache = {"ts": 0.0, "data": None}
+_dbm_raw = {}   # last (reads, read_requests) sample, for the recent miss rate
+
+
+def dbm_state(force=False):
+    now = time.time()
+    if not force and _dbm_cache["data"] is not None and now - _dbm_cache["ts"] < 30:
+        return _dbm_cache["data"]
+    mem = meminfo()
+    ram = mem.get("MemTotal", 0)
+    st = {"error": None, "live": None, "data": None, "miss_pct": None, "recent_miss_pct": None,
+          "configured": _dbm_configured()}
+    ok, out = _db_exec(
+        "SELECT @@innodb_buffer_pool_size;"
+        " SELECT COALESCE(SUM(data_length + index_length), 0) FROM information_schema.tables"
+        " WHERE engine = 'InnoDB';"
+        " SELECT variable_value FROM information_schema.global_status"
+        " WHERE variable_name = 'INNODB_BUFFER_POOL_READS';"
+        " SELECT variable_value FROM information_schema.global_status"
+        " WHERE variable_name = 'INNODB_BUFFER_POOL_READ_REQUESTS';", timeout=60)
+    if ok:
+        try:
+            live, data, reads, reqs = (int(float(v)) for v in out.split()[:4])
+            # Too few requests (a fresh or idle DB) make the ratio meaningless
+            st.update(live=live, data=data,
+                      miss_pct=round(min(100.0, 100.0 * reads / reqs), 2) if reqs >= 10000 else None)
+            # The total counts since the DB started, so it barely moves after a resize;
+            # the rate between two samples shows what the current pool is doing.
+            prev = _dbm_raw.get("v")
+            if prev and reqs - prev[1] > 1000:
+                st["recent_miss_pct"] = round(
+                    min(100.0, 100.0 * max(0, reads - prev[0]) / (reqs - prev[1])), 2)
+            elif prev and "recent" in _dbm_raw:
+                st["recent_miss_pct"] = _dbm_raw["recent"]
+            if prev is None or reqs - prev[1] > 1000 or reqs < prev[1]:
+                _dbm_raw["v"] = (reads, reqs)
+                if "recent_miss_pct" in st:
+                    _dbm_raw["recent"] = st["recent_miss_pct"]
+        except ValueError:
+            st["error"] = "unexpected answer from MariaDB"
+    else:
+        st["error"] = out
+    st.update(_db_container())
+
+    upper = ram - DBM_HOST_RESERVE
+    if st["mem_limit"]:
+        upper = min(upper, st["mem_limit"] - (512 << 20))
+    upper = max(DBM_MIN, _round_pool(upper))
+    # The whole database plus a quarter for growth, but never more than a quarter of RAM
+    want = max(256 << 20, (st["data"] or 0) * 5 // 4)
+    rec = min(max(DBM_MIN, _round_pool(min(ram // 4, want), up=True)), upper)
+    st.update(ram=ram, available=mem.get("MemAvailable", 0), min=DBM_MIN, max=upper, recommended=rec,
+              h={"live": _fmt_pool(st["live"]) if st["live"] else "–",
+                 "configured": _fmt_pool(st["configured"]) if st["configured"] else "not set",
+                 "data": human(st["data"]) if st["data"] is not None else "–",
+                 "recommended": _fmt_pool(rec), "max": _fmt_pool(upper), "min": _fmt_pool(DBM_MIN),
+                 "mem_limit": human(st["mem_limit"]) if st["mem_limit"] else "none",
+                 "available": human(mem.get("MemAvailable", 0))})
+    _dbm_cache.update(ts=now, data=st)
+    return st
+
+
+def _dbm_job_busy():
+    with _job_lock:
+        return bool(_job and _job["proc"].poll() is None)
+
+
+def _parse_docker_bytes(text):
+    m = re.match(r"\s*([\d.]+)\s*([KMGT]?i?B)", text or "")
+    if not m:
+        return 0
+    mult = {"B": 1, "KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12,
+            "KIB": 1 << 10, "MIB": 1 << 20, "GIB": 1 << 30, "TIB": 1 << 40}
+    return int(float(m.group(1)) * mult.get(m.group(2).upper(), 1))
+
+
+_dstats_cache = {"ts": 0.0, "data": None}
+
+
+def docker_mem_stats():
+    """Every running container's memory against its limit (docker stats takes ~2s: cached)."""
+    now = time.time()
+    if _dstats_cache["data"] is not None and now - _dstats_cache["ts"] < 15:
+        return _dstats_cache["data"]
+    res = {"rows": [], "error": None}
+    try:
+        out = subprocess.run(["docker", "stats", "--no-stream", "--format", "{{json .}}"],
+                             capture_output=True, text=True, timeout=40)
+        if out.returncode != 0:
+            res["error"] = (out.stderr or "docker stats failed").strip()[:300]
+        host = meminfo().get("MemTotal", 0)
+        for line in out.stdout.splitlines():
+            if not line.strip():
+                continue
+            it = json.loads(line)
+            used_s, _, limit_s = (it.get("MemUsage") or "").partition("/")
+            used, limit = _parse_docker_bytes(used_s), _parse_docker_bytes(limit_s)
+            # No limit set: docker reports the host's RAM as the limit
+            limited = bool(limit) and host and limit < host * 0.97
+            res["rows"].append({
+                "name": it.get("Name", "?"), "used": used, "used_h": human(used),
+                "limit_h": human(limit) if limited else "none",
+                "pct": round(100.0 * used / limit, 1) if limited else None,
+                "host_pct": round(100.0 * used / host, 1) if host else 0,
+                "cpu": it.get("CPUPerc", ""),
+            })
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        res["error"] = str(e)[:300]
+    res["rows"].sort(key=lambda r: r["used"], reverse=True)
+    _dstats_cache.update(ts=now, data=res)
+    return res
+
+
+def top_processes(limit=12):
+    procs = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/status") as f:
+                fields = dict(line.split(":", 1) for line in f if ":" in line)
+            if "VmRSS" not in fields:   # kernel thread
+                continue
+            rss = int(fields["VmRSS"].split()[0]) * 1024
+            swap = int(fields.get("VmSwap", "0 kB").split()[0]) * 1024
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = f.read().replace(b"\0", b" ").decode(errors="replace").strip()
+        except (OSError, ValueError):
+            continue
+        procs.append({"pid": int(pid), "name": fields.get("Name", "").strip(), "rss": rss,
+                      "swap": swap, "cmd": cmd[:140]})
+    procs.sort(key=lambda p: p["rss"] + p["swap"], reverse=True)
+    for p in procs:
+        p["rss_h"], p["swap_h"] = human(p["rss"]), human(p["swap"])
+    return procs[:limit]
+
+
+_vm_last = {"ts": 0.0, "in": 0, "out": 0}
+
+
+def swap_rates():
+    """Bytes/s swapped in and out since the previous call (None on the first)."""
+    vals = {}
+    try:
+        with open("/proc/vmstat") as f:
+            for line in f:
+                k, _, v = line.partition(" ")
+                if k in ("pswpin", "pswpout"):
+                    vals[k] = int(v)
+    except OSError:
+        return None, None
+    now, page = time.time(), os.sysconf("SC_PAGE_SIZE")
+    prev = dict(_vm_last)
+    _vm_last.update(ts=now, **{"in": vals.get("pswpin", 0), "out": vals.get("pswpout", 0)})
+    dt = now - prev["ts"]
+    if not prev["ts"] or dt <= 0:
+        return None, None
+    return (max(0, _vm_last["in"] - prev["in"]) * page / dt,
+            max(0, _vm_last["out"] - prev["out"]) * page / dt)
+
+
+def mem_pressure():
+    """Share of the last 10s some task stalled waiting for memory (PSI), or None."""
+    try:
+        with open("/proc/pressure/memory") as f:
+            m = re.search(r"some avg10=([\d.]+)", f.read())
+        return float(m.group(1)) if m else None
+    except OSError:
+        return None
+
+
+def ram_report():
+    mem = meminfo()
+    total, avail = mem.get("MemTotal", 0), mem.get("MemAvailable", 0)
+    swap_t, swap_f = mem.get("SwapTotal", 0), mem.get("SwapFree", 0)
+    swap_used = swap_t - swap_f
+    sin, sout = swap_rates()
+    psi = mem_pressure()
+    containers = docker_mem_stats()
+    db = dbm_state()
+    alerts = []
+
+    def alert(level, text):
+        alerts.append({"level": level, "text": text})
+
+    avail_pct = 100.0 * avail / total if total else 100
+    if avail_pct < 10:
+        alert("crit", f"Only {human(avail)} RAM available ({avail_pct:.0f}%)")
+    elif avail_pct < 20:
+        alert("warn", f"RAM is getting low: {human(avail)} available ({avail_pct:.0f}%)")
+    if sin is not None and sin > (1 << 20):
+        alert("crit", f"Actively swapping in {human(sin)}/s — the server is out of RAM")
+    elif swap_t and swap_used > swap_t * 0.25:
+        alert("warn", f"{human(swap_used)} of swap in use")
+    if psi is not None and psi >= 10:
+        alert("crit" if psi >= 30 else "warn", f"Tasks stalled on memory {psi:.0f}% of the last 10s")
+    for c in containers["rows"]:
+        if c["pct"] is not None and c["pct"] >= 90:
+            alert("warn", f"{c['name']} is at {c['pct']:.0f}% of its {c['limit_h']} memory limit")
+    miss = db.get("recent_miss_pct")
+    miss = db.get("miss_pct") if miss is None else miss
+    if miss is not None and miss > 1:
+        alert("warn", f"Database reads {miss:.1f}% of pages from disk — raise the "
+                      f"buffer pool (recommended {db['h']['recommended']})")
+    if db.get("live") and db["live"] < db["recommended"] // 2:
+        alert("warn", f"Database buffer pool {db['h']['live']} is well below the recommended "
+                      f"{db['h']['recommended']}")
+    return {
+        "mem": {"total": human(total), "available": human(avail),
+                "used_pct": round(100.0 - avail_pct, 1),
+                "cached": human(mem.get("Cached", 0) + mem.get("Buffers", 0))},
+        "swap": {"total": human(swap_t), "used": human(swap_used),
+                 "pct": round(100.0 * swap_used / swap_t, 1) if swap_t else 0,
+                 "in": human(sin) + "/s" if sin is not None else "–",
+                 "out": human(sout) + "/s" if sout is not None else "–"},
+        "psi": psi, "alerts": alerts, "containers": containers, "processes": top_processes(),
+    }
+
+
+@app.route("/ram")
+@login_required
+def ram_page():
+    return render_template_string(RAM_HTML, user=session["user"], version=PANEL_VERSION)
+
+
+@app.route("/api/ram")
+@login_required
+def api_ram():
+    return jsonify(ram_report())
+
+
+@app.route("/api/db-memory")
+@login_required
+def api_db_memory():
+    return jsonify(dbm_state(force=request.args.get("fresh") == "1"))
+
+
+@app.route("/api/db-memory", methods=["POST"])
+@login_required
+def api_db_memory_set():
+    data = request.get_json(silent=True) or {}
+    st = dbm_state(force=True)
+    raw = str(data.get("size", "")).strip()
+    size = st["recommended"] if raw.lower() == "recommended" else _parse_pool(raw)
+    if size is None:
+        return jsonify({"error": "Size must look like 2G or 1536M"}), 400
+    if not st["min"] <= size <= st["max"]:
+        return jsonify({"error": f"Size must be between {st['h']['min']} and {st['h']['max']} "
+                                 f"(RAM minus {_fmt_pool(DBM_HOST_RESERVE)} for everything else)"}), 400
+    # Some MariaDB builds cap live growth (innodb_buffer_pool_size_max). Then the size is
+    # only saved, and takes effect when the db container next starts.
+    live_ok, out = _db_exec(f"SET GLOBAL innodb_buffer_pool_size = {int(size)}")
+    try:
+        _dbm_write_cnf(size)
+    except OSError as e:
+        return jsonify({"error": (f"Applied live, but could not save {DBM_CNF}: {e}" if live_ok
+                                  else f"MariaDB refused the new size ({out}) and {DBM_CNF} "
+                                       f"could not be saved: {e}")}), 500
+    st = dbm_state(force=True)
+    if not live_ok:
+        return jsonify({"ok": True, "state": st, "message": (
+            f"MariaDB would not resize live ({out}). Saved {_fmt_pool(size)} to the file: it "
+            "applies when the db container restarts" + ("." if st["mounted"] else
+            " — press 'Make permanent', which restarts it."))})
+    msg = f"Buffer pool is now {st['h']['live']}."
+    msg += (" Saved — it stays after a restart." if st["mounted"] else
+            " Saved to the file, but the db container does not read it yet: press"
+            " 'Make permanent' or it falls back to 128M on the next DB restart.")
+    return jsonify({"ok": True, "message": msg, "state": st})
+
+
+@app.route("/api/db-memory/persist", methods=["POST"])
+@login_required
+def api_db_memory_persist():
+    """Add the conf.d mount to the compose file and recreate the db container."""
+    if _dbm_job_busy():
+        return jsonify({"error": "A job is running — wait for it to finish first"}), 409
+    st = dbm_state(force=True)
+    if st["mounted"]:
+        return jsonify({"ok": True, "message": "Already permanent.", "state": st})
+    compose = _dbm_compose()
+    try:
+        if _dbm_configured() is None:
+            _dbm_write_cnf(st["live"] if st["live"] and st["live"] > DBM_MIN else st["recommended"])
+        ov = _dbm_write_override()
+        # Merging the generated file with the override is lossless (it is itself the
+        # output of 'docker compose config'), so no installer re-run is needed.
+        merged = subprocess.run(["docker", "compose", "-f", compose, "-f", str(ov), "config"],
+                                capture_output=True, text=True, timeout=60,
+                                cwd=os.path.dirname(compose))
+    except (OSError, subprocess.SubprocessError) as e:
+        return jsonify({"error": f"Could not prepare the compose change: {e}"}), 500
+    if merged.returncode != 0 or DBM_TARGET not in merged.stdout:
+        return jsonify({"error": "docker compose config failed: "
+                                 + (merged.stderr or "mount missing from output").strip()[:300]}), 500
+    backup = f"{compose}.bak-dbmem-{datetime.now():%Y%m%d_%H%M%S}"
+    shutil.copy2(compose, backup)
+    with open(compose, "w") as f:
+        f.write(merged.stdout)
+
+    def up_db():
+        return subprocess.run(["docker", "compose", "-f", compose, "up", "-d", "db"],
+                              capture_output=True, text=True, timeout=300)
+
+    up = up_db()
+    if up.returncode != 0:
+        shutil.copy2(backup, compose)   # put the old definition back and bring db up on it
+        up_db()
+        return jsonify({"error": "Recreating the db container failed, the old compose file was "
+                                 "restored: " + (up.stderr or "").strip()[-300:]}), 500
+    for _ in range(60):
+        if _db_exec("SELECT 1", timeout=10)[0]:
+            break
+        time.sleep(2)
+    _containers_cache.update(ts=0.0, data=None)
+    st = dbm_state(force=True)
+    if not st["mounted"]:
+        return jsonify({"error": "The db container restarted but the mount is not there — "
+                                 f"check {compose} (backup: {backup})"}), 500
+    return jsonify({"ok": True, "state": st,
+                    "message": f"Permanent: the db container now reads {DBM_CNF} "
+                               f"(buffer pool {st['h']['live']}). Old compose file: {backup}"})
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     error = None
@@ -1405,6 +2016,7 @@ def api_sites():
                     "cloud": wired.split() if wired else [],
                     "http_port": http_port(),
                     "https": https_on(),
+                    "auth": {"installed": auth_installed(), "users": auth_users() if auth_installed() else []},
                     "stack": os.path.isfile(compose_file()),
                     "tools": os.path.isfile(_tool("lib/common.sh"))})
 
@@ -1571,8 +2183,137 @@ def _domain_request(name, data):
         return None, None, f"{domain} already points at {owner}"
     if domain != site and domain in list_sites():
         return None, None, f"{domain} is the name of another site"
+    if site_auth_linked(site) and not auth_domain_ok(domain):
+        return None, None, f"{site} is behind Authelia, which needs a domain with a dot (or an IP address)"
     args = [site, domain] + (["--primary"] if data.get("primary") else [])
     return args, f"Add domain {domain} to {site}", None
+
+
+def _auth_password(data):
+    pw = str(data.get("password", ""))
+    if len(pw) < 8:
+        return None, "the password needs 8 characters or more"
+    if len(pw) > 256 or "\n" in pw or "\r" in pw:
+        return None, "the password is too long or has a line break"
+    return pw, None
+
+
+def _auth_sites_arg(data):
+    sites = data.get("sites") or []
+    if isinstance(sites, str):
+        sites = [x for x in sites.split(",")]
+    sites = sorted({str(x).strip().lower() for x in sites if str(x).strip()})
+    known = set(list_sites())
+    bad = [x for x in sites if x not in known]
+    if bad:
+        return None, f"no such site: {', '.join(bad)}"
+    return ",".join(sites), None
+
+
+def _auth_request(name, data):
+    """Arguments for sites/auth.sh. (args, env, label, None) or (None, None, None, error).
+    Passwords go in env (AUTH_PASSWORD), never argv."""
+    if not auth_installed():
+        return None, None, None, "Authelia is not installed — install it from the installation suite"
+    if name in ("auth_link", "auth_unlink"):
+        site = str(data.get("site", "")).strip().lower()
+        if site not in list_sites():
+            return None, None, None, "no such site"
+        if name == "auth_link":
+            if not https_on():
+                return None, None, None, "HTTPS is off on the host nginx — Authelia only works on https:// pages"
+            bad = [d for d in site_domains(site) if not auth_domain_ok(d)]
+            if bad:
+                return None, None, None, (f"Authelia needs domains with a dot (or IP addresses): "
+                                          f"remove {', '.join(bad)} first")
+            return [site], None, f"Put {site} behind Authelia", None
+        return [site], None, f"Remove the Authelia login from {site}", None
+    if name == "auth_trusted":
+        nets = str(data.get("networks", "")).split()
+        if len(nets) > 20 or any(not CIDR_RE.match(n) for n in nets):
+            return None, None, None, "networks: IPv4 addresses or CIDRs (e.g. 192.168.1.0/24), space-separated"
+        return [" ".join(nets)], None, "No-2FA networks: " + (" ".join(nets) or "none"), None
+    if name == "auth_mail_test":
+        to = str(data.get("to", "")).strip()
+        if not EMAIL_RE.match(to):
+            return None, None, None, "that e-mail address does not look right"
+        return [to], None, f"Test mail to {to}", None
+
+    user = str(data.get("user", "")).strip().lower()
+    if not AUTH_USER_RE.match(user):
+        return None, None, None, "user names: lowercase letters, digits, . _ - (start with a letter or digit)"
+    exists = any(u["user"] == user for u in auth_users())
+    if name == "auth_user_add":
+        if exists:
+            return None, None, None, f"user {user} already exists"
+        email = str(data.get("email", "")).strip()
+        if not EMAIL_RE.match(email):
+            return None, None, None, "that e-mail address does not look right (2FA codes are sent there)"
+        disp = str(data.get("name", "")).strip()[:100] or user
+        if any(ord(c) < 32 for c in disp):
+            return None, None, None, "the display name has control characters"
+        sites, err = _auth_sites_arg(data)
+        if err:
+            return None, None, None, err
+        pw, err = _auth_password(data)
+        if err:
+            return None, None, None, err
+        args = [user, email, disp, sites] + (["--admin"] if data.get("admin") else [])
+        return args, {"AUTH_PASSWORD": pw}, f"Add Authelia user {user}", None
+    if not exists:
+        return None, None, None, f"no user {user}"
+    if name == "auth_user_passwd":
+        pw, err = _auth_password(data)
+        if err:
+            return None, None, None, err
+        return [user], {"AUTH_PASSWORD": pw}, f"New password for {user}", None
+    if name == "auth_user_sites":
+        sites, err = _auth_sites_arg(data)
+        if err:
+            return None, None, None, err
+        return [user, sites], None, f"Sites of {user}: {sites or 'none'}", None
+    if name in ("auth_user_admin", "auth_user_disable"):
+        on = "yes" if data.get("on") else "no"
+        what = "admin" if name == "auth_user_admin" else "disabled"
+        return [user, on], None, f"{user}: {what} = {on}", None
+    if name in ("auth_user_remove", "auth_user_reset_2fa"):
+        return [user], None, (f"Remove user {user}" if name == "auth_user_remove" else f"Reset 2FA of {user}"), None
+    return None, None, None, "unknown action"
+
+
+def _wg_request(name, data):
+    """Arguments for sites/wireguard.sh: (args, label, None) or (None, None, error)."""
+    peer = str(data.get("name", "")).strip().lower()
+    if not WG_NAME_RE.fullmatch(peer):
+        return None, None, "name: lowercase letters, digits and - (31 at most)"
+    exists = any(p["name"] == peer for p in wg_peers())
+    if name == "wg_add":
+        if exists:
+            return None, None, f"print server {peer} already exists"
+        site = str(data.get("site", "")).strip()
+        if site and site not in list_sites():
+            return None, None, "no such site"
+        return [peer] + (["--site", site] if site else []), f"Add print server {peer}", None
+    if not exists:
+        return None, None, f"no print server {peer}"
+    return [peer], f"{ACTIONS[name]['label']} {peer}", None
+
+
+@app.route("/api/wireguard/setup/<peer>")
+@login_required
+def api_wireguard_setup(peer):
+    # Holds the peer's private key: straight to the browser, never in a job log.
+    if not any(p["name"] == peer for p in wg_peers()):
+        return jsonify({"error": "no such print server"}), 404
+    try:
+        r = subprocess.run([_tool("sites/wireguard.sh"), "setup-script", peer], capture_output=True,
+                           text=True, timeout=20, env={**os.environ, "SSPL_CONF": MT_CONF})
+    except (OSError, subprocess.SubprocessError):
+        return jsonify({"error": "could not run sites/wireguard.sh"}), 500
+    if r.returncode != 0:
+        return jsonify({"error": r.stderr.strip()[-300:] or "failed"}), 500
+    return Response(r.stdout, mimetype="text/x-shellscript", headers={
+        "Content-Disposition": f'attachment; filename="sspl-wg-{peer}.sh"', "Cache-Control": "no-store"})
 
 
 @app.route("/api/run/<name>", methods=["POST"])
@@ -1665,6 +2406,16 @@ def api_run(name):
                     return jsonify({"error": "that e-mail address does not look right"}), 400
                 extra_env = {"LETSENCRYPT_EMAIL": email}
 
+    elif name.startswith("auth_"):
+        extra_args, extra_env, label, err = _auth_request(name, data)
+        if err:
+            return jsonify({"error": err}), 400
+
+    elif name.startswith("wg_"):
+        extra_args, label, err = _wg_request(name, data)
+        if err:
+            return jsonify({"error": err}), 400
+
     elif name in INSTALL_ACTIONS:
         if not REPO_DIR:
             return jsonify({"error": "repo_dir is not configured on this server"}), 400
@@ -1732,6 +2483,53 @@ def _install_env(name, data):
 
     if name in ("install_rclone", "install_proxy"):
         return {}, None, None
+    if name == "install_auth":
+        env = {}
+        user = str(data.get("smtp_user", "")).strip()
+        pw = str(data.get("smtp_password", "")).replace(" ", "")
+        mfrom = str(data.get("mail_from", "")).strip()
+        if user and not EMAIL_RE.match(user):
+            return None, None, "Gmail address: that does not look like an e-mail address"
+        if mfrom and not EMAIL_RE.match(mfrom):
+            return None, None, "sender: that does not look like an e-mail address"
+        if pw and (len(pw) > 128 or any(ord(c) < 33 for c in pw)):
+            return None, None, "the app password has odd characters"
+        if user:
+            env["SMTP_USER"] = user
+        if pw:
+            env["SMTP_PASSWORD"] = pw
+        if mfrom:
+            env["MAIL_FROM"] = mfrom
+        if "trusted" in data:
+            nets = str(data.get("trusted", "")).split()
+            if len(nets) > 20 or any(not CIDR_RE.match(n) for n in nets):
+                return None, None, "no-2FA networks: IPv4 addresses or CIDRs, space-separated"
+            env["AUTH_TRUSTED_NETWORKS"] = " ".join(nets)
+        au = str(data.get("admin_user", "")).strip().lower()
+        if au:
+            if not AUTH_USER_RE.match(au):
+                return None, None, "admin user name: lowercase letters, digits, . _ -"
+            ae = str(data.get("admin_email", "")).strip()
+            if not EMAIL_RE.match(ae):
+                return None, None, "admin e-mail: that does not look right (2FA codes are sent there)"
+            apw, err = _auth_password({"password": data.get("admin_password", "")})
+            if err:
+                return None, None, "admin " + err
+            env.update({"ADMIN_USER": au, "ADMIN_EMAIL": ae, "AUTH_PASSWORD": apw})
+        if not auth_installed() and not (user and pw):
+            return None, None, "enter the Gmail address and its app password (Authelia mails the 2FA codes)"
+        return env, None, None
+    if name == "install_wireguard":
+        ep = str(data.get("endpoint", "")).strip()
+        port = str(data.get("port", "")).strip() or "51820"
+        subnet = str(data.get("subnet", "")).strip() or MT_DEFAULTS["WG_SUBNET"]
+        if not WG_ENDPOINT_RE.fullmatch(ep):
+            return None, None, "enter this server's public IP or DNS name"
+        if not (port.isascii() and port.isdigit() and 1 <= int(port) <= 65535):
+            return None, None, "UDP port must be a number between 1 and 65535"
+        if not WG_SUBNET_RE.fullmatch(subnet):
+            return None, None, "tunnel network: a private /24, e.g. 10.99.0.0/24"
+        return {"WG_ENDPOINT": ep, "WG_PORT": port, "WG_SUBNET": subnet}, None, None
     if name == "install_openwa":
         return {"OPENWA_DIR": OPENWA_DIR, "OPENWA_PORT": str(OPENWA_PORT)}, None, None
 
@@ -2641,6 +3439,72 @@ async function refreshSetup(){
         still holds the public port. <b>Repair nginx routing</b> moves it.</div>`;
     }
     rows += `</div>`;
+    // Authelia login gate + Redis + mail relay (Gmail)
+    const au = c.auth || {};
+    rows += `<div class="setup-row"><div class="setup-h"><b>Authelia login (2FA) + mail relay</b> ${pill(au.installed)}`
+      + (au.installed ? (au.running ? ' <span class="badge ok">running</span>'
+                                    : ' <span class="badge miss">not answering</span>') : '')
+      + (au.installed ? ` <span class="badge">${(au.linked||[]).length} site(s) linked</span>
+                         <span class="badge">${au.users} user(s)</span>` : '')
+      + (au.mail ? ` <span class="badge ok" title="sends through ${esc(au.relay)}">mail: ${esc(au.mail)}</span>`
+                 : (au.installed ? ' <span class="badge miss">no mail account</span>' : '')) + `</div>`;
+    if(erpDone && s.scripts.auth){
+      rows += `<div class="setup-form">
+        <input type="email" id="au-smtp-user" placeholder="Gmail address" value="${esc(au.mail||'')}" size="26" autocomplete="off">
+        <input type="password" id="au-smtp-pw" placeholder="${au.mail ? 'app password (unchanged)' : 'Gmail app password'}" size="20" autocomplete="new-password">
+        <input type="email" id="au-from" placeholder="sender (default: the Gmail address)" value="${esc(au.mail_from && au.mail_from !== au.mail ? au.mail_from : '')}" size="28" autocomplete="off">
+        <input type="text" id="au-trusted" placeholder="no-2FA networks, e.g. 192.168.1.0/24" value="${esc(au.trusted||'')}" size="30"
+          title="From these networks the password is enough (no 2FA). Space-separated. Empty: 2FA everywhere.">`
+        + (au.installed ? '' : `
+        <input type="text" id="au-admin-user" placeholder="first admin user" size="14" autocomplete="off" autocapitalize="off">
+        <input type="email" id="au-admin-email" placeholder="admin e-mail" size="22" autocomplete="off">
+        <input type="password" id="au-admin-pw" placeholder="admin password (8+)" size="16" autocomplete="new-password">`)
+        + `
+        <button class="primary setup-install" data-inst="install_auth"
+          data-confirm="${au.installed ? 'Apply these Authelia / mail settings? Authelia restarts for a few seconds; nobody is logged out.' : 'Install Authelia, Redis and the mail relay now? Nothing is gated until you link a site in its Domains… dialog.'}">${au.installed ? 'Save settings' : 'Install Authelia'}</button></div>`;
+      if(au.installed && au.mail){
+        rows += `<div class="setup-form"><input type="email" id="au-test-to" placeholder="send a test mail to…" size="26">
+          <button id="au-test" onclick="authMailTest()">Send test mail</button></div>`;
+      }
+    }
+    rows += `<div class="note">A linked site shows an Authelia login with 2FA (authenticator app or security key)
+      before ERPNext. <b>Remember me</b> keeps that browser logged in for ${esc(au.remember||'1y')}, stored in Redis
+      (survives restarts). Users and their sites: <b>Authelia users…</b> on the <a href="/">dashboard</a>; link a site
+      in its <b>Domains…</b> dialog. Mail goes through Gmail: turn on 2-Step Verification for the Google account, then
+      create an <b>app password</b> (Google Account → Security → App passwords); Gmail sends as that address or a
+      verified alias only. Needs HTTPS on the nginx routing above.</div>`;
+    if(au.installed && !c.proxy.https_live){
+      rows += `<div class="note" style="color:var(--warn)">HTTPS is off on the nginx routing — linked sites refuse every request until it works.</div>`;
+    }
+    rows += `</div>`;
+    // WireGuard to the CUPS print servers
+    const wg = c.wireguard || {peers: []};
+    rows += `<div class="setup-row"><div class="setup-h"><b>WireGuard (print servers)</b> ${pill(wg.installed)}`
+      + (wg.installed ? (wg.running ? ' <span class="badge ok">running</span>'
+                                    : ' <span class="badge miss">down</span>') : '') + `</div>`;
+    if(erpDone && s.scripts.wireguard){
+      rows += `<div class="setup-form">
+        <input type="text" id="wg-endpoint" placeholder="public IP or DNS of this server" value="${esc(wg.endpoint||'')}" size="28" autocomplete="off">
+        <input type="text" id="wg-port" title="UDP port" value="${esc(wg.port||'51820')}" size="6">
+        <input type="text" id="wg-subnet" title="Tunnel network (a /24)" value="${esc(wg.subnet||'')}" size="14" ${wg.peers.length ? 'disabled' : ''}>
+        <button class="primary setup-install" data-inst="install_wireguard"
+          data-confirm="${wg.installed ? 'Apply and restart the tunnel? Printing pauses for a few seconds.' : 'Install WireGuard on this server now?'}">${wg.installed ? 'Save / repair' : 'Install WireGuard'}</button></div>`;
+    }
+    if(wg.installed){
+      rows += wg.peers.map(p => `<div class="setup-form"><b>${esc(p.name)}</b> <code>${esc(p.ip)}</code>
+        ${p.up ? '<span class="badge ok">connected</span>' : `<span class="badge miss">${p.age === null ? 'never connected' : 'not connected'}</span>`}
+        ${p.site ? `<span class="badge">${esc(p.site)}</span>` : ''}
+        <a href="/api/wireguard/setup/${esc(p.name)}" title="Contains a private key">Setup script</a>
+        <button class="wg-act" data-act="wg_test" data-n="${esc(p.name)}">Test CUPS</button>
+        <button class="wg-act danger" data-act="wg_remove" data-n="${esc(p.name)}">Remove</button></div>`).join('');
+      rows += `<div class="setup-form"><input type="text" id="wg-name" placeholder="print server name, e.g. shop1" size="26" autocomplete="off" autocapitalize="off">
+        <select id="wg-site"><option value="">no site label</option>${(c.erp.sites||[]).map(x => `<option value="${esc(x)}">${esc(x)}</option>`).join('')}</select>
+        <button class="wg-act" data-act="wg_add">Add print server</button></div>`;
+    }
+    rows += `<div class="note">Lets the ERP containers print to CUPS servers behind shop routers. Open <b>UDP ${esc(wg.port||'51820')}</b>
+      to this server. Run the setup script as root on the CUPS machine, then delete it (it holds a private key). In ERPNext, set
+      the Printer Server host to the address shown here, port 631. Print servers cannot open connections to this server or to each
+      other. The site is a label only: every site on the stack can reach every print server.</div></div>`;
     // OpenWA WhatsApp API (Docker)
     const ow = c.openwa, owUrl = 'http://' + (s.server_ip || location.hostname) + ':' + ow.port;
     rows += `<div class="setup-row"><div class="setup-h"><b>OpenWA WhatsApp API</b> ${pill(ow.installed)}`
@@ -2671,10 +3535,22 @@ async function refreshSetup(){
       <div class="note">Panel running v${esc(s.panel_version||'')}. <b>Update panel &amp; tools</b> on the
         dashboard pulls <code>${esc(s.repo_dir||'')}</code> from git, refreshes the tools and redeploys
         this panel. Settings, cron and site data are not touched.</div></div>`;
+    // The refresh rebuilds the forms: keep what was typed in them.
+    const keep = {};
+    document.querySelectorAll('#setup-body input[id], #wg-site').forEach(i => {
+      keep[i.id] = i.type === 'checkbox' ? i.checked : i.value; });
+    const focused = document.activeElement && document.activeElement.id;
     $('#setup-body').innerHTML =
       (erpDone && toolsOk ? '<p style="color:var(--ok);margin:0 0 6px">✓ Stack and tools are installed. ' +
                  'Create and run sites from the <a href="/">dashboard</a>.</p>' : '') + rows;
+    for (const [id, v] of Object.entries(keep)){
+      const i = document.getElementById(id);
+      if (!i || i.id === 'ow-key') continue;
+      if (i.type === 'checkbox') i.checked = v; else i.value = v;
+    }
+    if (focused && document.getElementById(focused)) document.getElementById(focused).focus();
     document.querySelectorAll('.setup-install').forEach(btn => btn.onclick = () => installComponent(btn));
+    document.querySelectorAll('.wg-act').forEach(btn => btn.onclick = () => wgAction(btn));
     if ($('#rc-wire')) $('#rc-wire').onclick = wireRclone;
     if ($('#rc-off')) $('#rc-off').onclick = rcloneOff;
     if ($('#rc-all')) { $('#rc-all').onchange = syncRcloneAll; syncRcloneAll(); }
@@ -2701,6 +3577,33 @@ async function copyOpenwaKey(){
   catch(e){ k.select(); document.execCommand('copy'); $('#ow-msg').textContent = 'copied'; }
 }
 
+async function authMailTest(){
+  const to = $('#au-test-to').value.trim();
+  if(!to) return;
+  try{
+    const r = await fetch('/api/run/auth_mail_test', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({to})});
+    const j = await r.json();
+    if(j.error) alert(j.error); else { jobWasActive = true; refreshJob(); revealConsole(); }
+  }catch(e){ alert('request failed'); }
+}
+
+async function wgAction(btn){
+  const act = btn.dataset.act, body = {name: btn.dataset.n};
+  if(act==='wg_add'){
+    body.name = $('#wg-name').value.trim(); body.site = $('#wg-site').value;
+    if(!body.name) return;
+  } else if(act==='wg_remove' && !confirm(`Remove ${body.name}? Its key stops working and printing to it stops.`)) return;
+  try{
+    const r = await fetch('/api/run/'+act, {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    const j = await r.json();
+    if(j.error){ alert(j.error); return; }
+    if(act==='wg_add') $('#wg-name').value = '';
+    jobWasActive = true; refreshJob(); revealConsole();
+  }catch(e){ alert('request failed'); }
+}
+
 async function installComponent(btn){
   if(btn.disabled) return;
   if(btn.dataset.confirm && !confirm(btn.dataset.confirm)) return;
@@ -2712,6 +3615,20 @@ async function installComponent(btn){
     body.schedule_cron = $('#erp-cron').checked;
   } else if(inst==='install_tools'){
     body.schedule_cron = btn.dataset.cron === '1';
+  } else if(inst==='install_wireguard'){
+    body.endpoint = $('#wg-endpoint').value.trim();
+    body.port = $('#wg-port').value.trim();
+    body.subnet = $('#wg-subnet').value.trim();
+  } else if(inst==='install_auth'){
+    body.smtp_user = $('#au-smtp-user').value.trim();
+    body.smtp_password = $('#au-smtp-pw').value;
+    body.mail_from = $('#au-from').value.trim();
+    body.trusted = $('#au-trusted').value.trim();
+    if ($('#au-admin-user')){
+      body.admin_user = $('#au-admin-user').value.trim();
+      body.admin_email = $('#au-admin-email').value.trim();
+      body.admin_password = $('#au-admin-pw').value;
+    }
   }
   btn.disabled = true;
   try{
@@ -2790,11 +3707,20 @@ details{margin:2px 0} details summary{cursor:pointer}
 .newsite{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:10px}
 .newsite .applist{width:100%;display:flex;flex-wrap:wrap;gap:12px;font-size:13px;color:var(--ink-2)}
 .lead{font-size:13px;color:var(--ink-2);margin:0 0 10px}
+.modal .chk{display:inline-flex;align-items:center;gap:5px;margin:4px 14px 4px 0}
+.modal .chk input{width:auto}
+#au-modal .card{max-width:780px}
+#au-modal td{vertical-align:top;font-size:13px}
+#au-modal .acts{display:flex;flex-wrap:wrap;gap:4px;justify-content:flex-end}
+#au-modal .acts button{padding:4px 8px;font-size:12.5px}
+.au-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
+#dm-auth{margin-top:12px;padding:10px 12px;border:1px solid var(--hairline);border-radius:8px;font-size:13px}
 </style></head><body>
 <div class="top">
   <h1>SSPL ERP Admin</h1><span class="badge">multi-tenant</span><span id="clock" class="badge"></span>
   <span class="badge" title="panel code version — restart the service after updating">v{{ version }}</span>
   <a class="nav" href="/install">ERP Next Installation suite →</a>
+  <a class="nav" href="/ram" title="RAM, swap, containers and the database buffer pool">RAM monitor →</a>
   {% if repo_ok %}
   <button class="act nav-act" data-act="update_panel"
     title="git pull the checkout, refresh the multi-tenant tools, then deploy this panel from it"
@@ -2824,6 +3750,8 @@ details{margin:2px 0} details summary{cursor:pointer}
   <p class="lead">One stack serves every site; nginx picks the site from the hostname in the
   browser's address bar. Per-site jobs touch only that site — the others stay up.</p>
   <div id="sites-body"><p style="color:var(--muted)">Loading…</p></div>
+  <div style="margin-top:10px"><button id="au-open" style="display:none"
+    title="Who may pass the Authelia login, and to which sites">Authelia users…</button></div>
   <details id="newsite-box" style="margin-top:12px">
     <summary><b>Create site</b></summary>
     <div class="newsite">
@@ -2998,13 +3926,36 @@ details{margin:2px 0} details summary{cursor:pointer}
     <button class="primary" id="dm-port-add">Add IP + port</button>
   </div>
   <p style="font-size:12.5px;color:var(--muted)"><b>IP + port</b>: everything on
-    <code>http://&lt;server-ip&gt;:&lt;port&gt;</code> goes to this site, no DNS needed (HTTP only). Browsers share
+    <code>http://&lt;server-ip&gt;:&lt;port&gt;</code> goes to this site, no DNS needed (HTTP; HTTPS once the
+    site is behind the Authelia login). Browsers share
     login cookies across ports of one IP, so one browser stays logged in to only one IP + port site at a time.</p>
   <p style="font-size:12.5px;color:var(--muted)">nginx sends every request for these domains to this site.
     The <b>primary</b> domain becomes the site's <code>host_name</code>: the URL in emails and the one PDFs
     load images from. Adding or removing a domain briefly restarts the backend and workers (a few
     seconds, all sites). Point each domain at this server too: a DNS A record, or a hosts-file line.</p>
+  <div id="dm-auth" style="display:none"></div>
   <div class="row"><button id="dm-close">Close</button></div>
+</div></div>
+
+<div class="modal" id="au-modal"><div class="card">
+  <h1 style="font-size:17px;margin-bottom:6px">Authelia users</h1>
+  <p style="font-size:12.5px;color:var(--muted);margin:0 0 8px">A user passes the login of the sites ticked for
+    them (an <b>admin</b> passes every linked site), then signs in to ERPNext as usual. The first login asks
+    them to register 2FA — an authenticator app or a security key; a code e-mailed to them confirms it.
+    With <b>Remember me</b> ticked, that browser stays logged in for a year.</p>
+  <div id="au-body" style="font-size:13px"></div>
+  <div id="au-edit" style="display:none;margin-top:10px;padding:10px 12px;border:1px solid var(--hairline);border-radius:8px"></div>
+  <h2 style="font-size:15px;margin:16px 0 4px">Add a user</h2>
+  <div class="au-grid">
+    <input type="text" id="au-user" placeholder="user name, e.g. ravi" autocomplete="off" autocapitalize="off" spellcheck="false">
+    <input type="text" id="au-name" placeholder="display name" autocomplete="off">
+    <input type="email" id="au-email" placeholder="e-mail (2FA codes)" autocomplete="off">
+    <input type="password" id="au-pw" placeholder="password (8+)" autocomplete="new-password">
+    <input type="password" id="au-pw2" placeholder="confirm" autocomplete="new-password">
+  </div>
+  <div id="au-sites" style="margin-top:6px"></div>
+  <label class="chk"><input type="checkbox" id="au-admin"> admin — every linked site</label>
+  <div class="row"><button id="au-close">Close</button><button class="primary" id="au-add">Add user</button></div>
 </div></div>
 
 <div class="modal" id="ap-modal"><div class="card">
@@ -3016,7 +3967,8 @@ details{margin:2px 0} details summary{cursor:pointer}
 </div></div>
 <script>
 """ + TERM_JS + r"""
-let SITES = [], IMAGE_APPS = [], SITE_INFO = {}, HTTP_PORT = 80, PROXY_HTTPS = false;
+let SITES = [], IMAGE_APPS = [], SITE_INFO = {}, HTTP_PORT = 80, PROXY_HTTPS = false,
+    AUTH = {installed: false, users: []};
 
 async function runAction(act, body){
   try{
@@ -3044,7 +3996,8 @@ function siteRow(s){
   const extra = (s.domain_info || []).slice(1);
   const doms = extra.length
     ? `<div class="apps">also: ${extra.map(d => `<a href="${esc(d.url)}" target="_blank">${esc(d.name)}</a>${d.cert ? ' 🔒' : ''}`).join(', ')}</div>` : '';
-  return `<tr><td><a href="${esc(s.url)}" target="_blank"><b>${n}</b></a> ${state}${doms}${skip}</td>
+  const lock = s.auth ? ' <span class="badge ok" title="Authelia login (2FA) before ERPNext">🔐 login</span>' : '';
+  return `<tr><td><a href="${esc(s.url)}" target="_blank"><b>${n}</b></a> ${state}${lock}${doms}${skip}</td>
     <td>${bk}</td>
     <td><div class="acts">
       <button class="act" data-act="backup" data-site="${n}">Backup</button>
@@ -3066,6 +4019,9 @@ async function refreshSites(){
     SITE_INFO = Object.fromEntries(j.sites.map(s => [s.name, s]));
     HTTP_PORT = j.http_port || 80;
     PROXY_HTTPS = !!j.https;
+    AUTH = j.auth || {installed: false, users: []};
+    $('#au-open').style.display = AUTH.installed ? '' : 'none';
+    if ($('#au-modal').classList.contains('on') && !$('#au-edit').innerHTML) renderUsers();
     IMAGE_APPS = j.image_apps || [];
     $('#t-sites').textContent = SITES.length;
     let h;
@@ -3227,7 +4183,111 @@ function renderDomains(){
   const info = s.domain_info || [];
   $('#dm-body').innerHTML = `<table><thead><tr><th>Domain</th><th></th></tr></thead><tbody>`
     + info.map((d, i) => row(d, i === 0)).join('') + '</tbody></table>';
+  const box = $('#dm-auth');
+  if (!AUTH.installed){ box.style.display = 'none'; return; }
+  box.style.display = '';
+  const who = (AUTH.users || []).filter(u => !u.disabled && (u.admin || u.sites.includes(dmSite)));
+  box.innerHTML = s.auth
+    ? `<b>🔐 Authelia login: on</b> — every domain and IP + port of this site asks for a login with 2FA
+       first (HTTPS only). ${who.length} user(s) may enter.
+       <div class="row" style="margin-top:8px"><button class="danger" id="dm-unlink">Remove the login</button></div>`
+    : `<b>Authelia login: off</b> — anyone who reaches this site sees the ERPNext login.
+       <div style="color:var(--muted);font-size:12.5px;margin-top:4px">Turning it on makes the site HTTPS-only and puts
+       a 2FA login in front of every domain and IP + port. API clients, the mobile app, webhooks and payment
+       callbacks are stopped by it too — give those an unlinked domain.</div>
+       <div class="row" style="margin-top:8px"><button class="primary" id="dm-link" ${PROXY_HTTPS ? '' : 'disabled title="HTTPS is off"'}>Require Authelia login</button></div>`;
+  if ($('#dm-link')) $('#dm-link').onclick = async () => {
+    const site = dmSite;
+    if (!who.length && !confirm(`No Authelia user may enter ${site} yet — nobody will get in until you add one under "Authelia users…". Link anyway?`)) return;
+    closeDomains(); await runAction('auth_link', {site});
+  };
+  if ($('#dm-unlink')) $('#dm-unlink').onclick = async () => {
+    const site = dmSite;
+    if (!confirm(`Remove the Authelia login from ${site}?\n\nAnyone who reaches it sees the ERPNext login again.`)) return;
+    closeDomains(); await runAction('auth_unlink', {site});
+  };
 }
+
+// ---- Authelia users ----
+function siteChecks(boxId, picked){
+  return SITES.map(x => `<label class="chk"><input type="checkbox" class="${boxId}" value="${esc(x)}"
+    ${picked.includes(x) ? 'checked' : ''}> ${esc(x)}${SITE_INFO[x] && SITE_INFO[x].auth ? ' 🔐' : ''}</label>`).join('');
+}
+function pickedSites(cls){ return [...document.querySelectorAll('.' + cls + ':checked')].map(c => c.value); }
+function renderUsers(){
+  const us = AUTH.users || [];
+  $('#au-body').innerHTML = us.length
+    ? `<table><thead><tr><th>User</th><th>Sites</th><th></th></tr></thead><tbody>` + us.map(u => `<tr>
+        <td><b>${esc(u.user)}</b>${u.admin ? ' <span class="badge ok">admin</span>' : ''}${u.disabled ? ' <span class="badge miss">disabled</span>' : ''}
+          <div style="color:var(--muted)">${esc(u.name)} · ${esc(u.email)}</div></td>
+        <td>${u.admin ? '<i>every linked site</i>' : (u.sites.map(esc).join('<br>') || '<span style="color:var(--muted)">none</span>')}</td>
+        <td><div class="acts">
+          <button class="au-sites" data-u="${esc(u.user)}">Sites…</button>
+          <button class="au-pw" data-u="${esc(u.user)}">Password…</button>
+          <button class="au-admin" data-u="${esc(u.user)}" data-on="${u.admin ? 0 : 1}">${u.admin ? 'Not admin' : 'Make admin'}</button>
+          <button class="au-2fa" data-u="${esc(u.user)}" title="Lost phone: register 2FA again at the next login">Reset 2FA</button>
+          <button class="au-dis" data-u="${esc(u.user)}" data-on="${u.disabled ? 0 : 1}">${u.disabled ? 'Enable' : 'Disable'}</button>
+          <button class="danger au-rm" data-u="${esc(u.user)}">Remove</button>
+        </div></td></tr>`).join('') + '</tbody></table>'
+    : '<p style="color:var(--muted);margin:0">No users yet.</p>';
+  $('#au-sites').innerHTML = SITES.length ? siteChecks('au-new-site', []) : '';
+}
+function closeUsers(){ $('#au-modal').classList.remove('on'); $('#au-edit').innerHTML = ''; $('#au-edit').style.display = 'none'; }
+$('#au-open').onclick = () => {
+  ['#au-user','#au-name','#au-email','#au-pw','#au-pw2'].forEach(i => $(i).value = '');
+  $('#au-admin').checked = false;
+  $('#au-edit').innerHTML = ''; $('#au-edit').style.display = 'none';
+  renderUsers(); $('#au-modal').classList.add('on');
+};
+$('#au-close').onclick = closeUsers;
+$('#au-modal').onclick = e => { if (e.target === $('#au-modal')) closeUsers(); };
+$('#au-add').onclick = async () => {
+  const user = $('#au-user').value.trim().toLowerCase(), pw = $('#au-pw').value;
+  if (!user) return;
+  if (pw !== $('#au-pw2').value){ alert('The passwords do not match.'); return; }
+  const body = {user, name: $('#au-name').value.trim(), email: $('#au-email').value.trim(),
+                password: pw, sites: pickedSites('au-new-site'), admin: $('#au-admin').checked};
+  closeUsers(); await runAction('auth_user_add', body);
+};
+document.addEventListener('click', async e => {
+  const b = e.target.closest('#au-modal .acts button');
+  if (!b) return;
+  const user = b.dataset.u, u = (AUTH.users || []).find(x => x.user === user) || {sites: []};
+  const ed = $('#au-edit');
+  if (b.classList.contains('au-sites')){
+    ed.innerHTML = `<b>Sites ${esc(user)} may enter</b><div style="margin-top:6px">${siteChecks('au-ed-site', u.sites)}</div>
+      <div class="row" style="margin-top:8px"><button id="au-ed-cancel">Cancel</button><button class="primary" id="au-ed-save">Save sites</button></div>`;
+    ed.style.display = '';
+    $('#au-ed-cancel').onclick = () => { ed.innerHTML = ''; ed.style.display = 'none'; };
+    $('#au-ed-save').onclick = async () => { const sites = pickedSites('au-ed-site'); closeUsers(); await runAction('auth_user_sites', {user, sites}); };
+    return;
+  }
+  if (b.classList.contains('au-pw')){
+    ed.innerHTML = `<b>New password for ${esc(user)}</b><div class="au-grid" style="margin-top:6px">
+      <input type="password" id="au-ed-pw" placeholder="password (8+)" autocomplete="new-password">
+      <input type="password" id="au-ed-pw2" placeholder="confirm" autocomplete="new-password"></div>
+      <div class="row" style="margin-top:8px"><button id="au-ed-cancel">Cancel</button><button class="primary" id="au-ed-save">Set password</button></div>`;
+    ed.style.display = '';
+    $('#au-ed-pw').focus();
+    $('#au-ed-cancel').onclick = () => { ed.innerHTML = ''; ed.style.display = 'none'; };
+    $('#au-ed-save').onclick = async () => {
+      const password = $('#au-ed-pw').value;
+      if (password !== $('#au-ed-pw2').value){ alert('The passwords do not match.'); return; }
+      closeUsers(); await runAction('auth_user_passwd', {user, password});
+    };
+    return;
+  }
+  let act, body = {user}, q = null;
+  if (b.classList.contains('au-admin')){ act = 'auth_user_admin'; body.on = b.dataset.on === '1';
+    q = body.on ? `Make ${user} an admin? Admins pass the login of every linked site.` : null; }
+  else if (b.classList.contains('au-dis')){ act = 'auth_user_disable'; body.on = b.dataset.on === '1';
+    q = body.on ? `Disable ${user}? They cannot log in until enabled again.` : null; }
+  else if (b.classList.contains('au-2fa')){ act = 'auth_user_reset_2fa'; q = `Forget ${user}'s 2FA devices? They register again at the next login.`; }
+  else if (b.classList.contains('au-rm')){ act = 'auth_user_remove'; q = `Remove ${user}? This cannot be undone.`; }
+  else return;
+  if (q && !confirm(q)) return;
+  closeUsers(); await runAction(act, body);
+});
 document.addEventListener('click', e => {
   const b = e.target.closest('.site-doms');
   if (!b) return;
@@ -3359,6 +4419,7 @@ document.addEventListener('keydown', e => {
   if ($('#dr-modal').classList.contains('on')) closeDrop();
   if ($('#ap-modal').classList.contains('on')) closeApps();
   if ($('#dm-modal').classList.contains('on')) closeDomains();
+  if ($('#au-modal').classList.contains('on')) closeUsers();
 });
 
 $('#rs-go').onclick = async () => {
@@ -3648,6 +4709,216 @@ setInterval(refreshStats, 5000);
 setInterval(refreshSites, 30000);
 setInterval(refreshBackups, 60000);
 pollJob();
+</script></body></html>"""
+
+
+RAM_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RAM monitor</title><style>""" + BASE_CSS + LAYOUT_CSS + r"""
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:16px}
+.tile{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:12px 14px}
+.tile .k{font-size:12px;color:var(--muted)} .tile .v{font-size:22px;margin-top:2px}
+.tile .s{font-size:12px;color:var(--ink-2)}
+.alerts{display:flex;flex-direction:column;gap:6px}
+.alert{border-radius:8px;padding:8px 12px;font-size:14px;border:1px solid var(--border)}
+.alert.warn{border-color:var(--warn);color:var(--warn)}
+.alert.crit{border-color:var(--crit);color:var(--crit);font-weight:600}
+.alert.ok{border-color:var(--ok);color:var(--ok)}
+.bar{height:8px;border-radius:4px;background:var(--track);overflow:hidden;min-width:80px}
+.bar i{display:block;height:100%;background:var(--accent)}
+.bar i.warn{background:var(--warn)} .bar i.crit{background:var(--crit)}
+.right{text-align:right}
+.kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px 18px;margin-bottom:14px}
+.kv .k{font-size:12px;color:var(--muted)} .kv .v{font-size:17px}
+.dbform{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.dbform input{width:120px}
+.note{font-size:13px;color:var(--ink-2);margin:10px 0 0}
+#db-msg{font-size:13px;margin-top:10px;min-height:1em}
+#db-msg.err{color:var(--crit)} #db-msg.okm{color:var(--ok)}
+.cmd{font:12px ui-monospace,Menlo,Consolas,monospace;color:var(--muted);
+  max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.scroll{overflow-x:auto}
+</style></head><body>
+<div class="top">
+  <h1>RAM monitor</h1><span id="clock" class="badge"></span>
+  <span class="badge" title="panel code version">v{{ version }}</span>
+  <a class="nav" href="/">← Dashboard</a>
+  <span class="spacer"></span>
+  <span style="color:var(--muted);font-size:13px">{{ user }}</span>
+  <form method="post" action="/logout" style="margin:0"><button>Log out</button></form>
+</div>
+<main>
+
+<div class="card"><h2>Alerts</h2><div class="alerts" id="alerts">
+  <div class="alert">Loading…</div></div></div>
+
+<div class="tiles">
+  <div class="tile"><div class="k">RAM available</div><div class="v num" id="t-avail">–</div>
+    <div class="s" id="t-total"></div></div>
+  <div class="tile"><div class="k">RAM used</div><div class="v num" id="t-used">–</div>
+    <div class="s" id="t-cache"></div></div>
+  <div class="tile"><div class="k">Swap used</div><div class="v num" id="t-swap">–</div>
+    <div class="s" id="t-swaptot"></div></div>
+  <div class="tile"><div class="k">Swapping in / out</div><div class="v num" id="t-swapio">–</div>
+    <div class="s">since the last refresh</div></div>
+  <div class="tile"><div class="k">Memory pressure</div><div class="v num" id="t-psi">–</div>
+    <div class="s">time tasks waited on RAM (10s)</div></div>
+</div>
+
+<div class="card"><h2>Database memory (InnoDB buffer pool)</h2>
+  <div class="kv">
+    <div><div class="k">Pool size now</div><div class="v num" id="d-live">–</div></div>
+    <div><div class="k">Saved setting</div><div class="v num" id="d-conf">–</div></div>
+    <div><div class="k">Database size</div><div class="v num" id="d-data">–</div></div>
+    <div><div class="k">Recommended</div><div class="v num" id="d-rec">–</div></div>
+    <div><div class="k">Reads from disk (recent)</div><div class="v num" id="d-miss">–</div></div>
+    <div><div class="k">Reads from disk (since DB start)</div><div class="v num" id="d-miss-all">–</div></div>
+    <div><div class="k">Survives a DB restart</div><div class="v" id="d-perm">–</div></div>
+    <div><div class="k">RAM free on the server</div><div class="v num" id="d-avail">–</div></div>
+  </div>
+  <div class="dbform">
+    <input id="d-size" placeholder="e.g. 2G" autocomplete="off">
+    <button class="primary" id="d-set">Apply size</button>
+    <button id="d-userec">Use recommended</button>
+    <button class="danger" id="d-persist" style="display:none"
+      title="Adds the settings mount to the compose file and recreates the db container">Make permanent (restarts DB)</button>
+  </div>
+  <div id="db-msg"></div>
+  <p class="note">The buffer pool is the RAM MariaDB keeps database pages in. When it is smaller than
+    the database, queries read from disk and every bill save slows down. A new size applies at once,
+    with no restart. The allowed range is <span id="d-range">–</span>: the server keeps 2G for
+    everything else. Raise it only when there is free RAM, because a pool pushed into swap is slower than a small one.</p>
+</div>
+
+<div class="card"><h2>Containers by memory</h2>
+  <div id="c-err" style="color:var(--crit);font-size:13px;display:none"></div>
+  <div class="scroll"><table><thead><tr><th>Container</th><th class="right">Memory</th>
+    <th class="right">Limit</th><th>Of limit</th><th class="right">Of host RAM</th><th class="right">CPU</th></tr></thead>
+  <tbody id="containers"><tr><td colspan="6" style="color:var(--muted)">Loading…</td></tr></tbody></table></div>
+</div>
+
+<div class="card"><h2>Top processes (RAM + swap)</h2>
+  <div class="scroll"><table><thead><tr><th class="right">PID</th><th>Name</th><th class="right">RAM</th>
+    <th class="right">Swap</th><th>Command</th></tr></thead>
+  <tbody id="procs"><tr><td colspan="5" style="color:var(--muted)">Loading…</td></tr></tbody></table></div>
+  <div class="dbform" style="margin-top:12px">
+    <button id="clear-ram">Clear RAM caches</button>
+    <span id="ram-msg" style="font-size:13px;color:var(--ink-2)"></span>
+  </div>
+</div>
+
+</main>
+<script>
+const $ = s => document.querySelector(s);
+const esc = t => (t??'').toString().replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const cls = p => p >= 92 ? 'crit' : p >= 80 ? 'warn' : '';
+let dbState = null;
+
+async function getJSON(url, opts){
+  const r = await fetch(url, opts);
+  if (r.status === 401){ location = '/login'; throw new Error('logged out'); }
+  return r.json();
+}
+
+async function refreshRam(){
+  try{
+    const s = await getJSON('/api/ram');
+    $('#t-avail').textContent = s.mem.available;
+    $('#t-total').textContent = 'of ' + s.mem.total;
+    $('#t-used').textContent = s.mem.used_pct + '%';
+    $('#t-cache').textContent = s.mem.cached + ' is reclaimable cache';
+    $('#t-swap').textContent = s.swap.total === '0 B' ? 'no swap' : s.swap.used;
+    $('#t-swaptot').textContent = s.swap.total === '0 B' ? '' : s.swap.pct + '% of ' + s.swap.total;
+    $('#t-swapio').textContent = s.swap.in + ' / ' + s.swap.out;
+    $('#t-psi').textContent = s.psi === null ? 'n/a' : s.psi.toFixed(1) + '%';
+    $('#alerts').innerHTML = s.alerts.length
+      ? s.alerts.map(a => `<div class="alert ${a.level}">${esc(a.text)}</div>`).join('')
+      : '<div class="alert ok">All clear: RAM, swap, containers and the database are healthy.</div>';
+    const ce = s.containers.error;
+    $('#c-err').style.display = ce ? '' : 'none'; if (ce) $('#c-err').textContent = ce;
+    $('#containers').innerHTML = s.containers.rows.map(c => `<tr><td>${esc(c.name)}</td>
+      <td class="right num">${esc(c.used_h)}</td><td class="right num">${esc(c.limit_h)}</td>
+      <td>${c.pct === null ? '<span style="color:var(--muted)">no limit</span>'
+        : `<div class="bar" title="${c.pct}%"><i class="${cls(c.pct)}" style="width:${Math.min(c.pct,100)}%"></i></div>`}</td>
+      <td class="right num">${c.host_pct}%</td><td class="right num">${esc(c.cpu)}</td></tr>`).join('')
+      || '<tr><td colspan="6" style="color:var(--muted)">No running containers</td></tr>';
+    $('#procs').innerHTML = s.processes.map(p => `<tr><td class="right num">${p.pid}</td>
+      <td>${esc(p.name)}</td><td class="right num">${esc(p.rss_h)}</td>
+      <td class="right num">${p.swap ? esc(p.swap_h) : '–'}</td>
+      <td><div class="cmd" title="${esc(p.cmd)}">${esc(p.cmd)}</div></td></tr>`).join('');
+  }catch(e){ console.error(e); }
+}
+
+function showDb(d){
+  dbState = d;
+  $('#d-live').textContent = d.h.live;
+  $('#d-conf').textContent = d.h.configured;
+  $('#d-data').textContent = d.h.data;
+  $('#d-rec').textContent = d.h.recommended;
+  $('#d-miss').textContent = d.recent_miss_pct === null ? 'measuring…' : d.recent_miss_pct + '%';
+  $('#d-miss-all').textContent = d.miss_pct === null ? '–' : d.miss_pct + '%';
+  $('#d-perm').innerHTML = d.mounted ? '<span class="badge ok">yes</span>'
+    : '<span class="badge miss">no — falls back to 128M</span>';
+  $('#d-persist').style.display = d.mounted ? 'none' : '';
+  $('#d-range').textContent = d.h.min + ' – ' + d.h.max;
+  $('#d-avail').textContent = d.h.available;
+  if (!$('#d-size').value) $('#d-size').placeholder = 'e.g. ' + d.h.recommended;
+  if (d.error) dbMsg(d.error, true);
+}
+function dbMsg(t, err){ const m = $('#db-msg'); m.textContent = t || ''; m.className = err ? 'err' : (t ? 'okm' : ''); }
+
+async function refreshDb(fresh){
+  try{ showDb(await getJSON('/api/db-memory' + (fresh ? '?fresh=1' : ''))); }catch(e){ console.error(e); }
+}
+
+const toBytes = v => parseInt(v, 10) * (v.toUpperCase().endsWith('G') ? 1073741824 : 1048576);
+async function applySize(size){
+  const live = dbState && dbState.h.live;
+  let warn = '';
+  if (dbState && dbState.live && toBytes(size) - dbState.live > dbState.available)
+    warn = `\n\nWARNING: this needs ${size} but only ${dbState.h.available} of RAM is free. `
+      + 'The pool would push other programs into swap and make the server slower. '
+      + 'Free RAM first (e.g. restart OpenWA), or pick a smaller size.';
+  if (!confirm(`Change the database buffer pool from ${live} to ${size}?\n\nIt applies at once, with no restart.${warn}`)) return;
+  dbMsg('Applying…');
+  for (const b of ['#d-set','#d-userec']) $(b).disabled = true;
+  try{
+    const j = await getJSON('/api/db-memory', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({size})});
+    if (j.error) dbMsg(j.error, true); else { dbMsg(j.message); showDb(j.state); $('#d-size').value = ''; }
+  }catch(e){ dbMsg('Request failed', true); }
+  for (const b of ['#d-set','#d-userec']) $(b).disabled = false;
+  refreshRam();
+}
+$('#d-set').onclick = () => { const v = $('#d-size').value.trim().toUpperCase();
+  if (!/^\d+[MG]$/.test(v)) { dbMsg('Enter a size like 2G or 1536M', true); return; } applySize(v); };
+$('#d-size').onkeydown = e => { if (e.key === 'Enter') $('#d-set').click(); };
+$('#d-userec').onclick = () => dbState && applySize(dbState.h.recommended);
+
+$('#d-persist').onclick = async () => {
+  if (!confirm('Make the buffer pool size permanent?\n\nThis adds the MariaDB settings mount to the '
+    + 'compose file and RECREATES THE DATABASE CONTAINER. Every site loses its database for about '
+    + '10-30 seconds. Do this when nobody is billing.')) return;
+  const b = $('#d-persist'); b.disabled = true; dbMsg('Recreating the db container… (up to a minute)');
+  try{
+    const j = await getJSON('/api/db-memory/persist', {method:'POST'});
+    if (j.error) dbMsg(j.error, true); else { dbMsg(j.message); showDb(j.state); }
+  }catch(e){ dbMsg('Request failed', true); }
+  b.disabled = false;
+};
+
+$('#clear-ram').onclick = async () => {
+  if (!confirm('Clear RAM caches now? This is safe but may briefly slow the system while caches rebuild.')) return;
+  $('#ram-msg').textContent = 'Clearing…';
+  const j = await getJSON('/api/clear-ram', {method:'POST'});
+  $('#ram-msg').textContent = j.error ? j.error : `Freed ${j.freed} — ${j.available} now available`;
+  refreshRam();
+};
+
+setInterval(() => $('#clock').textContent = new Date().toLocaleString(), 1000);
+refreshRam(); refreshDb(true);
+setInterval(refreshRam, 10000);
+setInterval(() => refreshDb(false), 30000);
 </script></body></html>"""
 
 

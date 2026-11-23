@@ -44,6 +44,12 @@ DOMAINS=$(site_domains "$SITE" | tr '\n' ' ')
 PORTS=$(site_ports "$SITE" | tr '\n' ' ')
 remove_site_domains "$SITE"
 remove_site_ports "$SITE"
+# Authelia: the site is no longer gated, and no user keeps it in their list.
+if site_auth_linked "$SITE"; then auth_unlink_site "$SITE"; fi
+if auth_installed; then
+    python3 "$TOOLS_DIR/lib/authusers.py" "$AUTH_DIR/config/users_database.yml" drop-site "$SITE" \
+        || warn "could not remove $SITE from the Authelia users"
+fi
 if [ -n "$PORTS" ]; then
     echo "   Ports freed: $PORTS"
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then

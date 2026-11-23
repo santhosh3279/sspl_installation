@@ -147,6 +147,7 @@ services:
 EOF
 # Tenant hostnames: none yet on a fresh stack; new-site.sh regenerates this.
 [ -f "$FD_DIR/overrides/compose.sspl-tenants.yaml" ] || write_tenant_hosts_override
+write_db_memory_override
 ok "Wrote overrides"
 
 # ───────────────────────────────────────────── 3. compose file, pull, start

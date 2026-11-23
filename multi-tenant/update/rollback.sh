@@ -41,6 +41,9 @@ docker load -i "$BACKUP_FILE"
 echo "→ Starting the stack..."
 dc up -d
 wait_for_services
+# 'down' recreated the stack's network, maybe on another subnet: the host
+# nginx lets that subnet past the Authelia gate (PDF rendering), so refresh it.
+if auth_active; then apply_proxy >/dev/null || warn "nginx not refreshed — run $TOOLS_DIR/sites/auth.sh apply"; fi
 for s in $(list_sites); do
     fix_db_grants "$s"
     dc exec -T backend bench --site "$s" clear-cache >/dev/null 2>&1 || warn "$s: cache clear failed"
