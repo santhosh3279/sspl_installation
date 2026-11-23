@@ -45,7 +45,7 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-11-23.mt11"
+PANEL_VERSION = "2026-11-23.mt12"
 FEATURES = ("Multi-tenant panel: sites list with per-site backup, DB backup, "
             "migrate, uninstall app and drop; Create site with app picker; "
             "per-site backup browser and guarded per-site restore (also from "
@@ -62,7 +62,7 @@ FEATURES = ("Multi-tenant panel: sites list with per-site backup, DB backup, "
             "no-2FA trusted networks, Gmail mail relay with test mail, "
             "RAM monitor page with alerts, per-container and per-process memory, "
             "and the MariaDB buffer pool size applied live from the panel, "
-            "WireGuard tunnel to the CUPS print servers (add, remove, test, setup script)")
+            "WireGuard page: tunnel to the CUPS print servers (add, remove, test, setup script)")
 
 CONFIG_FILE = os.environ.get("SSPL_ADMIN_CONFIG", "/opt/sspl-admin/config.json")
 with open(CONFIG_FILE) as f:
@@ -1984,6 +1984,20 @@ def api_auth_logins(site):
     return jsonify(auth_logins(site))
 
 
+@app.route("/wireguard")
+@login_required
+def wireguard_page():
+    return render_template_string(WG_HTML, user=session["user"], version=PANEL_VERSION)
+
+
+@app.route("/api/wireguard")
+@login_required
+def api_wireguard():
+    st = wg_status()
+    return jsonify({**st, "hub": st["subnet"].removesuffix(".0/24") + ".1",
+                    "tools": os.path.isfile(_tool("sites/wireguard.sh")), "sites": list_sites()})
+
+
 @app.route("/api/ram")
 @login_required
 def api_ram():
@@ -3602,21 +3616,8 @@ async function refreshSetup(){
         <button class="primary setup-install" data-inst="install_wireguard"
           data-confirm="${wg.installed ? 'Apply and restart the tunnel? Printing pauses for a few seconds.' : 'Install WireGuard on this server now?'}">${wg.installed ? 'Save / repair' : 'Install WireGuard'}</button></div>`;
     }
-    if(wg.installed){
-      rows += wg.peers.map(p => `<div class="setup-form"><b>${esc(p.name)}</b> <code>${esc(p.ip)}</code>
-        ${p.up ? '<span class="badge ok">connected</span>' : `<span class="badge miss">${p.age === null ? 'never connected' : 'not connected'}</span>`}
-        ${p.site ? `<span class="badge">${esc(p.site)}</span>` : ''}
-        <a href="/api/wireguard/setup/${esc(p.name)}" title="Contains a private key">Setup script</a>
-        <button class="wg-act" data-act="wg_test" data-n="${esc(p.name)}">Test CUPS</button>
-        <button class="wg-act danger" data-act="wg_remove" data-n="${esc(p.name)}">Remove</button></div>`).join('');
-      rows += `<div class="setup-form"><input type="text" id="wg-name" placeholder="print server name, e.g. shop1" size="26" autocomplete="off" autocapitalize="off">
-        <select id="wg-site"><option value="">no site label</option>${(c.erp.sites||[]).map(x => `<option value="${esc(x)}">${esc(x)}</option>`).join('')}</select>
-        <button class="wg-act" data-act="wg_add">Add print server</button></div>`;
-    }
     rows += `<div class="note">Lets the ERP containers print to CUPS servers behind shop routers. Open <b>UDP ${esc(wg.port||'51820')}</b>
-      to this server. Run the setup script as root on the CUPS machine, then delete it (it holds a private key). In ERPNext, set
-      the Printer Server host to the address shown here, port 631. Print servers cannot open connections to this server or to each
-      other. The site is a label only: every site on the stack can reach every print server.</div></div>`;
+      to this server. Add, test and remove print servers on the <a href="/wireguard">WireGuard page</a>.</div></div>`;
     // OpenWA WhatsApp API (Docker)
     const ow = c.openwa, owUrl = 'http://' + (s.server_ip || location.hostname) + ':' + ow.port;
     rows += `<div class="setup-row"><div class="setup-h"><b>OpenWA WhatsApp API</b> ${pill(ow.installed)}`
@@ -3649,7 +3650,7 @@ async function refreshSetup(){
         this panel. Settings, cron and site data are not touched.</div></div>`;
     // The refresh rebuilds the forms: keep what was typed in them.
     const keep = {};
-    document.querySelectorAll('#setup-body input[id], #wg-site').forEach(i => {
+    document.querySelectorAll('#setup-body input[id]').forEach(i => {
       keep[i.id] = i.type === 'checkbox' ? i.checked : i.value; });
     const focused = document.activeElement && document.activeElement.id;
     $('#setup-body').innerHTML =
@@ -3662,7 +3663,6 @@ async function refreshSetup(){
     }
     if (focused && document.getElementById(focused)) document.getElementById(focused).focus();
     document.querySelectorAll('.setup-install').forEach(btn => btn.onclick = () => installComponent(btn));
-    document.querySelectorAll('.wg-act').forEach(btn => btn.onclick = () => wgAction(btn));
     if ($('#rc-wire')) $('#rc-wire').onclick = wireRclone;
     if ($('#rc-off')) $('#rc-off').onclick = rcloneOff;
     if ($('#rc-all')) { $('#rc-all').onchange = syncRcloneAll; syncRcloneAll(); }
@@ -3697,22 +3697,6 @@ async function authMailTest(){
       headers:{'Content-Type':'application/json'}, body: JSON.stringify({to})});
     const j = await r.json();
     if(j.error) alert(j.error); else { jobWasActive = true; refreshJob(); revealConsole(); }
-  }catch(e){ alert('request failed'); }
-}
-
-async function wgAction(btn){
-  const act = btn.dataset.act, body = {name: btn.dataset.n};
-  if(act==='wg_add'){
-    body.name = $('#wg-name').value.trim(); body.site = $('#wg-site').value;
-    if(!body.name) return;
-  } else if(act==='wg_remove' && !confirm(`Remove ${body.name}? Its key stops working and printing to it stops.`)) return;
-  try{
-    const r = await fetch('/api/run/'+act, {method:'POST',
-      headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-    const j = await r.json();
-    if(j.error){ alert(j.error); return; }
-    if(act==='wg_add') $('#wg-name').value = '';
-    jobWasActive = true; refreshJob(); revealConsole();
   }catch(e){ alert('request failed'); }
 }
 
@@ -3822,6 +3806,7 @@ details{margin:2px 0} details summary{cursor:pointer}
   <span class="badge" title="panel code version — restart the service after updating">v{{ version }}</span>
   <a class="nav" href="/install">ERP Next Installation suite →</a>
   <a class="nav" id="au-open" href="/auth" style="display:none" title="Authelia users, whitelisted IPs and 2FA logins of each site">Authelia →</a>
+  <a class="nav" href="/wireguard" title="Tunnel to the CUPS print servers">WireGuard →</a>
   <a class="nav" href="/ram" title="RAM, swap, containers and the database buffer pool">RAM monitor →</a>
   {% if repo_ok %}
   <button class="act nav-act" data-act="update_panel"
@@ -4931,6 +4916,154 @@ document.addEventListener('click', async e => {
 onJobFinished = load;
 setInterval(() => $('#clock').textContent = new Date().toLocaleString(), 1000);
 setInterval(() => { if (!document.hidden) loadLogins(); }, 60000);
+load(); pollJob();
+</script></body></html>"""
+
+
+WG_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WireGuard</title><style>""" + BASE_CSS + LAYOUT_CSS + TERM_CSS + r"""
+.lead{font-size:13px;color:var(--ink-2);margin:0 0 12px}
+.top{flex-wrap:wrap}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.row input,.row select{max-width:100%}
+.acts{display:flex;flex-wrap:wrap;gap:6px;justify-content:flex-end;align-items:center}
+.acts button{padding:4px 9px;font-size:13px}
+.acts a{font-size:13px}
+.facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-top:12px}
+.scroll{overflow-x:auto}
+.sub{color:var(--muted);font-size:12.5px}
+ol{margin:0;padding-left:20px;font-size:13.5px}
+li{margin-bottom:4px}
+</style></head><body>
+<div class="top">
+  <h1>WireGuard</h1><span id="clock" class="badge"></span>
+  <span class="badge" title="panel code version">v{{ version }}</span>
+  <a class="nav" href="/">← Dashboard</a>
+  <a class="nav" href="/install">Tunnel settings →</a>
+  <span class="spacer"></span>
+  <span style="color:var(--muted);font-size:13px">{{ user }}</span>
+  <form method="post" action="/logout" style="margin:0"><button>Log out</button></form>
+</div>
+<main>
+<div class="col-left">
+
+<div class="card"><h2>Tunnel</h2>
+  <p class="lead">Lets the ERP containers print to CUPS servers behind shop routers. Print servers cannot open
+    connections to this server or to each other.</p>
+  <div id="state">Loading…</div>
+  <div id="facts" class="facts"></div>
+  <div id="msg" class="sub" style="margin-top:8px"></div></div>
+
+<div id="manage" style="display:none">
+<div class="card"><h2>Print servers</h2>
+  <p class="lead">The site is a label only: every site on the stack can reach every print server.</p>
+  <div id="peers" class="scroll"></div>
+</div>
+
+<div class="card"><h2>Add a print server</h2>
+  <div class="row">
+    <input type="text" id="n-name" aria-label="Print server name" placeholder="name, e.g. shop1" size="24" maxlength="31" autocomplete="off" autocapitalize="off" spellcheck="false">
+    <select id="n-site" aria-label="Site label"><option value="">no site label</option></select>
+    <button class="primary act" id="n-add">Add print server</button></div>
+</div>
+
+<div class="card"><h2>Connect it</h2>
+  <ol>
+    <li>Open <b>UDP <span id="h-port"></span></b> to this server in the cloud firewall or router.</li>
+    <li>Download the <b>setup script</b> and run it as root on the CUPS machine (Debian/Ubuntu).
+      It holds a <b>private key</b>: copy it over a safe channel and delete it afterwards.</li>
+    <li>Share each printer: <code>lpadmin -p &lt;printer&gt; -o printer-is-shared=true</code></li>
+    <li>In ERPNext, set the Printer Server host to the tunnel address above, port 631.</li>
+    <li><b>Test CUPS</b> asks for a page from inside the backend container.</li>
+  </ol>
+</div>
+</div>
+
+</div><!-- /col-left -->
+""" + TERM_HTML + r"""
+</main>
+<script>
+""" + TERM_JS + r"""
+let sitesShown = null, loadSeq = 0;
+
+async function run(act, body){
+  try{
+    const r = await fetch('/api/run/' + act, {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    if (r.status === 401){ location = '/login'; return false; }
+    const j = await r.json();
+    if (j.error){ alert(j.error); return false; }
+    jobWasActive = true; refreshJob(); revealConsole();
+    return true;
+  }catch(e){ alert('request failed'); return false; }
+}
+
+function ago(s){
+  if (s === null) return 'never';
+  if (s < 120) return s + ' s ago';
+  if (s < 7200) return Math.floor(s / 60) + ' min ago';
+  if (s < 172800) return Math.floor(s / 3600) + ' h ago';
+  return Math.floor(s / 86400) + ' days ago';
+}
+
+async function load(){
+  const seq = ++loadSeq;
+  let w;
+  try{
+    const r = await fetch('/api/wireguard'); if (r.status === 401){ location = '/login'; return; }
+    if (!r.ok) throw 0;
+    w = await r.json();
+  }catch(e){ if (seq === loadSeq) $('#msg').textContent = 'Could not load: the status shown may be old.'; return; }
+  if (seq !== loadSeq) return;       // a newer answer is on its way
+  $('#state').innerHTML = !w.installed ? '<span class="badge miss">not installed</span>'
+    : w.running ? '<span class="badge ok">running</span>' : '<span class="badge miss">down</span>';
+  $('#manage').style.display = w.installed && w.tools ? '' : 'none';
+  $('#msg').innerHTML = !w.installed ? '<a href="/install">Install WireGuard in the installation suite</a>'
+    : !w.tools ? 'The tools are missing. <a href="/install">Open the installation suite</a>'
+    : !w.running ? 'The tunnel is down, so nothing prints through it. Use <b>Save / repair</b> in the <a href="/install">installation suite</a>.' : '';
+  $('#facts').innerHTML = !w.installed ? '' : [
+    ['Print servers dial', w.endpoint ? w.endpoint + ':' + w.port : 'not set'], ['Tunnel network', w.subnet],
+    ['This server', w.hub], ['Connected', w.peers.filter(p => p.up).length + ' of ' + w.peers.length]]
+    .map(([k, v]) => `<div><div class="sub">${k}</div><b class="num">${esc(v)}</b></div>`).join('');
+  $('#h-port').textContent = w.port;
+  $('#peers').innerHTML = w.peers.length ? `<table><thead><tr><th>Name</th><th>Tunnel address</th><th>Site</th><th>Status</th><th>Last handshake</th><th></th></tr></thead><tbody>`
+    + w.peers.map(p => `<tr><td><b>${esc(p.name)}</b></td><td><code>${esc(p.ip)}</code></td><td>${esc(p.site || '–')}</td>
+      <td>${p.up ? '<span class="badge ok">connected</span>' : '<span class="badge miss">not connected</span>'}</td>
+      <td class="num">${ago(p.age)}</td>
+      <td><div class="acts"><a href="/api/wireguard/setup/${esc(p.name)}" title="Contains a private key">Setup script</a>
+        <button class="act p-act" data-a="wg_test" data-n="${esc(p.name)}">Test CUPS</button>
+        <button class="danger act p-act" data-a="wg_remove" data-n="${esc(p.name)}">Remove</button></div></td></tr>`).join('') + '</tbody></table>'
+    : '<span class="sub">None yet. Add the first one below.</span>';
+  if (jobWasActive) document.querySelectorAll('.act').forEach(b => b.disabled = true);
+  const key = JSON.stringify(w.sites);
+  if (key !== sitesShown){           // rebuilt only on a change: keeps the choice
+    const sel = $('#n-site'), was = sel.value;
+    sel.innerHTML = '<option value="">no site label</option>' + w.sites.map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
+    if (w.sites.includes(was)) sel.value = was;
+    sitesShown = key;
+  }
+}
+
+$('#n-add').onclick = async () => {
+  const name = $('#n-name').value.trim();
+  if (!name){ $('#n-name').focus(); return; }
+  if (await run('wg_add', {name, site: $('#n-site').value})) $('#n-name').value = '';
+};
+$('#n-name').addEventListener('keydown', e => { if (e.key === 'Enter' && !$('#n-add').disabled) $('#n-add').click(); });
+document.addEventListener('click', e => {
+  const b = e.target.closest('.p-act');
+  if (!b) return;
+  const name = b.dataset.n;
+  if (b.dataset.a === 'wg_remove' && !confirm(`Remove ${name}?
+
+Its key stops working, printing to it stops, and its address is not used again.`)) return;
+  run(b.dataset.a, {name});
+});
+
+onJobFinished = load;
+setInterval(() => $('#clock').textContent = new Date().toLocaleString(), 1000);
+setInterval(() => { if (!document.hidden) load(); }, 15000);
 load(); pollJob();
 </script></body></html>"""
 

@@ -333,7 +333,8 @@ machine dials in, so it works behind a shop router.
 
    `WG_ENDPOINT` is the **public** IP or DNS name. After changing it, re-run each
    print server's setup script.
-3. Add the print server and get its setup script (the panel has both too):
+3. Add the print server and get its setup script, on the panel's **WireGuard** page
+   or with:
 
    ```bash
    sudo $T/sites/wireguard.sh add shop1 --site acme.erp.lan
