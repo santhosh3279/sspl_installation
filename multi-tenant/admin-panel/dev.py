@@ -25,6 +25,7 @@ REPO = HERE.parent.parent
 HOME = Path(os.environ.get("SSPL_DEV_HOME") or Path.home() / ".cache" / "sspl-panel-dev")
 STATE = HOME / "state"
 ERP, VOLUME, BACKUPS, AUTH = STATE / "erp", STATE / "volume", STATE / "backups", STATE / "auth"
+RCLONE_CONF = STATE / "rclone.conf"
 TOOLS, PROXY = STATE / "tools", STATE / "nginx.conf"
 SITES = {"acme.example.test": "https://acme.example.test:8443",
          "beta.example.test": "http://beta.example.test:8080",
@@ -52,6 +53,8 @@ def seed():
     put(ERP / "site-ports", "8001 demo.erp.lan\n")
     put(ERP / "site-auth", "acme.example.test\n")
     put(ERP / "wg-peers", "shop1 10.99.0.2 devkey1 acme.example.test\nshop2 10.99.0.3 devkey2 beta.example.test\n")
+    put(RCLONE_CONF, "[gdrive]\ntype = drive\nscope = drive\nteam_drive = devdrive\ntoken = {}\n\n[mega]\ntype = mega\n")
+    RCLONE_CONF.chmod(0o600)
     put(VOLUME / "apps.txt", "frappe\n" + "\n".join(APPS) + "\n")
     put(PROXY, "listen 8080;\nlisten 8443 ssl;\n")
     # The panel checks each tool exists before it starts a job.
@@ -118,7 +121,11 @@ def answer(cmd):
     if cmd[0] == "wg":
         return f"devkey1\t{int(time.time()) - 40}\ndevkey2\t0\n"
     if cmd[:2] == ["rclone", "listremotes"]:
-        return "gdrive:\nmega:\n"
+        return "".join(ln[1:-1] + ":\n" for ln in RCLONE_CONF.read_text().splitlines() if ln.startswith("["))
+    if cmd[:3] == ["rclone", "config", "file"]:
+        return f"Configuration file is stored at:\n{RCLONE_CONF}\n"
+    if cmd[0] == "rclone" and "lsd" in cmd:
+        return ""
     if cmd[0] == "rclone":
         return "rclone v1.70.0 (dev)\n"
     if cmd[0] == str(TOOLS / "sites" / "wireguard.sh"):

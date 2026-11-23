@@ -25,6 +25,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 import termios
 import threading
 import time
@@ -45,12 +46,13 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-11-23.mt12"
+PANEL_VERSION = "2026-11-23.mt14"
 FEATURES = ("Multi-tenant panel: sites list with per-site backup, DB backup, "
             "migrate, uninstall app and drop; Create site with app picker; "
             "per-site backup browser and guarded per-site restore (also from "
             "uploads and other sites); all-site backup, verify, migrate, update "
-            "and rollback; stack + tools installer; rclone destinations in "
+            "and rollback; stack + tools installer; rclone install, Google Drive "
+            "connect / reconnect and destinations in "
             "sspl-mt.conf; multi-tenant cron schedule; one-click panel and "
             "tools update from git; nginx domain → site routing with per-site "
             "Domains… (add, remove, primary); AdGuard removed; HTTPS: self-signed "
@@ -62,7 +64,7 @@ FEATURES = ("Multi-tenant panel: sites list with per-site backup, DB backup, "
             "no-2FA trusted networks, Gmail mail relay with test mail, "
             "RAM monitor page with alerts, per-container and per-process memory, "
             "and the MariaDB buffer pool size applied live from the panel, "
-            "WireGuard page: tunnel to the CUPS print servers (add, remove, test, setup script)")
+            "WireGuard page: tunnel to the CUPS print servers (install, settings, add, remove, test, setup script)")
 
 CONFIG_FILE = os.environ.get("SSPL_ADMIN_CONFIG", "/opt/sspl-admin/config.json")
 with open(CONFIG_FILE) as f:
@@ -1995,7 +1997,9 @@ def wireguard_page():
 def api_wireguard():
     st = wg_status()
     return jsonify({**st, "hub": st["subnet"].removesuffix(".0/24") + ".1",
-                    "tools": os.path.isfile(_tool("sites/wireguard.sh")), "sites": list_sites()})
+                    "tools": os.path.isfile(_tool("sites/wireguard.sh")),
+                    "stack": os.path.isfile(compose_file()) and os.path.isfile(MT_CONF),
+                    "script": _script_ok(WG_SETUP_SCRIPT), "sites": list_sites()})
 
 
 @app.route("/api/ram")
@@ -2724,7 +2728,7 @@ def api_rclone_wire():
     if use_all:
         if not known:
             return jsonify({"error": "rclone has no remotes configured yet — "
-                                     "run 'sudo rclone config' over SSH first"}), 400
+                                     "connect a cloud account first"}), 400
         target = "*:" + path
     else:
         if not names:
@@ -2735,7 +2739,7 @@ def api_rclone_wire():
                 return jsonify({"error": f"'{n}' is not a valid remote name"}), 400
             if n not in known:
                 return jsonify({"error": f"rclone does not know a remote called '{n}' — "
-                                         "configure it with 'sudo rclone config' over SSH"}), 400
+                                         "connect it first"}), 400
             if n not in seen:
                 seen.append(n)
         target = " ".join(n + path for n in seen)
@@ -2744,6 +2748,151 @@ def api_rclone_wire():
     if err:
         return jsonify({"error": err}), 500
     return jsonify({"ok": True, "wired": target})
+
+
+_rclone_lock = threading.Lock()
+
+
+def rclone_conf_path():
+    """Root's rclone.conf, the one the backup jobs read. None if unknown."""
+    try:
+        out = subprocess.run(["rclone", "config", "file"], capture_output=True,
+                             text=True, timeout=15, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = out.stdout.split("\n")
+    path = next((ln.strip() for ln in reversed(lines) if ln.strip()), "")
+    return os.path.realpath(path) if out.returncode == 0 and path.startswith("/") else None
+
+
+def rclone_section(text, name):
+    """Options of one remote in rclone.conf text, or None."""
+    opts = None
+    for ln in text.splitlines():
+        s = ln.strip()
+        if s.startswith("[") and s.endswith("]"):
+            if opts is not None:
+                break
+            opts = {} if s[1:-1] == name else None
+        elif opts is not None and "=" in s and s[0] not in "#;":
+            k, v = s.split("=", 1)
+            opts[k.strip()] = v.strip()
+    return opts
+
+
+def rclone_put_section(text, name, opts):
+    """rclone.conf text with that remote replaced, or added at the end."""
+    out, skip = [], False
+    for ln in text.splitlines():
+        s = ln.strip()
+        if s.startswith("[") and s.endswith("]"):
+            skip = s[1:-1] == name
+        if not skip:
+            out.append(ln)
+    body = "\n".join(out).strip("\n")
+    return (body + "\n\n" if body else "") + f"[{name}]\n" \
+        + "".join(f"{k} = {v}\n" for k, v in opts.items())
+
+
+def rclone_token(raw):
+    """The OAuth token in what `rclone authorize` printed, as one JSON line, or None."""
+    a, b = raw.find("{"), raw.rfind("}")
+    try:
+        tok = json.loads(raw[a:b + 1]) if 0 <= a < b else None
+    except ValueError:
+        return None
+    if not isinstance(tok, dict):
+        return None
+    tok = {k: tok[k] for k in ("access_token", "token_type", "refresh_token", "expiry", "expires_in") if k in tok}
+    if not all(isinstance(tok.get(k), str) and tok[k] for k in ("access_token", "refresh_token")):
+        return None
+    line = json.dumps(tok, separators=(",", ":"))
+    # rclone's config reader expands %(x)s
+    return None if "%(" in line else line
+
+
+@app.route("/api/rclone/connect", methods=["POST"])
+@login_required
+def api_rclone_connect():
+    """Connect a Google Drive account: {"name", "token", "replace"}. The token
+    is written straight to rclone.conf: never argv, a job log or a response.
+    Nothing is saved until Google has accepted it."""
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name", "")).strip().rstrip(":")
+    if not RCLONE_NAME_RE.fullmatch(name + ":"):
+        return jsonify({"error": "name: letters, digits, _ . and - only, 41 at most"}), 400
+    raw = str(data.get("token", ""))
+    token = rclone_token(raw) if len(raw) <= 8192 else None
+    if not token:
+        return jsonify({"error": "that is not the token rclone printed — copy everything from { to }"}), 400
+    if not shutil.which("rclone"):
+        return jsonify({"error": "install rclone first"}), 400
+    with _rclone_lock:
+        path = rclone_conf_path()
+        if not path:
+            return jsonify({"error": "could not find rclone's config file"}), 500
+        try:
+            text = ""
+            if os.path.exists(path):
+                with open(path) as f:
+                    text = f.read()
+        except (OSError, ValueError) as e:
+            return jsonify({"error": f"could not read {path}: {type(e).__name__}"}), 500
+        if "RCLONE_ENCRYPT_V" in text:
+            return jsonify({"error": "rclone.conf is password-protected — run 'sudo rclone config' over SSH"}), 400
+        old = rclone_section(text, name)
+        if old is not None and old.get("type") != "drive":
+            return jsonify({"error": f"'{name}' is already used by another kind of remote — choose another name"}), 400
+        if old is not None and data.get("replace") is not True:
+            return jsonify({"exists": True, "error": f"'{name}' is already connected"}), 409
+        # Reconnecting keeps e.g. a shared drive. The token belongs to the
+        # OAuth client that asked for it: rclone's own, as in the guide.
+        opts = {k: v for k, v in (old or {}).items()
+                if k not in ("client_id", "client_secret", "token")}
+        opts.update(type="drive", scope=opts.get("scope") or "drive", token=token)
+        tmpdir = tempfile.mkdtemp(prefix="sspl-rclone-")        # 0700
+        try:
+            trial = os.path.join(tmpdir, "rclone.conf")
+            with os.fdopen(os.open(trial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
+                f.write(rclone_put_section("", name, opts))
+            try:
+                r = subprocess.run(["rclone", "--config", trial, "lsd", name + ":", "--contimeout", "10s",
+                                    "--timeout", "20s", "--retries", "1", "--low-level-retries", "2"],
+                                   capture_output=True, text=True, timeout=45, stdin=subprocess.DEVNULL)
+            except subprocess.TimeoutExpired:
+                return jsonify({"error": "no answer from Google — nothing was saved"}), 502
+            if r.returncode != 0:
+                why = (r.stderr.strip().splitlines() or ["unknown error"])[-1]
+                for secret in json.loads(token).values():
+                    if isinstance(secret, str) and len(secret) > 6:
+                        why = why.replace(secret, "…")
+                return jsonify({"error": "Google did not accept it, nothing was saved: " + why[-300:]}), 400
+            # rclone may have renewed the token during the test
+            with open(trial) as f:
+                opts["token"] = (rclone_section(f.read(), name) or {}).get("token") or token
+            # Read again: a backup may have renewed another remote's token.
+            text, mode = "", 0o600
+            if os.path.exists(path):
+                with open(path) as f:
+                    text = f.read()
+                mode = os.stat(path).st_mode & 0o600
+            os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+            fd, new = tempfile.mkstemp(prefix=".rclone.conf.", dir=os.path.dirname(path))     # 0600
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(rclone_put_section(text, name, opts))
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.chmod(new, mode)
+                os.replace(new, path)
+            except OSError:
+                os.unlink(new)
+                raise
+        except (OSError, ValueError) as e:
+            return jsonify({"error": f"could not save the remote: {type(e).__name__}"}), 500
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    return jsonify({"ok": True, "remote": name + ":"})
 
 
 @app.route("/guide/rclone")
@@ -3351,8 +3500,16 @@ function rcloneRow(s){
         <span class="t">Cloud account connected</span>
         ${stagePill(r.configured, (r.remotes||[]).join(' ') || 'connected', 'no remote configured')}
         </div>`;
-  if(r.installed && !r.configured){
-    h += `<div class="note">Run <code>sudo rclone config</code> over SSH — see the setup guide below.</div>`;
+  if(r.installed){
+    h += `<div class="setup-form" style="margin-left:14px;flex-wrap:wrap">
+      <input type="text" id="rc-name" aria-label="Remote name" size="12" value="gdrive" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <input type="password" id="rc-token" aria-label="Google Drive token" size="34" placeholder="paste the token from rclone authorize" autocomplete="off">
+      <button class="${r.configured ? '' : 'primary'}" id="rc-connect" data-all="${r.wired_all ? 1 : ''}">${r.configured ? 'Connect / reconnect Google Drive' : 'Connect Google Drive'}</button>
+      <span id="rc-cmsg" style="font-size:13px;color:var(--ink-2)"></span></div>
+      <div class="note">On your own computer, install rclone and run <code>rclone authorize "drive"</code>, sign in to Google,
+      then paste what it prints. The token gives access to that whole Drive: it is tested, then stored only in root's
+      rclone config.${location.protocol === 'https:' ? '' : ` <b style="color:var(--crit)">This page is not on HTTPS: the token
+      would cross the network unencrypted. Use an SSH tunnel or VPN.</b>`}</div>`;
   }
 
   h += `<div class="stage"><span class="n">3.</span>
@@ -3394,30 +3551,47 @@ function rcloneRow(s){
   }
 
   h += `<details class="guide"><summary>Setup guide — connecting a Google account</summary>
-    <div class="why">Step 2 is not a button. Connecting the account is an OAuth flow that
-    needs a browser, and on the way through <code>rclone config</code> prints the account's
-    long-lived token. Run as a panel job that token would be written to the job log and shown
-    in the terminal to anyone signed in here — so it is done over SSH instead.</div>
     <ol>
-      <li>SSH to the server and run <code>sudo rclone config</code>.
-        <b>Use sudo</b> — backups run as root, and rclone only sees the config of the user
-        that created it.</li>
-      <li><code>n</code> for a new remote, name it <code>gdrive</code>, choose storage
-        <code>drive</code> (Google Drive).</li>
-      <li>Press Enter through client_id / client_secret, choose scope <code>1</code>
-        (full access), and answer <code>n</code> to advanced config.</li>
-      <li><b>Answer <code>n</code> to "Use auto config?"</b> — this server has no browser.</li>
-      <li>rclone prints a command to run on your own computer
-        (<code>rclone authorize "drive"</code>). Run it there, sign in to Google, then paste
-        the result back into the SSH session.</li>
-      <li>Confirm with <code>y</code>, then <code>q</code> to quit.</li>
-      <li>Come back here — the remote appears at step 2, and step 3 points every site's
-        backups at it. New sites are included automatically.</li>
+      <li>On your own computer (it needs a browser), install rclone from
+        <a href="https://rclone.org/downloads/" target="_blank" rel="noopener">rclone.org/downloads</a>.
+        Use a recent version.</li>
+      <li>Run <code>rclone authorize "drive"</code>, sign in to Google and allow access.</li>
+      <li>Copy the result, from <code>{</code> to <code>}</code>, and paste it at step 2. Press
+        <b>Connect Google Drive</b>: the account is tested before anything is saved.</li>
+      <li>The remote appears at step 2, and step 3 points every site's backups at it.
+        New sites are included automatically.</li>
+      <li>If uploads start failing with an expired or revoked token, do the same again with the same name.</li>
     </ol>
+    <div class="why">Other clouds (MEGA, S3, Dropbox), your own Google client ID, or a password-protected rclone
+      config: use <code>sudo rclone config</code> over SSH. With <b>sudo</b>, because backups run as root.</div>
     ${s.guide_ok ? '<p><a href="/guide/rclone">Download the full guide (.docx)</a> — also covers '
       + 'AWS S3, Dropbox, testing a remote, and encrypting the rclone config.</p>' : ''}
   </details>`;
   return h + `</div>`;
+}
+
+async function connectRclone(){
+  const btn = $('#rc-connect'), tok = $('#rc-token').value.trim(), name = $('#rc-name').value.trim();
+  const say = m => { const el = $('#rc-cmsg'); if(el) el.textContent = m; };   // the row may be rebuilt meanwhile
+  if(!tok){ $('#rc-token').focus(); return; }
+  if(btn.dataset.all && !confirm('Backups go to EVERY remote rclone knows, so this account will receive every site\'s backups. Continue?')) return;
+  const post = async replace => (await fetch('/api/rclone/connect', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({name, token: tok, replace})}));
+  btn.disabled = true; say('Testing the account…');
+  try{
+    let r = await post(false);
+    if(r.status === 401){ location = '/login'; return; }
+    let j = await r.json();
+    if(j.exists){
+      if(!confirm(`Reconnect ${name} with this account? If it is a different Google account, backups go there from now on.`)){ say(''); return; }
+      r = await post(true); j = await r.json();
+    }
+    if(j.error){ say(j.error); return; }
+    $('#rc-token').value = '';
+    await refreshSetup();
+    say('Connected ' + j.remote + ' Now choose where backups upload (step 3).');
+  }catch(e){ say('request failed'); }
+  finally{ const b = $('#rc-connect'); if(b) b.disabled = false; }
 }
 
 function syncRcloneAll(){
@@ -3608,16 +3782,8 @@ async function refreshSetup(){
     rows += `<div class="setup-row"><div class="setup-h"><b>WireGuard (print servers)</b> ${pill(wg.installed)}`
       + (wg.installed ? (wg.running ? ' <span class="badge ok">running</span>'
                                     : ' <span class="badge miss">down</span>') : '') + `</div>`;
-    if(erpDone && s.scripts.wireguard){
-      rows += `<div class="setup-form">
-        <input type="text" id="wg-endpoint" placeholder="public IP or DNS of this server" value="${esc(wg.endpoint||'')}" size="28" autocomplete="off">
-        <input type="text" id="wg-port" title="UDP port" value="${esc(wg.port||'51820')}" size="6">
-        <input type="text" id="wg-subnet" title="Tunnel network (a /24)" value="${esc(wg.subnet||'')}" size="14" ${wg.peers.length ? 'disabled' : ''}>
-        <button class="primary setup-install" data-inst="install_wireguard"
-          data-confirm="${wg.installed ? 'Apply and restart the tunnel? Printing pauses for a few seconds.' : 'Install WireGuard on this server now?'}">${wg.installed ? 'Save / repair' : 'Install WireGuard'}</button></div>`;
-    }
-    rows += `<div class="note">Lets the ERP containers print to CUPS servers behind shop routers. Open <b>UDP ${esc(wg.port||'51820')}</b>
-      to this server. Add, test and remove print servers on the <a href="/wireguard">WireGuard page</a>.</div></div>`;
+    rows += `<div class="note">Lets the ERP containers print to CUPS servers behind shop routers. Install it, change its
+      settings and manage print servers on the <a href="/wireguard">WireGuard page</a>.</div></div>`;
     // OpenWA WhatsApp API (Docker)
     const ow = c.openwa, owUrl = 'http://' + (s.server_ip || location.hostname) + ':' + ow.port;
     rows += `<div class="setup-row"><div class="setup-h"><b>OpenWA WhatsApp API</b> ${pill(ow.installed)}`
@@ -3663,6 +3829,7 @@ async function refreshSetup(){
     }
     if (focused && document.getElementById(focused)) document.getElementById(focused).focus();
     document.querySelectorAll('.setup-install').forEach(btn => btn.onclick = () => installComponent(btn));
+    if ($('#rc-connect')) $('#rc-connect').onclick = connectRclone;
     if ($('#rc-wire')) $('#rc-wire').onclick = wireRclone;
     if ($('#rc-off')) $('#rc-off').onclick = rcloneOff;
     if ($('#rc-all')) { $('#rc-all').onchange = syncRcloneAll; syncRcloneAll(); }
@@ -3710,10 +3877,6 @@ async function installComponent(btn){
     body.schedule_cron = $('#erp-cron').checked;
   } else if(inst==='install_tools'){
     body.schedule_cron = btn.dataset.cron === '1';
-  } else if(inst==='install_wireguard'){
-    body.endpoint = $('#wg-endpoint').value.trim();
-    body.port = $('#wg-port').value.trim();
-    body.subnet = $('#wg-subnet').value.trim();
   } else if(inst==='install_auth'){
     body.smtp_user = $('#au-smtp-user').value.trim();
     body.smtp_password = $('#au-smtp-pw').value;
@@ -4940,7 +5103,6 @@ li{margin-bottom:4px}
   <h1>WireGuard</h1><span id="clock" class="badge"></span>
   <span class="badge" title="panel code version">v{{ version }}</span>
   <a class="nav" href="/">← Dashboard</a>
-  <a class="nav" href="/install">Tunnel settings →</a>
   <span class="spacer"></span>
   <span style="color:var(--muted);font-size:13px">{{ user }}</span>
   <form method="post" action="/logout" style="margin:0"><button>Log out</button></form>
@@ -4954,6 +5116,15 @@ li{margin-bottom:4px}
   <div id="state">Loading…</div>
   <div id="facts" class="facts"></div>
   <div id="msg" class="sub" style="margin-top:8px"></div></div>
+
+<div class="card" id="settings" style="display:none"><h2>Settings</h2>
+  <div class="row" style="align-items:flex-end">
+    <label class="sub">Public IP or DNS name of this server<br><input type="text" id="s-endpoint" placeholder="erp.example.com" size="28" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+    <label class="sub">UDP port<br><input type="text" id="s-port" size="6" inputmode="numeric" autocomplete="off"></label>
+    <label class="sub">Tunnel network (a /24)<br><input type="text" id="s-subnet" size="16" autocomplete="off"></label>
+    <button class="primary act" id="s-save"></button></div>
+  <div id="s-note" class="sub" style="margin-top:8px"></div>
+</div>
 
 <div id="manage" style="display:none">
 <div class="card"><h2>Print servers</h2>
@@ -4985,7 +5156,8 @@ li{margin-bottom:4px}
 </main>
 <script>
 """ + TERM_JS + r"""
-let sitesShown = null, loadSeq = 0;
+let W = null, sitesShown = null, loadSeq = 0;
+const SETTINGS = ['endpoint', 'port', 'subnet'];
 
 async function run(act, body){
   try{
@@ -5016,12 +5188,26 @@ async function load(){
     w = await r.json();
   }catch(e){ if (seq === loadSeq) $('#msg').textContent = 'Could not load: the status shown may be old.'; return; }
   if (seq !== loadSeq) return;       // a newer answer is on its way
+  // A field follows the server until it is edited.
+  for (const k of SETTINGS){
+    const i = $('#s-' + k);
+    if (!W || i.value === (W[k] || '')) i.value = w[k] || '';
+  }
+  W = w;
+  $('#settings').style.display = w.stack && w.script ? '' : 'none';
+  $('#s-subnet').disabled = w.peers.length > 0;
+  if (w.peers.length) $('#s-subnet').value = w.subnet;
+  $('#s-save').textContent = w.installed ? 'Save / repair' : 'Install WireGuard';
+  $('#s-note').textContent = w.peers.length
+    ? 'The network is fixed while print servers exist. After changing the address or port, run each print server\'s setup script again.' : '';
   $('#state').innerHTML = !w.installed ? '<span class="badge miss">not installed</span>'
     : w.running ? '<span class="badge ok">running</span>' : '<span class="badge miss">down</span>';
   $('#manage').style.display = w.installed && w.tools ? '' : 'none';
-  $('#msg').innerHTML = !w.installed ? '<a href="/install">Install WireGuard in the installation suite</a>'
+  $('#msg').innerHTML = !w.stack ? 'Install the stack and tools first. <a href="/install">Open the installation suite</a>'
+    : !w.script ? 'install-wireguard.sh is not in the checkout: update the panel &amp; tools first.'
+    : !w.installed ? 'Fill in the settings below to install it.'
     : !w.tools ? 'The tools are missing. <a href="/install">Open the installation suite</a>'
-    : !w.running ? 'The tunnel is down, so nothing prints through it. Use <b>Save / repair</b> in the <a href="/install">installation suite</a>.' : '';
+    : !w.running ? 'The tunnel is down, so nothing prints through it. Use <b>Save / repair</b> below.' : '';
   $('#facts').innerHTML = !w.installed ? '' : [
     ['Print servers dial', w.endpoint ? w.endpoint + ':' + w.port : 'not set'], ['Tunnel network', w.subnet],
     ['This server', w.hub], ['Connected', w.peers.filter(p => p.up).length + ' of ' + w.peers.length]]
@@ -5045,6 +5231,16 @@ async function load(){
   }
 }
 
+$('#s-save').onclick = () => {
+  if (!W) return;
+  const body = {}, moved = W.installed && W.peers.length;
+  for (const k of SETTINGS) body[k] = $('#s-' + k).value.trim();
+  if (!body.endpoint){ $('#s-endpoint').focus(); return; }
+  let q = W.installed ? 'Apply and restart the tunnel? Printing pauses for a few seconds.' : 'Install WireGuard on this server now?';
+  if (moved && (body.endpoint !== W.endpoint || body.port !== W.port))
+    q += '\n\nThe address or port changes: print servers may stay disconnected until you run their setup scripts again.';
+  if (confirm(q)) run('install_wireguard', body);
+};
 $('#n-add').onclick = async () => {
   const name = $('#n-name').value.trim();
   if (!name){ $('#n-name').focus(); return; }

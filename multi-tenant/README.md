@@ -53,7 +53,8 @@ Then open `https://<server-ip>:8090`:
    password, and whether to schedule backups. Runs `install/panel-install.sh`
    (`install-stack.sh` then `install-tools.sh`). No site is created.
    The stack install also sets up the host nginx (`install/install-proxy.sh`).
-2. Optional, same page: rclone (cloud backups for every site, stored as
+2. Optional, same page: rclone (install, connect Google Drive with a token from
+   `rclone authorize "drive"`, choose where every site uploads; stored as
    `RCLONE_REMOTE` in `sspl-mt.conf`) and OpenWA. The **nginx domain
    routing** row shows whether the proxy is running, and repairs it.
 3. **Dashboard → Create site**, once per tenant: hostname, Administrator
@@ -325,7 +326,7 @@ the host (`wg-quick@sspl-wg`); this server is the hub (`10.99.0.1`) and each CUP
 machine dials in, so it works behind a shop router.
 
 1. Open UDP 51820 to this server (cloud firewall or router).
-2. Installation page, **WireGuard (print servers)**, or:
+2. Panel, **WireGuard** page, **Settings**, or:
 
    ```bash
    sudo WG_ENDPOINT=erp.example.com multi-tenant/install/install-wireguard.sh
@@ -333,7 +334,7 @@ machine dials in, so it works behind a shop router.
 
    `WG_ENDPOINT` is the **public** IP or DNS name. After changing it, re-run each
    print server's setup script.
-3. Add the print server and get its setup script, on the panel's **WireGuard** page
+3. Add the print server and get its setup script, on the same page
    or with:
 
    ```bash
