@@ -66,7 +66,7 @@ sites**, image download and rollback; a per-site backup browser with Restore
 (into the same site, another site with `--allow-other-site`, or from an upload
 folder); uploads; and license files per site. Restore and Drop ask for the
 site name and the panel password, then run the tool with `--yes`.
-**Update panel & tools** (top bar) runs `admin-panel/update_panel.sh`: `git
+**Update panel & tools** (top bar, **Tools** menu) runs `admin-panel/update_panel.sh`: `git
 pull`, `install-tools.sh` (cron and `sspl-mt.conf` untouched), redeploy the
 panel.
 
@@ -255,7 +255,7 @@ sudo SMTP_USER=you@gmail.com SMTP_PASSWORD='abcd efgh ijkl mnop' \
 - Needs HTTPS on the host nginx (`install-proxy.sh`). Authelia only works on
   `https://` pages.
 
-**Add a user, then link the site:** the **Authelia** page (dashboard top bar), then the
+**Add a user, then link the site:** the **Authelia** page (dashboard **Tools** menu), then the
 site's **Domains…** → **Require Authelia login**. Or:
 
 ```bash
@@ -406,7 +406,7 @@ encrypted fields stay readable. Use that flag only when moving a tenant.
 
 ## RAM monitor and database memory
 
-The **RAM monitor →** link at the top of the dashboard opens `/ram`. It shows:
+**RAM monitor** in the dashboard's **Tools** menu opens `/ram`. It shows:
 
 - alerts for low RAM, active swapping, memory pressure, containers near their memory
   limit, and a database reading too much from disk

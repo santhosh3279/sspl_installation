@@ -46,7 +46,7 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-11-23.mt14"
+PANEL_VERSION = "2026-11-23.mt15"
 FEATURES = ("Multi-tenant panel: sites list with per-site backup, DB backup, "
             "migrate, uninstall app and drop; Create site with app picker; "
             "per-site backup browser and guarded per-site restore (also from "
@@ -64,6 +64,7 @@ FEATURES = ("Multi-tenant panel: sites list with per-site backup, DB backup, "
             "no-2FA trusted networks, Gmail mail relay with test mail, "
             "RAM monitor page with alerts, per-container and per-process memory, "
             "and the MariaDB buffer pool size applied live from the panel, "
+            "Tools dropdown in the dashboard top bar, "
             "WireGuard page: tunnel to the CUPS print servers (install, settings, add, remove, test, setup script)")
 
 CONFIG_FILE = os.environ.get("SSPL_ADMIN_CONFIG", "/opt/sspl-admin/config.json")
@@ -3177,9 +3178,25 @@ LAYOUT_CSS = """
 .top a.nav{font-size:13px;text-decoration:none;border:1px solid var(--border);
   border-radius:8px;padding:7px 12px;color:var(--ink)}
 .top a.nav:hover{border-color:var(--accent);color:var(--accent)}
-/* The panel updater sits in the top bar beside the suite link, so it reads as
-   chrome rather than as one of the server actions further down the page. */
-.top .nav-act{font-size:13px;padding:7px 12px}
+/* The dashboard's Tools dropdown: the other pages, then the panel updater. */
+.tools{position:relative}
+.tools summary{font-size:13px;border:1px solid var(--border);border-radius:8px;padding:7px 12px;
+  background:var(--surface);cursor:pointer;list-style:none;white-space:nowrap;user-select:none}
+.tools summary::-webkit-details-marker{display:none}
+.tools summary::after{content:"▾";margin-left:6px;color:var(--muted)}
+.tools summary:hover,.tools[open] summary{border-color:var(--accent)}
+.tools .menu{position:absolute;top:calc(100% + 6px);left:0;z-index:5;min-width:230px;
+  max-width:calc(100vw - 32px);padding:6px;background:var(--surface);border:1px solid var(--border);
+  border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.18)}
+.tools .menu a,.tools .menu button{display:block;width:100%;text-align:left;font-size:13px;
+  padding:8px 10px;border:0;border-radius:6px;background:none;color:var(--ink);text-decoration:none}
+.tools .menu a:hover,.tools .menu button:hover:not(:disabled){background:var(--track)}
+.tools .menu .sep{height:1px;margin:6px 4px;background:var(--hairline)}
+@media (max-width:700px){
+  .top{flex-wrap:wrap;position:relative}
+  .tools{position:static}
+  .tools .menu{left:16px;right:16px;top:100%}
+}
 /* One column: the page's controls, then the terminal full-width at the foot.
    Starting a job scrolls the terminal into view. */
 main{max-width:1500px;margin:0 auto;padding:0 16px 40px}
@@ -3967,15 +3984,21 @@ details{margin:2px 0} details summary{cursor:pointer}
 <div class="top">
   <h1>SSPL ERP Admin</h1><span class="badge">multi-tenant</span><span id="clock" class="badge"></span>
   <span class="badge" title="panel code version — restart the service after updating">v{{ version }}</span>
-  <a class="nav" href="/install">ERP Next Installation suite →</a>
-  <a class="nav" id="au-open" href="/auth" style="display:none" title="Authelia users, whitelisted IPs and 2FA logins of each site">Authelia →</a>
-  <a class="nav" href="/wireguard" title="Tunnel to the CUPS print servers">WireGuard →</a>
-  <a class="nav" href="/ram" title="RAM, swap, containers and the database buffer pool">RAM monitor →</a>
-  {% if repo_ok %}
-  <button class="act nav-act" data-act="update_panel"
-    title="git pull the checkout, refresh the multi-tenant tools, then deploy this panel from it"
-    data-confirm="Pull the latest code, refresh the multi-tenant tools and update this panel now?&#10;&#10;Settings, cron and site data are not touched. The panel restarts itself a few seconds after the job finishes — reload the page then.">Update panel &amp; tools</button>
-  {% endif %}
+  <details class="tools" id="tools">
+    <summary>Tools</summary>
+    <div class="menu">
+      <a href="/install">ERP Next Installation suite</a>
+      <a id="au-open" href="/auth" style="display:none" title="Authelia users, whitelisted IPs and 2FA logins of each site">Authelia</a>
+      <a href="/wireguard" title="Tunnel to the CUPS print servers">WireGuard</a>
+      <a href="/ram" title="RAM, swap, containers and the database buffer pool">RAM monitor</a>
+      {% if repo_ok %}
+      <div class="sep"></div>
+      <button class="act" data-act="update_panel"
+        title="git pull the checkout, refresh the multi-tenant tools, then deploy this panel from it"
+        data-confirm="Pull the latest code, refresh the multi-tenant tools and update this panel now?&#10;&#10;Settings, cron and site data are not touched. The panel restarts itself a few seconds after the job finishes — reload the page then.">Update panel &amp; tools</button>
+      {% endif %}
+    </div>
+  </details>
   <span class="spacer"></span>
   <span style="color:var(--muted);font-size:13px">{{ user }}</span>
   <form method="post" action="/logout" style="margin:0"><button>Log out</button></form>
@@ -4293,6 +4316,15 @@ function fillSelect(sel, values, placeholder){
 function fillSiteSelects(){
   fillSelect($('#licsite'), SITES, SITES.length ? '' : 'no sites');
 }
+
+// Tools dropdown: close on a pick, a click elsewhere or Escape. Capture phase,
+// so it is already closed when an item's confirm() blocks the page.
+document.addEventListener('click', e => {
+  if (!e.target.closest('#tools') || e.target.closest('#tools .menu a, #tools .menu button')) $('#tools').open = false;
+}, true);
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && $('#tools').open) { $('#tools').open = false; $('#tools summary').focus(); }
+});
 
 // Every button with class .act starts a job. data-site / data-all say whom for.
 document.addEventListener('click', async e => {
