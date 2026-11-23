@@ -24,7 +24,8 @@
 #                        the account itself or a verified "Send mail as" alias)
 #   AUTH_TRUSTED_NETWORKS  CIDRs where the password is enough, no 2FA,
 #                        e.g. "192.168.1.0/24"
-#   ADMIN_USER, ADMIN_EMAIL, AUTH_PASSWORD   create a first admin user
+#   ADMIN_USER, ADMIN_EMAIL, AUTH_PASSWORD   the first admin user; required
+#                        while there are no users (Authelia does not start without one)
 #   MAIL_TEST_TO         send a test mail there at the end
 #   SSPL_CONF            default /opt/sspl-erp/sspl-mt.conf
 #
@@ -88,6 +89,12 @@ ok "Mail: ${SMTP_USER:-not configured (2FA codes go to $AUTH_DIR/config/notifica
 proxy_installed || warn "the host nginx is not installed yet — run install/install-proxy.sh before linking sites"
 https_on || warn "HTTPS is off on the host nginx — linked sites need it (HTTPS_PORT + default certificate)"
 command -v python3 >/dev/null 2>&1 || err "python3 is needed (users file)"
+USERS_DB="$AUTH_DIR/config/users_database.yml"
+USERS_JSON=$(python3 "$TOOLS_DIR/lib/authusers.py" "$USERS_DB" list --json) || err "could not read $USERS_DB"
+if [ "$USERS_JSON" = "[]" ]; then
+    [ -n "${ADMIN_USER:-}" ] && [ -n "${ADMIN_EMAIL:-}" ] && [ "${AUTH_PASSWORD:-}" != "" ] && [ "${#AUTH_PASSWORD}" -ge 8 ] \
+        || err "there are no users yet and Authelia does not start without one — set ADMIN_USER, ADMIN_EMAIL and AUTH_PASSWORD (8+ characters)"
+fi
 
 # ─────────────────────────────────────────────── 2. files and secrets
 step "Files in $AUTH_DIR"
@@ -220,7 +227,6 @@ EOF
 ok "compose.yaml, mail relay, Redis config"
 
 # Users file (JSON is valid YAML; lib/authusers.py owns it).
-USERS_DB="$AUTH_DIR/config/users_database.yml"
 [ -s "$USERS_DB" ] || { ( umask 077; echo '{"users": {}}' > "$USERS_DB" ); ok "empty users file"; }
 if [ -n "${ADMIN_USER:-}" ]; then
     if python3 "$TOOLS_DIR/lib/authusers.py" "$USERS_DB" list --json | grep -F "\"user\": \"$ADMIN_USER\"" >/dev/null; then

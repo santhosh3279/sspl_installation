@@ -152,6 +152,14 @@ case "$CMD" in
         check_sites "$SITES"
         ask_password "$U"
         users_py add "$U" "$E" "$N" "$SITES" ${ADMIN[@]+"${ADMIN[@]}"}
+        # Without any user Authelia crash-loops: bring it up with the first one.
+        if ! curl -fsS -m 5 -o /dev/null "http://127.0.0.1:$AUTH_PORT/authelia/api/health" 2>/dev/null; then
+            echo "→ Authelia is not answering; restarting it..."
+            auth_dc up -d authelia >/dev/null 2>&1 && auth_dc restart authelia >/dev/null 2>&1 \
+                || err "could not start Authelia — docker compose -p $AUTH_PROJECT logs authelia"
+            auth_wait || err "the user was added, but Authelia is not healthy"
+            ok "Authelia is running"
+        fi
         ;;
 
     user-passwd)

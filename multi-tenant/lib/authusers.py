@@ -197,6 +197,8 @@ def main(argv):
         save(path, data)
         print(f"   ✓ {name}: {cmd} = {args[1]}")
     elif cmd == "remove":
+        if len(users) == 1:
+            die("this is the only user — Authelia does not start without one; add another first")
         del users[name]
         save(path, data)
         print(f"   ✓ user {name} removed")

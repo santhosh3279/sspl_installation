@@ -42,7 +42,7 @@ from werkzeug.utils import secure_filename
 # think it is. Copying app.py is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-11-23.mt7"
+PANEL_VERSION = "2026-11-23.mt8"
 FEATURES = ("Multi-tenant panel: sites list with per-site backup, DB backup, "
             "migrate, uninstall app and drop; Create site with app picker; "
             "per-site backup browser and guarded per-site restore (also from "
@@ -2276,6 +2276,8 @@ def _auth_request(name, data):
         on = "yes" if data.get("on") else "no"
         what = "admin" if name == "auth_user_admin" else "disabled"
         return [user, on], None, f"{user}: {what} = {on}", None
+    if name == "auth_user_remove" and len(auth_users()) == 1:
+        return None, None, None, "this is the only user — Authelia does not start without one; add another first"
     if name in ("auth_user_remove", "auth_user_reset_2fa"):
         return [user], None, (f"Remove user {user}" if name == "auth_user_remove" else f"Reset 2FA of {user}"), None
     return None, None, None, "unknown action"
@@ -2516,6 +2518,8 @@ def _install_env(name, data):
             if err:
                 return None, None, "admin " + err
             env.update({"ADMIN_USER": au, "ADMIN_EMAIL": ae, "AUTH_PASSWORD": apw})
+        if not au and not auth_users():
+            return None, None, "enter the first admin user (Authelia does not start without a user)"
         if not auth_installed() and not (user and pw):
             return None, None, "enter the Gmail address and its app password (Authelia mails the 2FA codes)"
         return env, None, None
@@ -3455,7 +3459,7 @@ async function refreshSetup(){
         <input type="email" id="au-from" placeholder="sender (default: the Gmail address)" value="${esc(au.mail_from && au.mail_from !== au.mail ? au.mail_from : '')}" size="28" autocomplete="off">
         <input type="text" id="au-trusted" placeholder="no-2FA networks, e.g. 192.168.1.0/24" value="${esc(au.trusted||'')}" size="30"
           title="From these networks the password is enough (no 2FA). Space-separated. Empty: 2FA everywhere.">`
-        + (au.installed ? '' : `
+        + (au.installed && au.users ? '' : `
         <input type="text" id="au-admin-user" placeholder="first admin user" size="14" autocomplete="off" autocapitalize="off">
         <input type="email" id="au-admin-email" placeholder="admin e-mail" size="22" autocomplete="off">
         <input type="password" id="au-admin-pw" placeholder="admin password (8+)" size="16" autocomplete="new-password">`)

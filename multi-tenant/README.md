@@ -222,6 +222,8 @@ sudo SMTP_USER=you@gmail.com SMTP_PASSWORD='abcd efgh ijkl mnop' \
      multi-tenant/install/install-auth.sh
 ```
 
+- The admin user is required on the first install: Authelia does not start
+  without a user, so the last one cannot be removed either.
 - **Gmail:** turn on 2-Step Verification for the Google account, then create an
   **app password** (Google Account → Security → App passwords). Use that, not
   the account password. Gmail sends as that address, or a verified "Send mail
@@ -302,6 +304,8 @@ machine dials in, so it works behind a shop router.
 
 - **One direction.** Firewall rules let the host and the containers connect to the
   print servers, not the reverse, and print servers cannot reach each other.
+  They are set by a systemd drop-in on `wg-quick@sspl-wg` (not `PostUp`, which
+  AppArmor can block): start and stop the tunnel with `systemctl`.
 - **Tenants share containers**, so every site can reach every print server.
   `--site` is only a label. Protect CUPS with a password if that matters.
 - Addresses are never reused after `remove`, so an old Printer Server record

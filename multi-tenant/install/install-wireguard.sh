@@ -114,6 +114,7 @@ fi
 
 step "Interface $WG_IFACE"
 tmp=$(mktemp "$(wg_conf_file).XXXXXX")
+write_wg_unit || { rm -f "$tmp"; err "could not write the systemd drop-in"; }
 render_wg_conf > "$tmp" || { rm -f "$tmp"; err "could not render the WireGuard config"; }
 mv -f "$tmp" "$(wg_conf_file)"
 systemctl enable "wg-quick@$WG_IFACE" >/dev/null 2>&1
