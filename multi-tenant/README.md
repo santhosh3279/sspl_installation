@@ -49,7 +49,7 @@ cd sspl_installation/multi-tenant/admin-panel
 
 Then open `https://<server-ip>:8090`:
 
-1. **ERP Next Installation suite → Install stack**: port, image, MariaDB root
+1. **ERP Next Installation suite → Install stack**: image, MariaDB root
    password, and whether to schedule backups. Runs `install/panel-install.sh`
    (`install-stack.sh` then `install-tools.sh`). No site is created.
    The stack install also sets up the host nginx (`install/install-proxy.sh`).
@@ -67,8 +67,18 @@ folder); uploads; and license files per site. Restore and Drop ask for the
 site name and the panel password, then run the tool with `--yes`.
 **Update panel & tools** (top bar) runs `admin-panel/update_panel.sh`: `git
 pull`, `install-tools.sh` (cron and `sspl-mt.conf` untouched), redeploy the
-panel. Changing the HTTP port of a running multi-tenant stack is not in the
-panel yet.
+panel.
+
+Domains open without a port only on HTTP 80 / HTTPS 443, so the installers use
+those. A stack on other ports moves with **Remove port from URLs** in the
+installation suite, or:
+
+```bash
+sudo multi-tenant/install/use-standard-ports.sh
+```
+
+It needs 80 and 443 free, rewrites every site's `host_name`, and puts the old
+port back if nginx fails. Links with the old port stop working.
 
 ## Install from the terminal (fresh server)
 
@@ -78,7 +88,7 @@ cd sspl_installation/multi-tenant/install
 ./install.sh
 ```
 
-It asks for the port, the MariaDB root password, the first tenant's hostname
+It asks for the MariaDB root password, the first tenant's hostname
 and Administrator password, and whether to schedule backups. Then it:
 
 1. starts the stack: `/opt/sspl-erp/` (compose project `sspl-erp`), and the

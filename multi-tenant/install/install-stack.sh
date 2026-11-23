@@ -81,7 +81,7 @@ source "$(cd "$(dirname "$0")/.." && pwd)/lib/common.sh"
 # and frontend on them: skip.)
 if [ ! -f "$COMPOSE_FILE" ]; then
     if ss -ltnH "sport = :$HTTP_PORT" 2>/dev/null | grep -q .; then
-        err "Port $HTTP_PORT is already in use: $(ss -ltnpH "sport = :$HTTP_PORT" | head -1). Pick another HTTP port."
+        err "Port $HTTP_PORT is already in use: $(ss -ltnpH "sport = :$HTTP_PORT" | head -1). Stop it or move it: domains open without a port only on 80 (HTTP_PORT=<n> overrides)."
     fi
     if [ -n "$HTTPS_PORT" ] && ss -ltnH "sport = :$HTTPS_PORT" 2>/dev/null | grep -q .; then
         warn "Port $HTTPS_PORT is already in use — the stack installs with HTTP only. Free it, then run install/install-proxy.sh"

@@ -481,6 +481,33 @@ domain_url() {   # $1 domain
     fi
 }
 
+# The URL a site uses in emails and PDFs, from its site_config.json.
+site_host_name() {   # $1 site; fails if the config cannot be read
+    local cfg
+    cfg=$(dc exec -T backend cat "$BENCH_SITES/$1/site_config.json" 2>/dev/null) || return 1
+    printf '%s' "$cfg" | grep -o '"host_name": *"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/' || true
+}
+
+# Re-derive host_name's scheme and port (HTTPS, Authelia or HTTP_PORT changed).
+# Keeps its host; leaves one that is not this site's own address alone.
+sync_host_name() {   # $1 site
+    local hn new
+    hn=$(site_host_name "$1") || return 1
+    [ -n "$hn" ] || return 0
+    local host="${hn#*://}"; host="${host%%/*}"
+    local name="${host%%:*}" port=""
+    [[ "$host" == *:* ]] && port="${host##*:}"
+    if [ -n "$port" ] && [ "$(port_site "$port")" = "$1" ] && [ "$name" = "$(server_ip)" ]; then
+        new="$(https_on && auth_active && site_auth_linked "$1" && echo https || echo http)://$name:$port"
+    elif [ "$(domain_site "$name")" = "$1" ]; then
+        new=$(domain_url "$name")
+    else
+        return 0
+    fi
+    [ "$new" = "$hn" ] && return 0
+    dc exec -T backend bench --site "$1" set-config host_name "$new" >/dev/null && ok "host_name of $1: $new"
+}
+
 # Delete a domain's Let's Encrypt certificate (and its renewal). Call after
 # apply_proxy has stopped referencing it.
 remove_cert() {   # $1 domain

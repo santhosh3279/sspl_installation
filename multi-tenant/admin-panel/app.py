@@ -500,6 +500,7 @@ STACK_SETUP_SCRIPT = _repo("multi-tenant/install/panel-install.sh")
 TOOLS_SETUP_SCRIPT = _repo("multi-tenant/install/install-tools.sh")
 RCLONE_SETUP_SCRIPT = _repo("Backup/frappe_backup_system/install_rclone.sh")
 PROXY_SETUP_SCRIPT = _repo("multi-tenant/install/install-proxy.sh")
+PORTS_SETUP_SCRIPT = _repo("multi-tenant/install/use-standard-ports.sh")
 AUTH_SETUP_SCRIPT = _repo("multi-tenant/install/install-auth.sh")
 WG_SETUP_SCRIPT = _repo("multi-tenant/install/install-wireguard.sh")
 OPENWA_SETUP_SCRIPT = _repo("Production Installation/install_openwa.sh")
@@ -517,6 +518,8 @@ INSTALL_ACTIONS = {
     # Host nginx: domain → site routing. Also moves an older stack's frontend
     # off the public port.
     "install_proxy":   {"label": "Install / repair nginx proxy",  "cmd": ["bash", PROXY_SETUP_SCRIPT or ""]},
+    # HTTP 80 / HTTPS 443, and every site's host_name without a port.
+    "install_ports":   {"label": "Move to ports 80 / 443",       "cmd": ["bash", PORTS_SETUP_SCRIPT or ""]},
     # Authelia + Redis + Postfix relay (Gmail). Secrets go as env vars.
     "install_auth":    {"label": "Install / update Authelia",     "cmd": ["bash", AUTH_SETUP_SCRIPT or ""]},
     "install_wireguard": {"label": "Install / update WireGuard", "cmd": ["bash", WG_SETUP_SCRIPT or ""]},
@@ -1261,6 +1264,7 @@ def setup_status():
         "scripts": {
             "rclone": _script_ok(RCLONE_SETUP_SCRIPT),
             "proxy": _script_ok(PROXY_SETUP_SCRIPT),
+            "ports": _script_ok(PORTS_SETUP_SCRIPT),
             "auth": _script_ok(AUTH_SETUP_SCRIPT),
             "wireguard": _script_ok(WG_SETUP_SCRIPT),
             "openwa": _script_ok(OPENWA_SETUP_SCRIPT),
@@ -2476,15 +2480,10 @@ def _install_env(name, data):
     action. Returns (env, args, None) or (None, None, error). Secrets stay in
     the env dict and reach the child as env vars — never argv, never logged."""
     if name == "install_stack":
-        port = str(data.get("http_port", "80")).strip() or "80"
         image = str(data.get("image", "")).strip() or erp_image()
         db_pw = str(data.get("db_password", ""))
         if os.path.isfile(compose_file()):
             return None, None, "a stack is already installed on this server"
-        if not (port.isdigit() and 1 <= int(port) <= 65535):
-            return None, None, "HTTP port must be a number between 1 and 65535"
-        if int(port) in RESERVED_PORTS:
-            return None, None, f"port {port} is already used on this server (SSH, OpenWA, this panel or the stack's internal nginx)"
         if len(image) > 200 or not ERP_IMAGE_RE.match(image):
             return None, None, ("Docker image must look like registry/owner/name "
                                 "(lowercase, no tag — e.g. ghcr.io/santhosh3279/sspl-erpnext)")
@@ -2499,13 +2498,14 @@ def _install_env(name, data):
                 save_config_key("erp_image", image)
             except OSError as e:
                 return None, None, f"could not save the image to config.json: {e}"
-        return {"HTTP_PORT": port, "IMAGE": image, "DB_PASSWORD": db_pw,
+        # Port 80, so domains open without a port in the URL.
+        return {"HTTP_PORT": "80", "IMAGE": image, "DB_PASSWORD": db_pw,
                 "SSPL_INSTALL_CRON": "yes" if data.get("schedule_cron", True) else "no"}, None, None
 
     if name == "install_tools":
         return {}, ["--cron" if data.get("schedule_cron", True) else "--no-cron"], None
 
-    if name in ("install_rclone", "install_proxy"):
+    if name in ("install_rclone", "install_proxy", "install_ports"):
         return {}, None, None
     if name == "install_auth":
         env = {}
@@ -3394,7 +3394,6 @@ async function refreshSetup(){
                    <span class="badge">${c.erp.sites.length} site${c.erp.sites.length===1?'':'s'}</span>` : '') + `</div>`;
     if(!erpDone){
       rows += `<div class="setup-form">
-        <input type="text" id="erp-port" placeholder="HTTP port" value="80" size="6" title="every site is served on this port, picked by hostname">
         <input type="text" id="erp-image" placeholder="Docker image" value="${esc(s.erp_image||'')}" size="34"
           title="ERPNext Docker image (registry/owner/name, no tag). One image serves every site.">
         <input type="password" id="erp-db" placeholder="MariaDB root password (new)" size="22">
@@ -3402,14 +3401,21 @@ async function refreshSetup(){
         <button class="primary setup-install" data-inst="install_stack"
           data-confirm="Install the multi-tenant ERPNext stack now? This pulls the image, starts the containers and installs the tools to ${esc(s.tools_dir)} — 5-15 minutes. No site is created: add sites from the dashboard afterwards.">Install stack</button></div>
         <div class="note">Creates the stack only. Then use <b>Create site</b> on the <a href="/">dashboard</a>
-          for each tenant — each gets its own hostname, database and Administrator password.</div>`;
+          for each tenant — each gets its own hostname, database and Administrator password.
+          Ports 80 and 443 must be free, so every domain opens without a port.</div>`;
     } else {
       const sites = c.erp.sites;
       rows += sites.length
         ? `<div class="note">Sites: ${sites.map(x => `<code>${esc(x)}</code>`).join(' ')} — manage them on the <a href="/">dashboard</a>.</div>`
         : `<div class="note">No sites yet — create the first one on the <a href="/">dashboard</a>.</div>`;
-      rows += `<div class="note">Changing the HTTP port is not available on a multi-tenant stack from here yet
-        (every site's <code>host_name</code> and the compose file must change together).</div>`;
+      const hp = c.proxy.https_port;
+      if(s.scripts.ports && (c.erp.http_port !== 80 || (hp !== null && hp !== 443))){
+        rows += `<div class="setup-form">
+          <button class="primary setup-install" data-inst="install_ports"
+            data-confirm="Move every site to ports 80 and 443? Domains then open without a port. Links with the old port stop working, and both ports must be free.">Remove port from URLs (use 80 / 443)</button></div>
+          <div class="note">Domains need a port in the URL because this stack is not on the standard ones
+            (HTTP ${esc(String(c.erp.http_port))}${hp !== null ? `, HTTPS ${esc(String(hp))}` : ''}).</div>`;
+      }
     }
     rows += `</div>`;
     // Tools
@@ -3618,7 +3624,6 @@ async function installComponent(btn){
   if(btn.dataset.confirm && !confirm(btn.dataset.confirm)) return;
   const inst = btn.dataset.inst, body = {};
   if(inst==='install_stack'){
-    body.http_port = $('#erp-port').value.trim();
     body.image = $('#erp-image').value.trim();
     body.db_password = $('#erp-db').value;
     body.schedule_cron = $('#erp-cron').checked;

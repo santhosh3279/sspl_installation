@@ -79,25 +79,6 @@ check_linkable() {   # $1 site
     fi
 }
 
-host_name_to_https() {   # $1 site — host_name follows the scheme change
-    local hn new
-    hn=$(dc exec -T backend cat "$BENCH_SITES/$1/site_config.json" 2>/dev/null \
-        | grep -o '"host_name": *"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/' || true)
-    [ -n "$hn" ] || return 0
-    local host="${hn#*://}"; host="${host%%/*}"
-    local name="${host%%:*}" port=""
-    [[ "$host" == *:* ]] && port="${host##*:}"
-    if [ -n "$port" ] && [ "$(port_site "$port")" = "$1" ] && [ "$name" = "$(server_ip)" ]; then
-        new="$(https_on && auth_active && site_auth_linked "$1" && echo https || echo http)://$name:$port"
-    elif [ "$(domain_site "$name")" = "$1" ]; then
-        new=$(domain_url "$name")
-    else
-        return 0
-    fi
-    [ "$new" = "$hn" ] && return 0
-    dc exec -T backend bench --site "$1" set-config host_name "$new" >/dev/null && ok "host_name of $1: $new"
-}
-
 CMD="${1:-}"; shift || true
 case "$CMD" in
     status)
@@ -135,7 +116,7 @@ case "$CMD" in
             apply_proxy || err "nginx was not reloaded — fix it, then: $0 apply"
             ok "$SITE no longer asks for an Authelia login"
         fi
-        host_name_to_https "$SITE" || warn "could not update host_name of $SITE"
+        sync_host_name "$SITE" || warn "could not update host_name of $SITE"
         if [ "$CMD" = link ]; then
             echo ""
             echo "✅ $SITE asks for a login on:"

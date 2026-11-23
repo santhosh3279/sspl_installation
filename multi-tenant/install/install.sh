@@ -31,7 +31,11 @@ if sudo test -f /opt/sspl-erp/docker-compose.yml; then
 fi
 
 echo "════ SSPL ERP multi-tenant installer ════"
-read -rp "HTTP port [80]: " HTTP_PORT; HTTP_PORT=${HTTP_PORT:-80}
+# 80, so domains open without a port. HTTP_PORT=<n> ./install.sh overrides.
+HTTP_PORT=${HTTP_PORT:-80}
+if ss -ltnH "sport = :$HTTP_PORT" 2>/dev/null | grep -q .; then
+    err "Port $HTTP_PORT is already in use: $(sudo ss -ltnpH "sport = :$HTTP_PORT" | head -1). Stop it or move it first."
+fi
 while true; do
     read -rsp "MariaDB root password (new): " DB_PASSWORD; echo ""
     read -rsp "Confirm: " P2; echo ""
