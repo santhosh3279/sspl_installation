@@ -24,8 +24,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$HERE/../.." && pwd)"
 cd "$HERE"
 
-if [ ! -f app.py ] || [ ! -f sspl-admin.service ]; then
-    echo "ERROR: app.py / sspl-admin.service not found in $HERE"
+if [ ! -f app.py ] || [ ! -f sspl-admin.service ] || [ ! -d templates ] || [ ! -d static/app ]; then
+    echo "ERROR: app.py / templates / static/app / sspl-admin.service not found in $HERE"
     exit 1
 fi
 
@@ -60,7 +60,9 @@ echo "Installing Flask..."
 sudo "$INSTALL_DIR/venv/bin/pip" install --quiet --upgrade pip flask
 
 # 3. App
-sudo cp app.py "$INSTALL_DIR/"
+# Old folders go first: the built pages have a new file name per build.
+sudo rm -rf "$INSTALL_DIR/templates" "$INSTALL_DIR/static"
+sudo cp -r app.py templates static "$INSTALL_DIR/"
 
 # 4. Credentials and config
 echo ""

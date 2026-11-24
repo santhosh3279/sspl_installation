@@ -244,6 +244,7 @@ def broken_app(text):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="127.0.0.1", help="0.0.0.0 = reachable from the LAN")
     ap.add_argument("--port", type=int, default=8091)
     ap.add_argument("--reset", action="store_true", help="rebuild the fake data")
     args = ap.parse_args()
@@ -254,7 +255,7 @@ def main():
         if args.reset or not (STATE / ".seeded").is_file():
             shutil.rmtree(STATE, ignore_errors=True)
             seed()
-        print(f"Panel (dev): http://127.0.0.1:{args.port}   login dev / dev   state: {STATE}", flush=True)
+        print(f"Panel (dev): http://{args.host}:{args.port}   login dev / dev   state: {STATE}", flush=True)
     try:
         wsgi = load_panel()
     except Exception:                           # keep watching: fix app.py and it reloads
@@ -262,8 +263,9 @@ def main():
         print(text, file=sys.stderr, flush=True)
         wsgi = broken_app(text)
     # No Werkzeug debugger: it runs code typed in the browser.
-    run_simple("127.0.0.1", args.port, wsgi, threaded=True, use_reloader=True,
-               use_debugger=False, extra_files=[str(HERE / "app.py")])
+    run_simple(args.host, args.port, wsgi, threaded=True, use_reloader=True,
+               use_debugger=False, extra_files=[str(HERE / "app.py")]
+               + [str(p) for p in (HERE / "templates").glob("*.html")])
 
 
 if __name__ == "__main__":

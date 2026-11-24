@@ -57,10 +57,10 @@ Then open `https://<server-ip>:8090`:
    `rclone authorize "drive"`, choose where every site uploads; stored as
    `RCLONE_REMOTE` in `sspl-mt.conf`) and OpenWA. The **nginx domain
    routing** row shows whether the proxy is running, and repairs it.
-3. **Dashboard → Create site**, once per tenant: hostname, Administrator
+3. **Sites → Create site**, once per tenant: hostname, Administrator
    password, which apps.
 
-The dashboard lists every site with per-site Backup, DB backup, Migrate,
+The Sites pages list every site with per-site Backup, DB backup, Migrate,
 Apps… (uninstall) and Drop; all-site backup, verify, migrate, **Update all
 sites**, image download and rollback; a per-site backup browser with Restore
 (into the same site, another site with `--allow-other-site`, or from an upload
@@ -88,9 +88,25 @@ cd multi-tenant/admin-panel && ./dev.sh      # http://127.0.0.1:8091, dev / dev
 ```
 
 Runs the checkout's `app.py` with live reload and fake sites, no root needed.
-It listens on 127.0.0.1 only (`ssh -L 8091:127.0.0.1:8091 <server>` from another
+It listens on 127.0.0.1 (`--host 0.0.0.0` opens it to the LAN; or `ssh -L 8091:127.0.0.1:8091 <server>` from another
 PC). Buttons print the command they would run; nothing is executed. State is in
 `~/.cache/sspl-panel-dev`; `./dev.sh --reset` rebuilds it.
+
+The whole UI is a Vue app in `frontend/` (one page per task, `/#/...` URLs);
+`templates/` holds only its shell, the login page and redirects from the old
+URLs. For hot reload keep `dev.sh` running and:
+
+```bash
+cd multi-tenant/admin-panel/frontend && npm ci && npm run dev   # port 5173, on 0.0.0.0
+npm run build                                # writes ../static/app: commit it
+```
+
+Vite listens on 0.0.0.0 and passes everything else to `dev.sh`, so the fake
+panel is open to the LAN with dev / dev: use it on a trusted network only.
+
+Servers never run npm: they get the built `static/app/` from git. After any
+change in `frontend/`, build and commit `static/app/` with it, and bump
+`PANEL_VERSION` in `app.py`. Use Node 22.12+ or 24.
 
 ## Install from the terminal (fresh server)
 
@@ -135,7 +151,7 @@ site.
 ## Domains
 
 Each site answers on its own name. Add more domains with `sites/domains.sh`,
-or with **Domains…** in the site's row on the dashboard:
+or on the site's **Domains** page in the panel:
 
 ```bash
 sudo $T/sites/domains.sh add acme.erp.lan erp.acme.com --primary
@@ -170,7 +186,7 @@ sudo $T/sites/domains.sh primary beta.erp.lan 8002           # a number = a port
 sudo $T/sites/domains.sh unport 8002
 ```
 
-The panel does the same with **Add IP + port** in the site's Domains… dialog.
+The panel does the same with **Add IP + port** on the site's Domains page.
 
 - One site can have domains *and* ports, and each works on its own:
   `erp.acme.com` on 80/443 and `http://192.168.1.50:8001` both reach
@@ -204,7 +220,7 @@ The host nginx also listens on `HTTPS_PORT` (default 443; set it to `""` in
   sudo $T/sites/domains.sh cert erp.acme.com
   ```
 
-  You can also use **Get certificate** in the site's Domains… dialog. The
+  You can also use **Get certificate** on the site's Domains page. The
   domain must be in the table, its DNS must point at this server's public IP,
   and port 80 must be open from the internet (`HTTP_PORT` must be 80). certbot
   uses the webroot method (`/var/www/sspl-acme`) and never edits the nginx
@@ -255,8 +271,8 @@ sudo SMTP_USER=you@gmail.com SMTP_PASSWORD='abcd efgh ijkl mnop' \
 - Needs HTTPS on the host nginx (`install-proxy.sh`). Authelia only works on
   `https://` pages.
 
-**Add a user, then link the site:** the **Authelia** page (dashboard **Tools** menu), then the
-site's **Domains…** → **Require Authelia login**. Or:
+**Add a user, then link the site:** **Login protection → Users**, then the
+site's **Login protection** page → **Require Authelia login**. Or:
 
 ```bash
 sudo $T/sites/auth.sh user-add acme.erp.lan ravi ravi@acme.com "Ravi"
@@ -406,7 +422,7 @@ encrypted fields stay readable. Use that flag only when moving a tenant.
 
 ## RAM monitor and database memory
 
-**RAM monitor** in the dashboard's **Tools** menu opens `/ram`. It shows:
+**Server → Memory** and **Database memory** in the panel. It shows:
 
 - alerts for low RAM, active swapping, memory pressure, containers near their memory
   limit, and a database reading too much from disk
@@ -456,7 +472,8 @@ restore those sites from the backups the update took.
 
 ```
 multi-tenant/
-  admin-panel/  the web panel: app.py, setup_admin_panel.sh, update_panel.sh
+  admin-panel/  the web panel: app.py, templates/, static/, frontend/ (Vue
+                source), setup_admin_panel.sh, update_panel.sh
   install/   install.sh (fresh server), panel-install.sh (the panel's),
              install-stack.sh, install-proxy.sh (host nginx), install-auth.sh
              (Authelia + Redis + mail relay), install-wireguard.sh,

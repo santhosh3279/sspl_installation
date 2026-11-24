@@ -4,7 +4,7 @@
 #   1. reset the repo checkout to what the remote has
 #   2. refresh the tools in $SSPL_TOOLS_DIR (install-tools.sh; cron and
 #      sspl-mt.conf are not touched)
-#   3. deploy this folder's app.py + service to /opt/sspl-admin and restart
+#   3. deploy this folder's app.py, templates, static + service to /opt/sspl-admin and restart
 #
 # NOT the repo-root update_panel.sh / update_tooling.sh: those deploy the
 # single-site panel ("Admin Panel/app.py") over this one and install the
@@ -96,9 +96,19 @@ deploy() {
 
     echo ""
     echo "→ 3/3 Deploying the admin panel to $PANEL_DST"
+    [ -d "$HERE/templates" ] && [ -d "$HERE/static/app" ] \
+        || { echo "   ❌ templates/ or static/app/ is missing from the checkout."; exit 1; }
+    # Copied beside the old ones, then swapped. Removed first because the built
+    # pages have a new file name per build.
+    for d in templates static; do
+        rm -rf "$PANEL_DST/$d.new"
+        cp -r "$HERE/$d" "$PANEL_DST/$d.new"
+        rm -rf "${PANEL_DST:?}/$d"
+        mv "$PANEL_DST/$d.new" "$PANEL_DST/$d"
+    done
     cp "$HERE/app.py" "$PANEL_DST/app.py"
     VER=$(grep -m1 '^PANEL_VERSION' "$HERE/app.py" | cut -d'"' -f2)
-    echo "   ✓ app.py (v$VER)"
+    echo "   ✓ app.py, templates, static (v$VER)"
     if [ -f /etc/systemd/system/sspl-admin.service ]; then
         cp "$HERE/sspl-admin.service" /etc/systemd/system/
         systemctl daemon-reload

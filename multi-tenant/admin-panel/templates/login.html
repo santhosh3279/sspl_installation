@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Sign in to SSPL ERP Admin</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app/assets/app.css', v=version) }}">
+</head>
+<body class="login">
+  <form method="post">
+    <h1>SSPL ERP Admin</h1>
+    <p>Sign in to manage this server and its sites.</p>
+    <label class="field"><span>Username</span><input name="username" autofocus required autocomplete="username"></label>
+    <label class="field"><span>Password</span><input name="password" type="password" required autocomplete="current-password"></label>
+    {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+    <button class="btn primary" type="submit">Sign in</button>
+  </form>
+</body>
+</html>

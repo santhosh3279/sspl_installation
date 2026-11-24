@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>SSPL ERP Admin</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app/assets/app.css', v=version) }}">
+</head>
+<body>
+  <div id="app" data-user="{{ user }}" data-version="{{ version }}" data-repo-ok="{{ 1 if repo_ok else 0 }}"></div>
+  <script type="module" src="{{ url_for('static', filename='app/assets/app.js', v=version) }}"></script>
+</body>
+</html>
