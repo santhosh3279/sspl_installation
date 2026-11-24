@@ -316,6 +316,12 @@ linked, and the last one of a linked site cannot be removed. Then:
 - **2FA IPs:** the Authelia page lists where each user passed 2FA, read from the
   site's `db.sqlite3` login log. Sessions stay in Redis: Authelia has no SQLite
   session store.
+- **Remembered logins:** the Trusted networks page lists each browser that ticked
+  Remember me, with the days left and a **Revoke** button (`auth.sh sessions
+  <site>`, `auth.sh session-revoke <site> <id>`). Revoking logs that browser out of
+  Authelia at its next request. It does not end its ERPNext session, so a
+  whitelisted address still gets in with that. The address shown is where the
+  user logged in, from the login log; Authelia keeps no last-used time for these.
 - **Not gated:** the ERP containers themselves (PDF rendering fetches the
   site's own URL), plus `AUTH_BYPASS_NETWORKS`.
 - **Stopped by the login:** API-token clients, the Frappe mobile app,

@@ -130,6 +130,13 @@ def answer(cmd):
         return "rclone v1.70.0 (dev)\n"
     if cmd[0] == str(TOOLS / "sites" / "wireguard.sh"):
         return "#!/bin/sh\necho 'dev mode: no real tunnel'\n"
+    if cmd[:2] == [str(TOOLS / "sites" / "auth.sh"), "sessions"]:
+        now, day = int(time.time()), 86400
+        rows = [("a" * 40, "alex", "203.0.113.7", True, 3 * day, 362 * day), ("b" * 40, "sam", "198.51.100.20", False, 354 * day, 11 * day),
+                ("c" * 40, "alex", "", True, 365 * day - 9000, 9000)] if cmd[2].startswith("acme") else []
+        return json.dumps({"unreadable": 0, "sessions": [
+            {"id": i, "user": u, "host": "acme.example.test", "ip": ip, "twofa": f, "login": now - ago,
+             "expires": now + left, "left": left} for i, u, ip, f, ago, left in rows]})
     if cmd[0] != "docker":
         return None
     if "volume" in cmd:

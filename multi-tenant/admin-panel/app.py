@@ -46,7 +46,7 @@ from werkzeug.utils import secure_filename
 # think it is. Copying the files is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-11-24.mt16"
+PANEL_VERSION = "2026-11-24.mt17"
 FEATURES = ("Multi-tenant panel: sites list with per-site backup, DB backup, "
             "migrate, uninstall app and drop; Create site with app picker; "
             "per-site backup browser and guarded per-site restore (also from "
@@ -59,7 +59,7 @@ FEATURES = ("Multi-tenant panel: sites list with per-site backup, DB backup, "
             "default + Let's Encrypt per domain (Get certificate); per-site "
             "IP + port (Add IP + port); Authelia login with 2FA per site "
             "(Domains… → Require Authelia login), Authelia page (per site: users, whitelist "
-            "and no-2FA IPs, 2FA logins; "
+            "and no-2FA IPs, 2FA logins, remembered logins with days left and revoke; "
             "password, admin, 2FA reset), Redis sessions (Remember me 1 year), "
             "no-2FA trusted networks, Gmail mail relay with test mail, "
             "RAM monitor page with alerts, per-container and per-process memory, "
@@ -360,6 +360,25 @@ def auth_logins(site):
     return out
 
 
+def auth_sessions(site):
+    """The site's remembered logins (sites/auth.sh sessions). The ids are
+    hashes, never the cookies."""
+    if not auth_installed():
+        return {"error": "Authelia is not installed"}
+    try:
+        r = subprocess.run([_tool("sites/auth.sh"), "sessions", site, "--json"],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode:
+            return {"error": ((r.stderr.strip() or "could not read the sessions").splitlines()[-1])[:300]}
+        out = json.loads(r.stdout)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return {"error": "could not read the sessions"}
+    for x in out["sessions"]:
+        for k in ("login", "expires"):
+            x[k] = datetime.fromtimestamp(x[k]).strftime("%Y-%m-%d %H:%M") if x[k] else ""
+    return {"error": None, **out}
+
+
 def auth_ports():
     """{site: port of its Authelia}."""
     out = {}
@@ -552,6 +571,7 @@ ACTIONS = {
     "auth_trusted":        {"label": "Set no-2FA networks",       "cmd": [_tool("sites/auth.sh"), "trusted"]},
     "auth_ip_add":         {"label": "Add site IP rule",          "cmd": [_tool("sites/auth.sh"), "ip-add"]},
     "auth_ip_remove":      {"label": "Remove site IP rule",       "cmd": [_tool("sites/auth.sh"), "ip-remove"]},
+    "auth_session_revoke": {"label": "Revoke remembered login",   "cmd": [_tool("sites/auth.sh"), "session-revoke"]},
     "auth_mail_test":      {"label": "Send test mail",            "cmd": [_tool("sites/auth.sh"), "mail-test"]},
     # WireGuard peers (CUPS print servers)
     "wg_add":    {"label": "Add print server",    "cmd": [_tool("sites/wireguard.sh"), "add"]},
@@ -1996,6 +2016,14 @@ def api_auth_logins(site):
     return jsonify(auth_logins(site))
 
 
+@app.route("/api/auth/<site>/sessions")
+@login_required
+def api_auth_sessions(site):
+    if site not in list_sites():
+        return jsonify({"error": "no such site"}), 404
+    return jsonify(auth_sessions(site))
+
+
 @app.route("/wireguard")
 @login_required
 def wireguard_page():
@@ -2403,6 +2431,11 @@ def _auth_request(name, data):
         verb = "Add" if name == "auth_ip_add" else "Remove"
         what = "whitelist" if kind == "bypass" else "no-2FA list"
         return [site, kind, str(net)], None, f"{verb} {net}: {what} of {site}", None
+    if name == "auth_session_revoke":
+        sid = str(data.get("id", ""))
+        if not re.fullmatch(r"[0-9a-f]{40}", sid):
+            return None, None, None, "unknown session"
+        return [site, sid], None, f"Revoke a remembered login on {site}", None
     user = str(data.get("user", "")).strip().lower()
     if not AUTH_USER_RE.match(user):
         return None, None, None, "user names: lowercase letters, digits, . _ - (start with a letter or digit)"

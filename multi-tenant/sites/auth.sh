@@ -19,6 +19,8 @@
 #   auth.sh ips [<site>]
 #   auth.sh ip-add <site> bypass|trusted <ip|cidr>
 #   auth.sh ip-remove <site> bypass|trusted <ip|cidr>
+#   auth.sh sessions <site> [--json]
+#   auth.sh session-revoke <site> <id>
 #   auth.sh mail-test <to>
 #   auth.sh apply
 #
@@ -33,6 +35,8 @@
 #               login from there (the ERPNext login still applies), trusted =
 #               password only (no 2FA). /8 or narrower. Everyone behind that
 #               address gets it; behind another proxy that is everyone.
+#   sessions    browsers that ticked "Remember me", with the days left; revoke
+#               logs one out of Authelia at its next request
 #   mail-test   send a test mail through the relay (Gmail) and show the result
 #
 # Logging in: https://<domain>/authelia/ is reached automatically. The first
@@ -263,6 +267,31 @@ case "$CMD" in
         fi
         rm -f "$BAK"
         ok "$SITE, $KIND: $NET $([ "$CMD" = ip-add ] && echo added || echo removed)"
+        ;;
+
+    sessions|session-revoke)
+        SITE="${1:-}"
+        [ -n "$SITE" ] || usage
+        need_root; need_auth
+        require_site "$SITE"
+        PORT=$(auth_site_port "$SITE")
+        if [ "$CMD" = sessions ]; then
+            [ $# -eq 1 ] || [ "$2" = --json ] || usage
+            if [ -z "$PORT" ]; then      # never linked: it has no sessions
+                if [ $# -gt 1 ]; then echo '{"sessions": [], "unreadable": 0}'; else echo "no remembered logins"; fi
+                exit 0
+            fi
+            set -- list "${@:2}"
+        else
+            [ $# -eq 2 ] || usage
+            [ -n "$PORT" ] || err "$SITE has no Authelia sessions"
+            set -- revoke "$2"
+        fi
+        # The Redis password stays inside the container.
+        python3 "$TOOLS_DIR/lib/authsessions.py" "$(auth_site_dir "$SITE")" "$@" -- \
+            docker compose -p "$AUTH_PROJECT" -f "$AUTH_DIR/compose.yaml" exec -T redis sh -c \
+            'REDISCLI_AUTH=$(sed -n "s/^requirepass //p" /usr/local/etc/redis/redis.conf) exec redis-cli -n "$1" --eval /dev/stdin' \
+            _ "$((PORT - AUTH_BASE_PORT))"
         ;;
 
     mail-test)
