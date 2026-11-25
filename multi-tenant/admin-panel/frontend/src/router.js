@@ -11,6 +11,7 @@ const router = createRouter({
     r('/sites', 'Sites', 'Sites'), r('/new-site', 'NewSite', 'Create site', '/sites'),
     r('/sites/:site', 'SiteSummary', 'Site'), r('/sites/:site/domains', 'SiteDomains', 'Domains'), r('/sites/:site/apps', 'SiteApps', 'Apps'),
     r('/sites/:site/backups', 'SiteBackups', 'Site backups'), r('/sites/:site/login', 'SiteLogin', 'Login protection'), r('/sites/:site/drop', 'SiteDrop', 'Drop site'),
+    r('/traffic', 'Traffic', 'Site traffic'),
     r('/licenses', 'Licenses', 'Licenses'),
     r('/backups', 'Backups', 'Backups'), r('/restore', 'Restore', 'Restore', '/backups'), r('/uploads', 'Uploads', 'Uploads'), r('/schedule', 'Schedule', 'Schedule'), r('/cloud', 'Cloud', 'Cloud storage'),
     r('/updates', 'Updates', 'Updates'), r('/containers', 'Containers', 'Containers'), r('/memory', 'Memory', 'Memory'), r('/database', 'Database', 'Database memory'), r('/activity', 'Activity', 'Activity'),

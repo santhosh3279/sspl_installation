@@ -26,7 +26,7 @@ HOME = Path(os.environ.get("SSPL_DEV_HOME") or Path.home() / ".cache" / "sspl-pa
 STATE = HOME / "state"
 ERP, VOLUME, BACKUPS, AUTH = STATE / "erp", STATE / "volume", STATE / "backups", STATE / "auth"
 RCLONE_CONF = STATE / "rclone.conf"
-TOOLS, PROXY = STATE / "tools", STATE / "nginx.conf"
+TOOLS, PROXY, TRAFFIC = STATE / "tools", STATE / "nginx.conf", STATE / "sspl-traffic.log"
 SITES = {"acme.example.test": "https://acme.example.test:8443",
          "beta.example.test": "http://beta.example.test:8080",
          "demo.erp.lan": "http://192.0.2.10:8001"}
@@ -36,6 +36,28 @@ APPS = ["erpnext", "hrms", "india_compliance"]
 def put(path, text):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
+
+
+def seed_traffic():
+    """14 days of fake requests; the older half in a rotated .gz file."""
+    import gzip
+    import random
+    rnd, now, lines = random.Random(7), time.time(), []
+    hosts = [("acme.example.test", "8443", 6), ("beta.example.test", "8080", 3), ("192.0.2.10", "8001", 1), ("scan.invalid", "8080", 1)]
+    paths = ["/api/method/frappe.desk.form.load.getdoc", "/api/method/frappe.desk.reportview.get", "/app/sales-invoice/SINV-1",
+             "/api/resource/Item/X", "/assets/frappe/dist/js/desk.bundle.js", "/socket.io/", "/login"]
+    for hour in range(14 * 24, -1, -1):
+        for host, port, weight in hosts:
+            for _ in range(rnd.randrange(weight * (14 if 9 <= time.localtime(now - hour * 3600).tm_hour < 19 else 3))):
+                lines.append((now - hour * 3600 - rnd.random() * 3600, host, port, f"203.0.113.{rnd.randrange(1, 3 + 3 * weight)}",
+                              rnd.choice(paths), rnd.choices([200, 304, 404, 403, 500], [85, 8, 3, 2, 1])[0],
+                              rnd.randrange(400, 90000), rnd.random() * .6))
+    lines.sort()
+    text = [json.dumps([f"{t:.3f}", *map(str, rest)]) + "\n" for t, *rest in lines]
+    half = len(text) // 2
+    put(TRAFFIC, "".join(text[half:]))
+    with gzip.open(f"{TRAFFIC}.2.gz", "wt") as f:
+        f.writelines(text[:half])
 
 
 def seed():
@@ -56,7 +78,8 @@ def seed():
     put(RCLONE_CONF, "[gdrive]\ntype = drive\nscope = drive\nteam_drive = devdrive\ntoken = {}\n\n[mega]\ntype = mega\n")
     RCLONE_CONF.chmod(0o600)
     put(VOLUME / "apps.txt", "frappe\n" + "\n".join(APPS) + "\n")
-    put(PROXY, "listen 8080;\nlisten 8443 ssl;\n")
+    put(PROXY, "listen 8080;\nlisten 8443 ssl;\nlog_format sspl_traffic\n")
+    seed_traffic()
     # The panel checks each tool exists before it starts a job.
     for d in ("lib", "sites", "backup", "update"):
         for src in (REPO / "multi-tenant" / d).glob("*.*"):
@@ -220,6 +243,7 @@ def load_panel():
         TimeoutExpired=subprocess.TimeoutExpired, CalledProcessError=subprocess.CalledProcessError)
     panel.shutil = Shutil()
     panel.PROXY_CONF = str(PROXY)
+    panel.TRAFFIC_LOG = str(TRAFFIC)
     panel.auth_site_up = lambda port: bool(port)
     real_wg = panel.wg_status
 

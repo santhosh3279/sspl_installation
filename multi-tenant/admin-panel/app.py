@@ -19,6 +19,7 @@ never disagree about where things are.
 
 import base64
 import fcntl
+import gzip
 import ipaddress
 import json
 import os
@@ -36,6 +37,8 @@ import threading
 import time
 import urllib.request
 import zipfile
+import zlib
+from collections import Counter
 from datetime import datetime, timezone
 from functools import wraps
 from concurrent.futures import ThreadPoolExecutor
@@ -51,7 +54,7 @@ from werkzeug.utils import secure_filename
 # think it is. Copying the files is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-11-25.mt18"
+PANEL_VERSION = "2026-11-25.mt19"
 FEATURES = ("Multi-tenant panel: sites list with per-site backup, DB backup, "
             "migrate, uninstall app and drop; Create site with app picker; "
             "per-site backup browser and guarded per-site restore (also from "
@@ -70,6 +73,7 @@ FEATURES = ("Multi-tenant panel: sites list with per-site backup, DB backup, "
             "RAM monitor page with alerts, per-container and per-process memory, "
             "and the MariaDB buffer pool size applied live from the panel, "
             "Tools dropdown in the dashboard top bar, "
+            "Site traffic page (requests, addresses, data, errors per site), "
             "WireGuard page: tunnel to the CUPS print servers (install, settings, add, remove, test, setup script, SSH terminal; built with Vue)")
 
 CONFIG_FILE = os.environ.get("SSPL_ADMIN_CONFIG", "/opt/sspl-admin/config.json")
@@ -1988,6 +1992,154 @@ def ram_report():
                  "out": human(sout) + "/s" if sout is not None else "–"},
         "psi": psi, "alerts": alerts, "containers": containers, "processes": top_processes(),
     }
+
+
+# Site traffic, from the JSON log the host nginx writes (lib/common.sh
+# render_proxy_conf). logrotate keeps it: FILE, FILE.1, FILE.2.gz, ...
+TRAFFIC_LOG = "/var/log/nginx/sspl-traffic.log"
+TRAFFIC_RANGES = {"24h": (24, 1), "7d": (7, 24), "14d": (14, 24)}     # buckets, hours in each
+_traffic = {"map": None, "files": {}}
+_traffic_lock = threading.Lock()
+
+
+class TrafficHour:
+    """One site in one hour. Assets and realtime polling count as requests only."""
+    __slots__ = ("requests", "calls", "bytes", "e4", "e5", "secs", "ips", "paths")
+
+    def __init__(self):
+        self.requests = self.calls = self.bytes = self.e4 = self.e5 = 0
+        self.secs = 0.0
+        self.ips, self.paths = Counter(), Counter()
+
+    def add(self, o):
+        for k in ("requests", "calls", "bytes", "e4", "e5", "secs"):
+            setattr(self, k, getattr(self, k) + getattr(o, k))
+        self.ips.update(o.ips)
+        self.paths.update(o.paths)
+
+
+def _traffic_path(uri):
+    """Group by page or method: no document names, and few distinct values."""
+    seg = [x for x in uri.split("/") if x]
+    return "/" + "/".join(seg[:3 if seg[:1] == ["api"] else 2])[:120]
+
+
+def _traffic_line(line, hours, domains, ports, tz):
+    try:
+        t, host, port, ip, uri, status, sent, secs = json.loads(line)
+        t, status, sent, secs = float(t), int(status), int(sent), float(secs)
+    except (ValueError, TypeError):
+        return
+    site = ports.get(port) or domains.get(host, "")     # "" = no such domain
+    key = (int(t + tz) // 3600, site)
+    h = hours.get(key)
+    if h is None:
+        h = hours[key] = TrafficHour()
+    h.requests += 1
+    h.bytes += sent
+    h.e4 += 400 <= status < 500
+    h.e5 += 500 <= status < 600
+    if not site:
+        return                  # scanners: no per-address or per-path detail
+    h.ips[ip] += 1
+    if uri.startswith(("/assets/", "/socket.io")):
+        return
+    h.calls += 1
+    h.secs += secs
+    path = _traffic_path(uri)
+    if path in h.paths or len(h.paths) < 500:       # a scanner must not fill the memory
+        h.paths[path] += 1
+
+
+def _traffic_hours(since):
+    """Parsed hours of every log file that reaches `since`. A file is read
+    once; the growing one continues where the last call stopped."""
+    domains, ports = domain_map(), {str(p): s for p, s in port_map().items()}
+    tz = time.localtime().tm_gmtoff
+    if _traffic["map"] != (domains, ports, tz):
+        _traffic["map"], _traffic["files"] = (domains, ports, tz), {}
+    files, alive = _traffic["files"], set()
+    log = Path(TRAFFIC_LOG)
+    for path in [log] + sorted(log.parent.glob(log.name + ".*")):
+        gz = path.suffix == ".gz"
+        try:
+            with (gzip.open if gz else open)(path, "rb") as f:
+                st = os.fstat(f.fileno())
+                alive.add(st.st_ino)
+                if st.st_mtime < since:
+                    continue
+                # gzip keeps the mtime; a reused inode has another one.
+                seen = files.get(st.st_ino)
+                if seen and (seen["gz"] != gz or (st.st_mtime != seen["mtime"] if gz else st.st_size < seen["at"])):
+                    seen = None
+                if seen is None:
+                    seen = files[st.st_ino] = {"at": 0, "gz": gz, "mtime": st.st_mtime, "hours": {}}
+                elif gz:
+                    continue
+                f.seek(seen["at"])
+                for line in f:
+                    if not line.endswith(b"\n"):
+                        break               # nginx is still writing it
+                    seen["at"] += len(line)
+                    _traffic_line(line.decode("utf-8", "replace"), seen["hours"], domains, ports, tz)
+        except (OSError, EOFError, zlib.error):
+            continue                        # rotated away or unreadable
+    for ino in set(files) - alive:
+        del files[ino]
+    return [f["hours"] for f in files.values()], tz
+
+
+def traffic_report(span):
+    count, step = TRAFFIC_RANGES[span]
+    try:
+        with open(PROXY_CONF) as f:
+            enabled = "sspl_traffic" in f.read()
+    except OSError:
+        enabled = False
+    with _traffic_lock:
+        now = int(time.time())
+        tz = time.localtime().tm_gmtoff
+        last = (now + tz) // 3600 // step           # buckets are local hours or days
+        first = last - count + 1
+        parsed, tz = _traffic_hours(first * step * 3600 - tz)
+        rows = {s: [TrafficHour() for _ in range(count)] for s in list_sites()}
+        total, unknown = [TrafficHour() for _ in range(count)], TrafficHour()
+        for hours in parsed:
+            for (hour, site), h in hours.items():
+                i = hour // step - first
+                if not 0 <= i < count:
+                    continue
+                if not site:
+                    unknown.add(h)
+                elif site in rows:
+                    rows[site][i].add(h)
+                    total[i].add(h)
+
+    def summary(name, buckets):
+        a = TrafficHour()
+        for b in buckets:
+            a.add(b)
+        return {"name": name, "requests": a.requests, "calls": a.calls, "bytes": a.bytes, "bytes_h": human(a.bytes),
+                "e4": a.e4, "e5": a.e5, "addresses": len(a.ips),
+                "avg_ms": round(1000 * a.secs / a.calls) if a.calls else None,
+                "series": [{"requests": b.requests, "calls": b.calls, "bytes": b.bytes, "bytes_h": human(b.bytes),
+                            "errors": b.e4 + b.e5, "addresses": len(b.ips)} for b in buckets],
+                "paths": a.paths.most_common(10), "ips": a.ips.most_common(10)}
+
+    fmt = "%Y-%m-%d %H:%M" if step == 1 else "%Y-%m-%d"
+    return {"enabled": enabled, "range": span,
+            "labels": [time.strftime(fmt, time.gmtime((first + i) * step * 3600)) for i in range(count)],
+            "all": summary("", total), "unknown": unknown.requests,
+            "sites": sorted((summary(s, b) for s, b in rows.items()), key=lambda x: (-x["calls"], x["name"]))}
+
+
+@app.route("/api/traffic")
+@login_required
+def api_traffic():
+    span = request.args.get("range", "24h")
+    if span not in TRAFFIC_RANGES:
+        return jsonify({"error": "unknown range"}), 400
+    return jsonify(traffic_report(span))
 
 
 @app.route("/ram")

@@ -11,7 +11,7 @@ import { job, startPolling } from './useJob.js'
 
 const NAV = [
   ['', [['/', 'Overview', 'home']]],
-  ['Sites', [['/sites', 'Sites', 'sites'], ['/licenses', 'Licenses', 'license']]],
+  ['Sites', [['/sites', 'Sites', 'sites'], ['/traffic', 'Site traffic', 'chart'], ['/licenses', 'Licenses', 'license']]],
   ['Backups', [['/backups', 'Backups', 'backup'], ['/uploads', 'Uploads', 'upload'], ['/schedule', 'Schedule', 'clock'], ['/cloud', 'Cloud storage', 'cloud']]],
   ['Server', [['/updates', 'Updates', 'update'], ['/containers', 'Containers', 'box'], ['/memory', 'Memory', 'memory'], ['/database', 'Database memory', 'backup'], ['/activity', 'Activity', 'list']]],
   ['Login protection', [['/access/users', 'Users', 'users'], ['/access/networks', 'Trusted networks', 'shield'], ['/access/logins', 'Login history', 'list']]],

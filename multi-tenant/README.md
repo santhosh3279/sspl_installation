@@ -457,6 +457,17 @@ change is lost on the next DB restart.
 
 Keep the pool below the free RAM. A pool pushed into swap is slower than a small one.
 
+## Site traffic
+
+The panel's **Site traffic** page shows calls, addresses, data sent, response time
+and errors per site for the last 24 hours, 7 days or 14 days. The host nginx writes
+`/var/log/nginx/sspl-traffic.log` (no query strings) next to its normal log, and
+its logrotate rule rotates it (14 daily files on Ubuntu).
+
+On a server installed before this page existed, update panel and tools, then run
+**Install / Repair nginx routing** once. Counting starts then. Assets and realtime
+polling are left out of "Pages and API calls" and of the response time.
+
 ## Update (all tenants)
 
 ```bash
