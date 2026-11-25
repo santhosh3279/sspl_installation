@@ -110,6 +110,7 @@ case "$CMD" in
         require_valid_site "$DOMAIN"
         require_site "$SITE"
         take_lock
+        [ "$DOMAIN" != "$(panel_domain)" ] || err "$DOMAIN is the admin panel's domain"
         CUR=$(domain_site "$DOMAIN")
         [ -z "$CUR" ] || [ "$CUR" = "$SITE" ] || err "$DOMAIN already points at $CUR"
         if [ "$DOMAIN" != "$SITE" ] && list_sites | grep -qx -- "$DOMAIN"; then
@@ -177,33 +178,7 @@ case "$CMD" in
         [ "$HTTP_PORT" = 80 ] || err "Let's Encrypt checks the domain on port 80, but HTTP_PORT is $HTTP_PORT"
         https_on || err "HTTPS is not set up (HTTPS_PORT empty, or no default certificate) — run install/install-proxy.sh from the checkout"
         take_lock
-        if ! command -v certbot >/dev/null 2>&1; then
-            echo "→ Installing certbot..."
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq certbot >/dev/null \
-                || err "could not install certbot (apt-get install certbot)"
-        fi
-        mkdir -p "$ACME_WEBROOT"
-        # Make sure nginx serves the challenge path before Let's Encrypt asks.
-        apply_proxy || err "nginx was not reloaded — fix it first"
-        if [ -n "$LETSENCRYPT_EMAIL" ]; then
-            ACCOUNT=(--email "$LETSENCRYPT_EMAIL")
-        else
-            ACCOUNT=(--register-unsafely-without-email)
-        fi
-        echo "→ Asking Let's Encrypt for $DOMAIN (it connects to http://$DOMAIN/ to check)..."
-        # --cert-name keeps the files at $LE_LIVE/$DOMAIN/ (no -0001 suffix).
-        # Never the --nginx plugin: it would edit the generated config.
-        certbot certonly --webroot -w "$ACME_WEBROOT" \
-            --cert-name "$DOMAIN" -d "$DOMAIN" \
-            --non-interactive --agree-tos "${ACCOUNT[@]}" \
-            --keep-until-expiring \
-            --deploy-hook "systemctl reload nginx" \
-            || err "Let's Encrypt refused. Check that $DOMAIN resolves to this server's public IP and port 80 is open from the internet."
-        systemctl enable --now certbot.timer >/dev/null 2>&1 \
-            || warn "certbot.timer not enabled — renewals need 'certbot renew' in cron"
-        domain_has_cert "$DOMAIN" || err "certbot finished but $LE_LIVE/$DOMAIN/ has no certificate"
-        apply_proxy || err "nginx did not take the new certificate — the previous config is kept"
-        ok "nginx serves $DOMAIN with its Let's Encrypt certificate"
+        get_cert "$DOMAIN"
         # The primary domain's host_name moves to https.
         if [ "$(primary_domain "$SITE")" = "$DOMAIN" ]; then
             set_primary "$SITE" "$DOMAIN"

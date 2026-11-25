@@ -54,7 +54,7 @@ from werkzeug.utils import secure_filename
 # think it is. Copying the files is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-11-25.mt19"
+PANEL_VERSION = "2026-11-25.mt20"
 FEATURES = ("Multi-tenant panel: sites list with per-site backup, DB backup, "
             "migrate, uninstall app and drop; Create site with app picker; "
             "per-site backup browser and guarded per-site restore (also from "
@@ -73,6 +73,7 @@ FEATURES = ("Multi-tenant panel: sites list with per-site backup, DB backup, "
             "RAM monitor page with alerts, per-container and per-process memory, "
             "and the MariaDB buffer pool size applied live from the panel, "
             "Tools dropdown in the dashboard top bar, "
+            "admin panel domain with Let's Encrypt (Tools page), "
             "Site traffic page (requests, addresses, data, errors per site), "
             "WireGuard page: tunnel to the CUPS print servers (install, settings, add, remove, test, setup script, SSH terminal; built with Vue)")
 
@@ -206,6 +207,24 @@ def domain_map():
     except OSError:
         pass
     return out
+
+
+def panel_domain():
+    """The panel's own domain (lib/common.sh panel_line), or ""."""
+    try:
+        with open(Path(erp_dir()) / "panel-domain") as f:
+            parts = f.readline().split()
+    except OSError:
+        return ""
+    return parts[0] if len(parts) >= 3 and valid_site_name(parts[0]) else ""
+
+
+def panel_domain_status():
+    d, p = panel_domain(), https_port()
+    return {"domain": d, "cert": bool(d) and domain_has_cert(d), "https": https_on(), "https_reason": https_off_reason(),
+            "http_port": http_port(), "port": int(CONFIG.get("port", 8090)),
+            "tools": os.path.isfile(_tool("sites/panel-domain.sh")),
+            "url": f"https://{d}" + ("" if p == 443 else f":{p}") if d else ""}
 
 
 def site_domains(site):
@@ -582,6 +601,10 @@ ACTIONS = {
     "auth_ip_remove":      {"label": "Remove site IP rule",       "cmd": [_tool("sites/auth.sh"), "ip-remove"]},
     "auth_session_revoke": {"label": "Revoke remembered login",   "cmd": [_tool("sites/auth.sh"), "session-revoke"]},
     "auth_mail_test":      {"label": "Send test mail",            "cmd": [_tool("sites/auth.sh"), "mail-test"]},
+    # The panel's own domain
+    "panel_domain_set":    {"label": "Set panel domain",       "cmd": [_tool("sites/panel-domain.sh"), "set"]},
+    "panel_domain_cert":   {"label": "Panel HTTPS certificate", "cmd": [_tool("sites/panel-domain.sh"), "cert"]},
+    "panel_domain_remove": {"label": "Remove panel domain",    "cmd": [_tool("sites/panel-domain.sh"), "remove"]},
     # WireGuard peers (CUPS print servers)
     "wg_add":    {"label": "Add print server",    "cmd": [_tool("sites/wireguard.sh"), "add"]},
     "wg_remove": {"label": "Remove print server", "cmd": [_tool("sites/wireguard.sh"), "remove"]},
@@ -2400,7 +2423,7 @@ def api_logs():
 @app.route("/api/setup-status")
 @login_required
 def api_setup_status():
-    return jsonify(setup_status())
+    return jsonify({**setup_status(), "panel": panel_domain_status()})
 
 
 @app.route("/api/openwa/key", methods=["POST"])
@@ -2439,6 +2462,8 @@ def _new_site_request(data):
                             "e.g. acme.erp.lan")
     if host in list_sites():
         return None, None, f"{host} already exists"
+    if host == panel_domain():
+        return None, None, f"{host} is the admin panel's domain"
     owner = domain_map().get(host)
     if owner:
         return None, None, f"{host} is already a domain of {owner} — remove it there first"
@@ -2527,10 +2552,40 @@ def _domain_request(name, data):
     owner = dmap.get(domain)
     if owner and owner != site:
         return None, None, f"{domain} already points at {owner}"
+    if domain == panel_domain():
+        return None, None, f"{domain} is the admin panel's domain"
     if domain != site and domain in list_sites():
         return None, None, f"{domain} is the name of another site"
     args = [site, domain] + (["--primary"] if data.get("primary") else [])
     return args, f"Add domain {domain} to {site}", None
+
+
+def _panel_domain_request(name, data):
+    """Arguments for sites/panel-domain.sh: (args, env, label, None) or (None, None, None, error)."""
+    if name == "panel_domain_remove":
+        d = panel_domain()
+        return ([], None, f"Remove panel domain {d}", None) if d else (None, None, None, "the panel has no domain")
+    d = str(data.get("domain", "")).strip().lower()
+    if not valid_site_name(d) or IPV4_RE.match(d) or "." not in d:
+        return None, None, None, "enter a full domain name, e.g. admin.example.com"
+    owner = domain_map().get(d) or (d if d in list_sites() else "")
+    if owner:
+        return None, None, None, f"{d} is a domain of the site {owner}"
+    if not https_on():
+        return None, None, None, https_off_reason()
+    # Where this very panel listens: the same test as at the end of this file.
+    tls = all(CONFIG.get(k) and os.path.isfile(CONFIG[k]) for k in ("tls_cert", "tls_key"))
+    env = {"PANEL_PORT": str(CONFIG.get("port", 8090)), "PANEL_SCHEME": "https" if tls else "http"}
+    if name == "panel_domain_set":
+        return [d], env, f"Panel domain {d}", None
+    if http_port() != 80:
+        return None, None, None, f"Let's Encrypt checks domains on port 80, but this stack's HTTP port is {http_port()}"
+    email = str(data.get("email", "")).strip()
+    if email:
+        if not EMAIL_RE.match(email):
+            return None, None, None, "that e-mail address does not look right"
+        env["LETSENCRYPT_EMAIL"] = email
+    return [d], env, f"HTTPS certificate for the panel: {d}", None
 
 
 def _auth_password(data):
@@ -2958,6 +3013,13 @@ def api_run(name):
                 if not EMAIL_RE.match(email):
                     return jsonify({"error": "that e-mail address does not look right"}), 400
                 extra_env = {"LETSENCRYPT_EMAIL": email}
+
+    elif name.startswith("panel_domain_"):
+        if not os.path.isfile(ACTIONS[name]["cmd"][0]):
+            return jsonify({"error": "refresh the tools first"}), 400
+        extra_args, extra_env, label, err = _panel_domain_request(name, data)
+        if err:
+            return jsonify({"error": err}), 400
 
     elif name.startswith("auth_"):
         extra_args, extra_env, label, err = _auth_request(name, data)

@@ -74,6 +74,7 @@ DOMAINS_FILE="$ERP_DIR/site-domains"           # "<domain> <site>" per line
 PORTS_FILE="$ERP_DIR/site-ports"               # "<port> <site>" per line
 PROXY_CONF=/etc/nginx/conf.d/sspl-erp.conf     # generated from DOMAINS_FILE
 TRAFFIC_LOG=/var/log/nginx/sspl-traffic.log    # the panel's Site traffic page; nginx's logrotate rotates it
+PANEL_DOMAIN_FILE="$ERP_DIR/panel-domain"      # "<domain> <port> <scheme>": the admin panel
 AUTH_SITES_FILE="$ERP_DIR/site-auth"           # sites behind Authelia, one per line
 WG_PEERS_FILE="$ERP_DIR/wg-peers"              # "<name> <ip> <public key> [site]" per line
 WG_DIR=/etc/wireguard                          # keys and the generated interface config
@@ -410,6 +411,15 @@ add_port()          { _edit_ports sh -c 'cat; printf "%s %s\n" "$1" "$2"' _ "$1"
 remove_port()       { _edit_ports awk -v p="$1" '$1 != p'; }
 remove_site_ports() { _edit_ports awk -v s="$1" '$2 != s'; }
 
+# The admin panel's own domain (sites/panel-domain.sh): its valid line, or nothing.
+panel_line() {
+    [ -r "$PANEL_DOMAIN_FILE" ] || return 0
+    local d p s _
+    read -r d p s _ < "$PANEL_DOMAIN_FILE" || true
+    if valid_site_name "$d" && valid_port "$p" && [[ "$s" =~ ^https?$ ]]; then printf '%s %s %s\n' "$d" "$p" "$s"; fi
+}
+panel_domain() { panel_line | awk '{print $1}'; }
+
 # The address this server is reached on, for http://<ip>:<port> links and
 # host_name. SERVER_IP in the config wins; else the first address.
 server_ip() {
@@ -507,6 +517,39 @@ sync_host_name() {   # $1 site
     fi
     [ "$new" = "$hn" ] && return 0
     dc exec -T backend bench --site "$1" set-config host_name "$new" >/dev/null && ok "host_name of $1: $new"
+}
+
+# Get a Let's Encrypt certificate for a domain nginx already serves on port 80,
+# and make nginx use it. Exits on failure.
+get_cert() {   # $1 domain
+    if ! command -v certbot >/dev/null 2>&1; then
+        echo "→ Installing certbot..."
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq certbot >/dev/null \
+            || err "could not install certbot (apt-get install certbot)"
+    fi
+    mkdir -p "$ACME_WEBROOT"
+    # Make sure nginx serves the challenge path before Let's Encrypt asks.
+    apply_proxy || err "nginx was not reloaded — fix it first"
+    local ACCOUNT
+    if [ -n "$LETSENCRYPT_EMAIL" ]; then
+        ACCOUNT=(--email "$LETSENCRYPT_EMAIL")
+    else
+        ACCOUNT=(--register-unsafely-without-email)
+    fi
+    echo "→ Asking Let's Encrypt for $1 (it connects to http://$1/ to check)..."
+    # --cert-name keeps the files at $LE_LIVE/$1/ (no -0001 suffix).
+    # Never the --nginx plugin: it would edit the generated config.
+    certbot certonly --webroot -w "$ACME_WEBROOT" \
+        --cert-name "$1" -d "$1" \
+        --non-interactive --agree-tos "${ACCOUNT[@]}" \
+        --keep-until-expiring \
+        --deploy-hook "systemctl reload nginx" \
+        || err "Let's Encrypt refused. Check that $1 resolves to this server's public IP and port 80 is open from the internet."
+    systemctl enable --now certbot.timer >/dev/null 2>&1 \
+        || warn "certbot.timer not enabled — renewals need 'certbot renew' in cron"
+    domain_has_cert "$1" || err "certbot finished but $LE_LIVE/$1/ has no certificate"
+    apply_proxy || err "nginx did not take the new certificate — the previous config is kept"
+    ok "nginx serves $1 with its Let's Encrypt certificate"
 }
 
 # Delete a domain's Let's Encrypt certificate (and its renewal). Call after
@@ -1353,6 +1396,7 @@ $(_proxy_location "" $gate)
     }
 }
 EOF
+    _panel_servers
     # One server per domain that has a Let's Encrypt certificate.
     all_domains | while read -r d; do
         is_ip "$d" && continue
@@ -1374,6 +1418,49 @@ $(_proxy_location "" $gate)
 }
 EOF
     done
+}
+
+# The admin panel on its own domain. Always HTTPS: the panel's login is root.
+# Not in the traffic log (no tenant), not behind Authelia (its own login).
+_panel_servers() {
+    local d p s crt="$SSL_DIR/default.crt" key="$SSL_DIR/default.key" hp=""
+    read -r d p s <<< "$(panel_line)" || true
+    [ -n "$d" ] && [ -z "$(domain_site "$d")" ] || return 0
+    if domain_has_cert "$d"; then crt="$LE_LIVE/$d/fullchain.pem"; key="$LE_LIVE/$d/privkey.pem"; fi
+    [ "$HTTPS_PORT" = 443 ] || hp=":$HTTPS_PORT"
+    cat <<EOF
+
+# The admin panel (sites/panel-domain.sh).
+server {
+    listen $HTTP_PORT;
+    listen [::]:$HTTP_PORT;
+    server_name $d;
+    location ^~ /.well-known/acme-challenge/ {
+        root $ACME_WEBROOT;
+        default_type text/plain;
+    }
+    location / { return 301 https://\$host$hp\$request_uri; }
+}
+server {
+    listen $HTTPS_PORT ssl;
+    listen [::]:$HTTPS_PORT ssl;
+    server_name $d;
+    ssl_certificate     $crt;
+    ssl_certificate_key $key;
+    client_max_body_size 0;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    location / {
+        proxy_pass $s://127.0.0.1:$p;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$http_host;
+        proxy_set_header Connection "";
+        # Backups up and down, and live output: straight through.
+        proxy_buffering off;
+        proxy_request_buffering off;
+    }
+}
+EOF
 }
 
 # Write the config, test it, reload. A config nginx rejects is rolled back,

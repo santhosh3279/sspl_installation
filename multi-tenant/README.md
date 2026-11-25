@@ -244,6 +244,14 @@ every existing site to the domain table, creates the default certificate, and
 starts nginx. It is safe to re-run. Every site is down
 for a few seconds while the frontend moves.
 
+### Admin panel domain
+
+**Setup > Tools** has a domain field for the panel itself (`sites/panel-domain.sh
+set|cert|remove`). The host nginx serves it over HTTPS only, self-signed until
+**Get Let's Encrypt certificate** (public domain, port 80 open). The panel's
+`https://<server-ip>:8090` address stays. The panel keeps its own login; Authelia
+does not cover it, so use a strong admin password on a public name.
+
 ## Authelia login (2FA) per site
 
 An optional login gate in front of chosen sites. **Every linked site has its own

@@ -39,6 +39,7 @@ echo "=============================="
 
 dc exec -T backend true >/dev/null 2>&1 || err "The backend is not running — start the stack first."
 site_exists "$SITE" && err "Site $SITE already exists."
+[ "$SITE" != "$(panel_domain)" ] || err "$SITE is the admin panel's domain."
 OWNER=$(domain_site "$SITE")
 [ -z "$OWNER" ] || err "$SITE is already a domain of site $OWNER (sites/domains.sh remove $SITE first)"
 
