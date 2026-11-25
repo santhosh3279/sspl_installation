@@ -17,13 +17,18 @@ the tools' own config file, sspl-mt.conf, so the panel and the tools can
 never disagree about where things are.
 """
 
+import base64
+import fcntl
 import ipaddress
 import json
 import os
 import pty
 import re
+import secrets
+import select
 import shutil
 import sqlite3
+import struct
 import subprocess
 import tempfile
 import termios
@@ -46,7 +51,7 @@ from werkzeug.utils import secure_filename
 # think it is. Copying the files is not enough — the service must be restarted
 # for a new version to take effect. Bump this whenever app.py gains something
 # visible; FEATURES lists what that version should show.
-PANEL_VERSION = "2026-11-24.mt17"
+PANEL_VERSION = "2026-11-25.mt18"
 FEATURES = ("Multi-tenant panel: sites list with per-site backup, DB backup, "
             "migrate, uninstall app and drop; Create site with app picker; "
             "per-site backup browser and guarded per-site restore (also from "
@@ -65,7 +70,7 @@ FEATURES = ("Multi-tenant panel: sites list with per-site backup, DB backup, "
             "RAM monitor page with alerts, per-container and per-process memory, "
             "and the MariaDB buffer pool size applied live from the panel, "
             "Tools dropdown in the dashboard top bar, "
-            "WireGuard page: tunnel to the CUPS print servers (install, settings, add, remove, test, setup script; built with Vue)")
+            "WireGuard page: tunnel to the CUPS print servers (install, settings, add, remove, test, setup script, SSH terminal; built with Vue)")
 
 CONFIG_FILE = os.environ.get("SSPL_ADMIN_CONFIG", "/opt/sspl-admin/config.json")
 with open(CONFIG_FILE) as f:
@@ -2506,6 +2511,210 @@ def api_wireguard_setup(peer):
         return jsonify({"error": r.stderr.strip()[-300:] or "failed"}), 500
     return Response(r.stdout, mimetype="text/x-shellscript", headers={
         "Content-Disposition": f'attachment; filename="sspl-wg-{peer}.sh"', "Cache-Control": "no-store"})
+
+
+# SSH terminal to a connected print server. Not a job: it must not take the one
+# job slot, and what is typed or shown must never reach a log file. The user
+# types the password at ssh's own prompt; nothing is stored.
+SSH_USER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,31}")
+SSH_MAX = 6                 # sessions at once
+SSH_IDLE = 30 * 60          # nothing typed
+SSH_GONE = 90               # nobody reading: the page was closed
+SSH_BUF = 256 * 1024
+_ssh_lock = threading.Lock()
+_ssh = {}                   # id -> SshSession
+
+
+class SshSession:
+    def __init__(self, peer, ip, user, rows, cols):
+        self.peer, self.buf, self.base, self.done = peer, bytearray(), 0, False
+        self.cond = threading.Condition()
+        self.typed = self.read = time.monotonic()
+        # setsid -c: ssh asks for the password on its controlling terminal.
+        # -F /dev/null: root's own ssh config and keys play no part.
+        # -e none: no escape menu, which could open port forwards.
+        # -B: if the tunnel is down, fail instead of dialing the address elsewhere.
+        cmd = ["setsid", "-c", "ssh", "-F", "/dev/null", "-e", "none", "-B", mt_conf()["WG_IFACE"]]
+        for o in ("PubkeyAuthentication=no", "PreferredAuthentications=keyboard-interactive,password",
+                  "StrictHostKeyChecking=accept-new", f"UserKnownHostsFile={JOB_DIR.parent / 'ssh_known_hosts'}",
+                  "GlobalKnownHostsFile=/dev/null", "ConnectTimeout=10", "ServerAliveInterval=15",
+                  "ServerAliveCountMax=3", "ForwardAgent=no", "ClearAllForwardings=yes"):
+            cmd += ["-o", o]
+        cmd += ["-l", user, "--", ip]
+        self.fd, slave = pty.openpty()
+        try:
+            self.resize(rows, cols)
+            os.set_blocking(self.fd, False)
+            self.proc = subprocess.Popen(
+                cmd, stdin=slave, stdout=slave, stderr=slave, cwd="/",
+                env={"PATH": os.environ.get("PATH", os.defpath), "TERM": "xterm-256color", "LANG": "C.UTF-8"})
+        except Exception:
+            os.close(self.fd)
+            raise
+        finally:
+            os.close(slave)
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self):
+        try:
+            while True:
+                now = time.monotonic()
+                if self.done or now - self.typed > SSH_IDLE or now - self.read > SSH_GONE:
+                    break
+                if not select.select([self.fd], [], [], 1)[0]:
+                    continue
+                try:
+                    data = os.read(self.fd, 65536)
+                except BlockingIOError:
+                    continue
+                except OSError:          # ssh exited
+                    break
+                if not data:
+                    break
+                with self.cond:
+                    self.buf += data
+                    extra = len(self.buf) - SSH_BUF
+                    if extra > 0:
+                        del self.buf[:extra]
+                        self.base += extra
+                    self.cond.notify_all()
+        finally:
+            with self.cond:
+                self.done = True
+                os.close(self.fd)
+                self.fd = None
+                self.cond.notify_all()
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                self.proc.kill()
+                self.proc.wait()
+            time.sleep(30)               # let the page read the last output
+            with _ssh_lock:
+                for k in [k for k, v in _ssh.items() if v is self]:
+                    del _ssh[k]
+
+    def resize(self, rows, cols):
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+    def close(self):
+        with self.cond:
+            self.done = True
+            self.cond.notify_all()
+
+
+def _ssh_size(data):
+    try:
+        return [min(500, max(2, int(data.get(k) or d))) for k, d in (("rows", 24), ("cols", 80))]
+    except (TypeError, ValueError):
+        return [24, 80]
+
+
+def _ssh_json():
+    # JSON only: another site's form can't send it, and its script would need CORS.
+    data = request.get_json(silent=True) if request.is_json else None
+    if not isinstance(data, dict):
+        abort(400)
+    return data
+
+
+def _ssh_get(sid):
+    with _ssh_lock:
+        s = _ssh.get(sid)
+    if s is None:
+        abort(404)
+    return s
+
+
+@app.route("/api/wireguard/ssh", methods=["POST"])
+@login_required
+def api_ssh_open():
+    data = _ssh_json()
+    name, user = str(data.get("name", "")), str(data.get("user", "")).strip()
+    if not SSH_USER_RE.fullmatch(user):
+        return jsonify({"error": "enter a valid user name"}), 400
+    peer = next((p for p in wg_status()["peers"] if p["name"] == name), None)
+    if not peer:
+        return jsonify({"error": "no such print server"}), 404
+    if not peer["up"]:
+        return jsonify({"error": f"{name} is not connected"}), 409
+    try:
+        ip = str(ipaddress.IPv4Address(peer["ip"]))
+    except ValueError:
+        return jsonify({"error": "bad tunnel address"}), 500
+    with _ssh_lock:
+        if sum(not s.done for s in _ssh.values()) >= SSH_MAX:
+            return jsonify({"error": "too many SSH sessions are open"}), 429
+        try:
+            s = SshSession(name, ip, user, *_ssh_size(data))
+        except OSError as e:
+            return jsonify({"error": f"could not start ssh: {e}"}), 500
+        sid = secrets.token_urlsafe(24)
+        _ssh[sid] = s
+    print(f"SSH terminal: {session['user']} from {request.remote_addr} to {user}@{name} ({ip})", flush=True)
+    return jsonify({"id": sid})
+
+
+@app.route("/api/wireguard/ssh/<sid>/output")
+@login_required
+def api_ssh_output(sid):
+    """Long poll: whatever came after byte `pos`, as base64."""
+    s = _ssh_get(sid)
+    pos = request.args.get("pos", 0, type=int)
+    s.read = time.monotonic()
+    with s.cond:
+        s.cond.wait_for(lambda: s.done or s.base + len(s.buf) > pos, timeout=20)
+        start = min(max(pos - s.base, 0), len(s.buf))
+        data, end, done = bytes(s.buf[start:]), s.base + len(s.buf), s.fd is None
+    s.read = time.monotonic()
+    return jsonify({"data": base64.b64encode(data).decode(), "pos": end, "done": done})
+
+
+@app.route("/api/wireguard/ssh/<sid>/input", methods=["POST"])
+@login_required
+def api_ssh_input(sid):
+    s, raw = _ssh_get(sid), _ssh_json().get("data")
+    if not isinstance(raw, str) or len(raw) > 65536:
+        return jsonify({"error": "bad input"}), 400
+    data, until = raw.encode("utf-8", "replace"), time.monotonic() + 5
+    s.typed = time.monotonic()
+    while data:
+        with s.cond:                     # the reader closes fd under this lock
+            if s.fd is None:
+                return jsonify({"error": "the session has ended"}), 410
+            try:
+                data = data[os.write(s.fd, data):]
+                continue
+            except BlockingIOError:
+                pass
+            except OSError:
+                return jsonify({"error": "the session has ended"}), 410
+        if time.monotonic() > until:
+            return jsonify({"error": "the print server is not taking input"}), 503
+        time.sleep(0.02)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/wireguard/ssh/<sid>/resize", methods=["POST"])
+@login_required
+def api_ssh_resize(sid):
+    s, size = _ssh_get(sid), _ssh_size(_ssh_json())
+    with s.cond:
+        if s.fd is not None:
+            try:
+                s.resize(*size)
+            except OSError:
+                pass
+    return jsonify({"ok": True})
+
+
+@app.route("/api/wireguard/ssh/<sid>/close", methods=["POST"])
+@login_required
+def api_ssh_close(sid):
+    _ssh_json()
+    _ssh_get(sid).close()
+    return jsonify({"ok": True})
 
 
 @app.route("/api/run/<name>", methods=["POST"])

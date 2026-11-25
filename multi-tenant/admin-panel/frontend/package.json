@@ -10,6 +10,8 @@
     "build": "vite build"
   },
   "dependencies": {
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/xterm": "6.0.0",
     "vue": "3.5.46",
     "vue-router": "4.6.5"
   },

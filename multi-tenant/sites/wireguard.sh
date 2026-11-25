@@ -16,7 +16,7 @@
 #                 --site is a label only: the containers are shared by every
 #                 site, so every site can reach every print server.
 #   setup-script  a bash script to run as root ON the print server: installs
-#                 WireGuard and opens CUPS to this server. CONTAINS A PRIVATE
+#                 WireGuard and opens CUPS and SSH (ufw) to this server. CONTAINS A PRIVATE
 #                 KEY: copy it over a safe channel and delete it afterwards.
 #   config        only the print server's WireGuard config (also secret)
 #   test          ask CUPS for a page from inside the backend container
@@ -120,7 +120,10 @@ systemctl enable cups >/dev/null 2>&1 || true
 systemctl restart cups
 if command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
     ufw allow in on "$IF" from "$HUB" to any port 631 proto tcp >/dev/null
+    ufw allow in on "$IF" from "$HUB" to any port 22 proto tcp >/dev/null
 fi
+[ -n "$(ss -ltnH 'sport = :22' 2>/dev/null)" ] \
+    || echo "No SSH server on port 22: the panel's SSH button needs one (apt install openssh-server)."
 if ping -c 3 -W 3 "$HUB" >/dev/null; then echo "Tunnel is up."; else
     echo "No answer from $HUB: is the UDP port open on the ERP server?" >&2; fi
 echo "In ERPNext, set the Printer Server host to $IP, port 631."

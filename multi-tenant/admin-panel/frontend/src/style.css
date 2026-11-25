@@ -123,3 +123,4 @@ td .track { min-width:90px; margin:0 }
 }
 @media (prefers-reduced-motion:reduce) { * { animation:none!important; transition:none!important } }
 .stack-list:empty { display:none }
+.ssh { background:var(--term); border-radius:var(--r); padding:10px; height:clamp(300px,calc(100vh - 300px),900px) } .ssh > div { height:100% }

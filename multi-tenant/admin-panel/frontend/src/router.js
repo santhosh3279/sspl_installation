@@ -15,7 +15,7 @@ const router = createRouter({
     r('/backups', 'Backups', 'Backups'), r('/restore', 'Restore', 'Restore', '/backups'), r('/uploads', 'Uploads', 'Uploads'), r('/schedule', 'Schedule', 'Schedule'), r('/cloud', 'Cloud', 'Cloud storage'),
     r('/updates', 'Updates', 'Updates'), r('/containers', 'Containers', 'Containers'), r('/memory', 'Memory', 'Memory'), r('/database', 'Database', 'Database memory'), r('/activity', 'Activity', 'Activity'),
     r('/access/users', 'AccessUsers', 'Users'), r('/access/networks', 'AccessNetworks', 'Trusted networks'), r('/access/logins', 'AccessLogins', 'Login history'),
-    r('/printers', 'Printers', 'Print servers'), r('/tunnel', 'Tunnel', 'WireGuard tunnel'),
+    r('/printers', 'Printers', 'Print servers'), r('/printers/:peer/ssh', 'PrinterSsh', 'SSH'), r('/tunnel', 'Tunnel', 'WireGuard tunnel'),
     r('/setup/stack', 'SetupStack', 'ERPNext stack'), r('/setup/tools', 'SetupTools', 'Tools'), r('/setup/nginx', 'SetupNginx', 'Domains and HTTPS'), r('/setup/authelia', 'SetupAuthelia', 'Authelia and mail'), r('/setup/whatsapp', 'SetupWhatsapp', 'WhatsApp API'),
     r('/:rest(.*)*', 'NotFound', 'Not found'),
   ],

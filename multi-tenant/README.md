@@ -376,6 +376,12 @@ machine dials in, so it works behind a shop router.
   print servers, not the reverse, and print servers cannot reach each other.
   They are set by a systemd drop-in on `wg-quick@sspl-wg` (not `PostUp`, which
   AppArmor can block): start and stop the tunnel with `systemctl`.
+- **SSH:** on the panel's Print servers page, **SSH** opens a terminal on a connected
+  print server. The user and password are typed each time and never stored. The
+  machine needs an SSH server with password login; the setup script only opens
+  port 22 in ufw to this server, so re-run it on machines set up earlier. Host
+  keys are kept on the ERP server. After reinstalling a machine, remove its old one:
+  `sudo ssh-keygen -R <tunnel-ip> -f /opt/sspl-admin/ssh_known_hosts`.
 - **Tenants share containers**, so every site can reach every print server.
   `--site` is only a label. Protect CUPS with a password if that matters.
 - Addresses are never reused after `remove`, so an old Printer Server record
